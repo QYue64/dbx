@@ -481,29 +481,8 @@ pub fn truncate_result_with_max_rows(mut result: db::QueryResult, max_rows: Opti
 }
 
 fn normalize_query_result_for_js(mut result: db::QueryResult) -> db::QueryResult {
-    result.rows = result.rows.into_iter().map(|row| row.into_iter().map(json_value_for_js).collect()).collect();
+    result.rows = result.rows.into_iter().map(|row| row.into_iter().map(db::json_value_for_js).collect()).collect();
     result
-}
-
-fn json_value_for_js(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Number(number) => {
-            if let Some(value) = number.as_i64() {
-                db::safe_i64_to_json(value)
-            } else if let Some(value) = number.as_u64() {
-                db::safe_u64_to_json(value)
-            } else {
-                serde_json::Value::Number(number)
-            }
-        }
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(json_value_for_js).collect())
-        }
-        serde_json::Value::Object(entries) => {
-            serde_json::Value::Object(entries.into_iter().map(|(key, value)| (key, json_value_for_js(value))).collect())
-        }
-        value => value,
-    }
 }
 
 pub fn agent_execute_query_params(

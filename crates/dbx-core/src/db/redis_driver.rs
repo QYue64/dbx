@@ -919,7 +919,7 @@ pub fn redis_command_raw_to_json(value: RedisRawValue) -> serde_json::Value {
         RedisRawValue::BulkString(bytes) => serde_json::Value::String(redis_bytes_to_display(&bytes)),
         RedisRawValue::SimpleString(value) => serde_json::Value::String(value),
         RedisRawValue::Okay => serde_json::Value::String("OK".to_string()),
-        RedisRawValue::Int(value) => serde_json::Value::Number(value.into()),
+        RedisRawValue::Int(value) => super::safe_i64_to_json(value),
         RedisRawValue::Double(value) => {
             serde_json::Number::from_f64(value).map_or(serde_json::Value::Null, serde_json::Value::Number)
         }
@@ -939,10 +939,10 @@ pub fn is_redis_json_type(key_type: &str) -> bool {
 pub fn redis_json_raw_to_json(value: RedisRawValue) -> Result<serde_json::Value, String> {
     match redis_raw_to_json(value) {
         serde_json::Value::Null => Ok(serde_json::Value::Null),
-        serde_json::Value::String(text) => {
-            serde_json::from_str(&text).map_err(|e| format!("Invalid RedisJSON value: {e}"))
-        }
-        other => Ok(other),
+        serde_json::Value::String(text) => serde_json::from_str(&text)
+            .map(super::json_value_for_js)
+            .map_err(|e| format!("Invalid RedisJSON value: {e}")),
+        other => Ok(super::json_value_for_js(other)),
     }
 }
 
@@ -1994,6 +1994,13 @@ mod tests {
     }
 
     #[test]
+    fn converts_command_unsafe_int64_to_string_for_js() {
+        let raw = RedisRawValue::Int(2_326_645_729_978_441_729);
+
+        assert_eq!(redis_command_raw_to_json(raw), serde_json::json!("2326645729978441729"));
+    }
+
+    #[test]
     fn recognizes_redis_json_module_key_types() {
         assert!(is_redis_json_type("ReJSON-RL"));
         assert!(is_redis_json_type("json"));
@@ -2140,6 +2147,19 @@ mod tests {
                 "id": 1,
                 "embedding": [0.1, 0.2],
                 "meta": { "source": "test" }
+            })
+        );
+    }
+
+    #[test]
+    fn parses_redis_json_unsafe_int64_as_string_for_js() {
+        let raw = bulk(r#"{"id":2326645729978441729,"nested":[1,2326645729978441728]}"#);
+
+        assert_eq!(
+            redis_json_raw_to_json(raw).unwrap(),
+            serde_json::json!({
+                "id": "2326645729978441729",
+                "nested": [1, "2326645729978441728"]
             })
         );
     }
