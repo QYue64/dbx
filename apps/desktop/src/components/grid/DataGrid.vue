@@ -116,6 +116,7 @@ import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid
 import { canGoNextDataGridPage } from "@/lib/dataGridPagination";
 import { CANVAS_DATA_GRID_ROW_HEIGHT, drawCanvasDataGrid } from "@/lib/canvasDataGridRenderer";
 import { dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGridSaveUi";
+import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/editorThemes";
 import { appendColumnValueFilterCondition, buildColumnValueFilterCondition, combineWhereInputs, filterModeNeedsValue, parseFilterValue } from "@/lib/dataGridColumnFilter";
 import { clampSearchSplitWidth } from "@/lib/dataGridSearchSplit";
 import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE, normalizeResultPageSize, resultPageSizeMenuOptions } from "@/lib/paginationPageSize";
@@ -1546,6 +1547,7 @@ const gridStyle = computed(() => ({
   ...columnVars.value,
   "--header-total-w": dataGridHeaderContentWidth("var(--total-w)", gridScrollbarGutter.value),
   "--grid-scrollbar-gutter": `${gridScrollbarGutter.value}px`,
+  [EDITOR_FONT_FAMILY_CSS_VAR]: settingsStore.editorSettings.fontFamily,
 }));
 const gridHorizontalScrollLeft = ref(0);
 const gridViewportWidth = ref(0);
@@ -3425,7 +3427,7 @@ const canvasSurfaceWidth = computed(() => {
   if (vw <= 0) return total;
   return Math.min(vw, total);
 });
-const canvasRenderStyleKey = computed(() => `${settingsStore.editorSettings.theme}:${settingsStore.editorSettings.uiScale}:${canvasBackingPixelRatio.value}:${isDark.value}`);
+const canvasRenderStyleKey = computed(() => `${settingsStore.editorSettings.theme}:${settingsStore.editorSettings.uiScale}:${canvasBackingPixelRatio.value}:${isDark.value}:${settingsStore.editorSettings.fontFamily}`);
 const CANVAS_MOUSE_WHEEL_SCROLL_MULTIPLIER = 1.5;
 const CANVAS_TRACKPAD_DELTA_THRESHOLD = 40;
 let canvasResizeObserver: ResizeObserver | null = null;
@@ -6729,7 +6731,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 <div class="relative" :style="{ width: `${totalWidth}px`, height: `${canvasContentHeight}px` }">
                   <canvas
                     ref="canvasRef"
-                    class="canvas-grid-surface sticky left-0 top-0 z-0 block text-xs font-sans font-normal"
+                    class="canvas-grid-surface dbx-editor-font-family sticky left-0 top-0 z-0 block text-xs font-normal"
                     :style="{ width: `${canvasSurfaceWidth}px`, height: `${canvasViewportHeight}px` }"
                     @mousemove="onCanvasMouseMove"
                     @mouseleave="onCanvasMouseLeave"
@@ -6737,7 +6739,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     @contextmenu="onCanvasContext"
                     @dblclick="onCanvasDblClick"
                   />
-                  <div ref="canvasOverlayRef" class="canvas-grid-overlay sticky left-0 top-0 z-10 overflow-hidden" :style="canvasOverlayStyle">
+                  <div ref="canvasOverlayRef" class="canvas-grid-overlay dbx-editor-font-family sticky left-0 top-0 z-10 overflow-hidden" :style="canvasOverlayStyle">
                     <div v-if="canvasEditingCell" class="absolute pointer-events-auto z-20" :class="{ 'tabular-nums': canvasEditingCellIsNumeric }" :style="canvasEditingCellStyle" @mousedown.stop @click.stop>
                       <TemporalCellEditor v-if="temporalEditorKindForColumn(canvasEditingCell.actualColIdx)" v-model="editValue" :kind="temporalEditorKindForColumn(canvasEditingCell.actualColIdx)!" @cancel="cancelEdit" @commit="commitGridEdit" />
                       <EnumCellEditor
@@ -6792,7 +6794,18 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               </div>
 
               <!-- Virtual scrolled rows -->
-              <RecycleScroller v-else-if="hasVisibleRows" ref="scrollerRef" class="data-grid-scroller flex-1 overflow-x-auto overscroll-none" :class="{ 'is-scrolling': isScrolling }" :items="displayItems" :item-size="26" :buffer="600" :skip-hover="true" key-field="id" @scroll="onScrollerScroll">
+              <RecycleScroller
+                v-else-if="hasVisibleRows"
+                ref="scrollerRef"
+                class="data-grid-scroller dbx-editor-font-family flex-1 overflow-x-auto overscroll-none"
+                :class="{ 'is-scrolling': isScrolling }"
+                :items="displayItems"
+                :item-size="26"
+                :buffer="600"
+                :skip-hover="true"
+                key-field="id"
+                @scroll="onScrollerScroll"
+              >
                 <template #default="{ item }">
                   <div
                     class="flex text-xs border-b border-border"
@@ -7810,11 +7823,15 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 
 .canvas-grid-surface {
   cursor: cell;
-  font-family: inherit;
+  font-family: var(--dbx-editor-font-family, var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace));
   font-size: 0.75rem;
   font-weight: 400;
   line-height: 1rem;
   outline: none;
+}
+
+.cell-edit-input {
+  font-family: inherit;
 }
 
 .canvas-grid-overlay {
