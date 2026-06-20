@@ -6,12 +6,15 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import { classifySqlActivityKind } from "@/lib/historyActivityKind";
+import { appendGovernanceAuditRecord, createQueryAuditRecord, evaluateSqlGovernance, findConnectionSharePolicy, readGovernancePolicy, type WorkspacePrincipal } from "@/lib/workspaceGovernance";
 import { sqlMetadataRefreshTarget } from "@/lib/sqlMetadataRefresh";
 import { classifyRedisCommandSafety, firstRedisCommandToken } from "@/lib/redisCommandSafety";
 import { isSqlExecutionSnapshot, resolveExecutableSql, type SqlExecutionOverride, type SqlExecutionSnapshot } from "@/lib/sqlExecutionTarget";
+import { uuid } from "@/lib/utils";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
 const DANGER_RE = /^\s*(DROP|DELETE|TRUNCATE|ALTER|UPDATE|MERGE|REPLACE)\b/i;
+const LOCAL_PRINCIPAL_ID = "local-user";
 
 export function stripSqlComments(sql: string): string {
   return sql
@@ -80,7 +83,24 @@ export function useSqlExecution(deps: {
         }
       }
     }
-    if (isDangerousSql(sql) && settingsStore.editorSettings.confirmDangerousSqlExecution) {
+    const governanceDecision = currentGovernanceDecision(sql, tab.connectionId);
+    if (!governanceDecision.allowed) {
+      appendGovernanceAuditRecord({
+        ...createQueryAuditRecord({
+          id: uuid(),
+          connectionId: tab.connectionId,
+          principalId: LOCAL_PRINCIPAL_ID,
+          sql,
+          decision: governanceDecision,
+          createdAt: new Date().toISOString(),
+        }),
+        status: "error",
+        error: `Governance blocked: ${governanceDecision.reasons.join(", ")}`,
+      });
+      toast(`Governance blocked SQL: ${governanceDecision.reasons.join(", ")}`, 5000);
+      return;
+    }
+    if (governanceDecision.requiresApproval || (isDangerousSql(sql) && settingsStore.editorSettings.confirmDangerousSqlExecution)) {
       dangerSql.value = sql;
       pendingDangerSql.value = sql;
       suppressDangerConfirm.value = false;
@@ -104,6 +124,21 @@ export function useSqlExecution(deps: {
     }
     const elapsed = Date.now() - start;
     const success = !tab.result?.columns.includes("Error");
+    const error = success ? undefined : String(tab.result?.rows?.[0]?.[0] ?? "");
+    const governanceDecision = currentGovernanceDecision(sql, tab.connectionId);
+    appendGovernanceAuditRecord({
+      ...createQueryAuditRecord({
+        id: uuid(),
+        connectionId: tab.connectionId,
+        principalId: LOCAL_PRINCIPAL_ID,
+        sql,
+        decision: governanceDecision,
+        createdAt: new Date().toISOString(),
+      }),
+      status: success ? "success" : "error",
+      executionTimeMs: elapsed,
+      error,
+    });
     historyStore.add({
       connection_id: tab.connectionId,
       connection_name: connName,
@@ -111,7 +146,7 @@ export function useSqlExecution(deps: {
       sql,
       execution_time_ms: elapsed,
       success,
-      error: success ? undefined : String(tab.result?.rows?.[0]?.[0] ?? ""),
+      error,
       activity_kind: classifySqlActivityKind(sql),
       operation: primarySqlOperation(sql),
       affected_rows: success ? tab.result?.affected_rows : undefined,
@@ -137,6 +172,21 @@ export function useSqlExecution(deps: {
     if (reason === "unsupported") return t("explain.unsupported");
     if (reason === "unsafe") return t("explain.unsafe");
     return t("explain.emptySql");
+  }
+
+  function currentGovernanceDecision(sql: string, connectionId: string) {
+    const policy = readGovernancePolicy();
+    const principal: WorkspacePrincipal = {
+      id: LOCAL_PRINCIPAL_ID,
+      role: policy.principalRole,
+    };
+    return evaluateSqlGovernance(sql, deps.activeConnection.value, {
+      principal,
+      sharePolicy: findConnectionSharePolicy(connectionId),
+      allowDangerousSql: policy.allowDangerousSql,
+      allowProductionWrites: policy.allowProductionWrites,
+      requireApprovalForWrites: policy.requireApprovalForWrites,
+    });
   }
 
   async function tryExplain(sqlOverride?: SqlExecutionOverride) {

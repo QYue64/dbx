@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount, h } from "vue";
 import { useI18n } from "vue-i18n";
-import { DatabaseZap, FilePlus2, Loader2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown } from "@lucide/vue";
+import { DatabaseZap, FilePlus2, Loader2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown, ShieldCheck } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
@@ -44,6 +44,7 @@ const emit = defineEmits<{
   "toggle-sql-library": [];
   "open-github": [];
   "open-settings": [];
+  "open-governance": [];
   "open-driver-store": [];
   "check-updates": [];
   "open-transfer": [];
@@ -490,6 +491,15 @@ const checkingUpdates = computed(() => props.checkingUpdates);
         </Button>
       </TooltipTrigger>
       <TooltipContent>{{ t("settings.title") }}</TooltipContent>
+    </Tooltip>
+
+    <Tooltip>
+      <TooltipTrigger as-child>
+        <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" :aria-label="t('governanceCenter.title')" @click="emit('open-governance')">
+          <ShieldCheck class="h-4 w-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{{ t("governanceCenter.title") }}</TooltipContent>
     </Tooltip>
 
     <WindowControls v-if="showControls" :is-maximized="isMaximized" @minimize="minimize" @toggle-maximize="toggleMaximize" @close="close" />

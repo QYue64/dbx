@@ -80,6 +80,7 @@ const AiAssistant = defineAsyncComponent(() => import("@/components/editor/AiAss
 const QueryHistory = defineAsyncComponent(() => import("@/components/editor/QueryHistory.vue"));
 const SqlLibraryPanel = defineAsyncComponent(() => import("@/components/layout/SqlLibraryPanel.vue"));
 const DriverStorePage = defineAsyncComponent(() => import("@/components/config/DriverStoreDialog.vue"));
+const GovernanceCenterDialog = defineAsyncComponent(() => import("@/components/config/GovernanceCenterDialog.vue"));
 const UpdateDialog = defineAsyncComponent(() => import("@/components/layout/UpdateDialog.vue"));
 const CloseActionPromptDialog = defineAsyncComponent(() => import("@/components/layout/CloseActionPromptDialog.vue"));
 const LoginPage = defineAsyncComponent(() => import("@/components/auth/LoginPage.vue"));
@@ -110,6 +111,7 @@ const showConnectionDialog = ref(false);
 const connectionDialogPrefill = ref<ConnectionDeepLinkDraft | null>(null);
 const showSettingsDialog = ref(false);
 const showDriverStore = ref(false);
+const showGovernanceCenter = ref(false);
 const showQuickOpen = ref(false);
 const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
@@ -1357,6 +1359,7 @@ onUnmounted(() => {
           @toggle-sql-library="toggleSqlLibrary"
           @open-github="openGitHub"
           @open-settings="showSettingsDialog = true"
+          @open-governance="showGovernanceCenter = true"
           @open-driver-store="showDriverStore = !showDriverStore"
           @check-updates="checkUpdates()"
           @open-transfer="dialogs.showTransferDialog.value = true"
@@ -1531,6 +1534,7 @@ onUnmounted(() => {
           @open-lineage-target="openLineageTarget"
           @open-database-search-target="openDatabaseSearchTarget"
         />
+        <GovernanceCenterDialog v-if="showGovernanceCenter" v-model:open="showGovernanceCenter" />
         <UpdateDialog
           v-if="showUpdateDialog"
           v-model:open="showUpdateDialog"
