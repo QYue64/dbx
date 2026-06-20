@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 const JDBC_PLUGIN_DOWNLOAD_URL: &str =
-    "https://github.com/t8y2/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip";
-const JDBC_PLUGIN_R2_PATH: &str = "releases/latest/dbx-jdbc-plugin-latest.zip";
+    "https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JdbcDriverInfo {
@@ -319,10 +318,13 @@ async fn download_jdbc_plugin_zip_with_progress(progress: &impl Fn(AgentProgress
         .build()
         .map_err(|err| err.to_string())?;
 
-    let mut resp =
-        crate::race_download(&client, JDBC_PLUGIN_DOWNLOAD_URL, JDBC_PLUGIN_R2_PATH, "dbx-jdbc-plugin-installer")
-            .await
-            .map_err(|err| format!("Failed to download JDBC plugin: {err}"))?;
+    let mut resp = client
+        .get(JDBC_PLUGIN_DOWNLOAD_URL)
+        .header(reqwest::header::USER_AGENT, "dbx-jdbc-plugin-installer")
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|err| format!("Failed to download JDBC plugin: {err}"))?;
 
     let total = resp.content_length().unwrap_or(0);
     progress(AgentProgressEvent::transfer("jdbc-plugin", 0, total));

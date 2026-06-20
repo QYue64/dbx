@@ -106,15 +106,15 @@ mod tests {
     #[test]
     fn download_candidates_exclude_third_party_github_proxy() {
         let urls = download_candidate_urls(
-            "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
-            "releases/latest/latest.json",
+            "https://github.com/t8y2/dbx-agents/releases/latest/download/agent-registry.json",
+            "agents/agent-registry.json",
         );
 
         assert_eq!(
             urls,
             vec![
-                "https://dl.dbxio.com/releases/latest/latest.json",
-                "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
+                "https://dl.dbxio.com/agents/agent-registry.json",
+                "https://github.com/t8y2/dbx-agents/releases/latest/download/agent-registry.json",
             ]
         );
     }
