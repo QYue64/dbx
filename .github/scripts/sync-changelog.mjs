@@ -5,12 +5,12 @@ import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const REPO = "t8y2/dbx";
+const REPO = "QYue64/dbx";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
 const OUT_CN = "releases-cn.json";
 const OUT_EN = "releases-en.json";
-const EN_CACHE_URL = process.env.CHANGELOG_EN_CACHE_URL || "https://dl.dbxio.com/changelog/releases-en.json";
+const EN_CACHE_URL = process.env.CHANGELOG_EN_CACHE_URL || "";
 
 const SECTION_MAP = {
   新功能: "added",
@@ -120,6 +120,7 @@ function releaseToMarkdown(release) {
 }
 
 export async function fetchCachedEnglish({ cacheUrl = EN_CACHE_URL, fetchImpl = fetch } = {}) {
+  if (!cacheUrl) return null;
   try {
     const res = await fetchImpl(cacheUrl, { headers: { Accept: "application/json" } });
     if (!res.ok) {

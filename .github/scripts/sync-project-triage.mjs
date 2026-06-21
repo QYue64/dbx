@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-const DEFAULT_PROJECT_OWNER = "t8y2";
+const DEFAULT_PROJECT_OWNER = "QYue64";
 const DEFAULT_PROJECT_NUMBER = 1;
-const DEFAULT_REPO = "t8y2/dbx";
+const DEFAULT_REPO = "QYue64/dbx";
 
 function parseArgs(argv) {
   const args = {};
