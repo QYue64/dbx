@@ -254,7 +254,14 @@ test("governance policy and automation drafts persist through injected storage",
     storage,
   );
   assert.equal(policy.principalRole, "editor");
-  assert.equal(readGovernancePolicy(storage).allowProductionWrites, true);
+  assert.deepEqual(readGovernancePolicy(storage), {
+    principalRole: "editor",
+    requireApprovalForWrites: false,
+    allowProductionWrites: true,
+    allowDangerousSql: false,
+    aiAllowWrites: false,
+    aiRequireDryRunForWrites: true,
+  });
 
   appendAutomationDraft(
     {
@@ -276,6 +283,24 @@ test("governance policy and automation drafts persist through injected storage",
   assert.equal(readAutomationDrafts(storage)[0].enabled, true);
   deleteAutomationDraft("job1", storage);
   assert.equal(readAutomationDrafts(storage).length, 0);
+});
+
+test("governance policy save fails when storage is unavailable", () => {
+  assert.throws(
+    () =>
+      saveGovernancePolicy(
+        {
+          principalRole: "admin",
+          requireApprovalForWrites: true,
+          allowProductionWrites: false,
+          allowDangerousSql: false,
+          aiAllowWrites: true,
+          aiRequireDryRunForWrites: true,
+        },
+        undefined,
+      ),
+    /storage is unavailable/,
+  );
 });
 
 test("automation run plans expose executable SQL for manual review", () => {

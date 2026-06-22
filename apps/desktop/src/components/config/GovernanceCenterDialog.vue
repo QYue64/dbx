@@ -315,8 +315,13 @@ function badgeVariant(severity: GovernanceSeverity) {
 }
 
 function savePolicy() {
-  policy.value = saveGovernancePolicy(policy.value);
-  toast(t("governanceCenter.toast.policySaved"), 1800);
+  try {
+    policy.value = saveGovernancePolicy(policy.value);
+    toast(t("governanceCenter.toast.policySaved"), 1800);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    toast(t("governanceCenter.toast.policySaveFailed", { message }), 4000);
+  }
 }
 
 function saveActiveSqlAutomation() {

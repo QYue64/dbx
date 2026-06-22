@@ -188,6 +188,17 @@ export const DEFAULT_GOVERNANCE_POLICY: GovernancePolicySettings = {
   aiRequireDryRunForWrites: true,
 };
 
+function normalizeGovernancePolicy(policy: Partial<GovernancePolicySettings> | null | undefined): GovernancePolicySettings {
+  return {
+    principalRole: policy?.principalRole && ROLE_PERMISSIONS[policy.principalRole] ? policy.principalRole : DEFAULT_GOVERNANCE_POLICY.principalRole,
+    requireApprovalForWrites: typeof policy?.requireApprovalForWrites === "boolean" ? policy.requireApprovalForWrites : DEFAULT_GOVERNANCE_POLICY.requireApprovalForWrites,
+    allowProductionWrites: typeof policy?.allowProductionWrites === "boolean" ? policy.allowProductionWrites : DEFAULT_GOVERNANCE_POLICY.allowProductionWrites,
+    allowDangerousSql: typeof policy?.allowDangerousSql === "boolean" ? policy.allowDangerousSql : DEFAULT_GOVERNANCE_POLICY.allowDangerousSql,
+    aiAllowWrites: typeof policy?.aiAllowWrites === "boolean" ? policy.aiAllowWrites : DEFAULT_GOVERNANCE_POLICY.aiAllowWrites,
+    aiRequireDryRunForWrites: typeof policy?.aiRequireDryRunForWrites === "boolean" ? policy.aiRequireDryRunForWrites : DEFAULT_GOVERNANCE_POLICY.aiRequireDryRunForWrites,
+  };
+}
+
 export function permissionsForRole(role: WorkspaceRole): Set<WorkspacePermission> {
   return new Set(ROLE_PERMISSIONS[role]);
 }
@@ -341,17 +352,18 @@ export function clearGovernanceAuditRecords(storage: GovernanceAuditStorage | un
 }
 
 export function readGovernancePolicy(storage: GovernanceAuditStorage | undefined = defaultAuditStorage()): GovernancePolicySettings {
-  const policy = readJsonObject(GOVERNANCE_POLICY_STORAGE_KEY, DEFAULT_GOVERNANCE_POLICY, storage);
-  return {
-    ...policy,
-    principalRole: ROLE_PERMISSIONS[policy.principalRole] ? policy.principalRole : DEFAULT_GOVERNANCE_POLICY.principalRole,
-  };
+  return normalizeGovernancePolicy(readJsonObject(GOVERNANCE_POLICY_STORAGE_KEY, DEFAULT_GOVERNANCE_POLICY, storage));
 }
 
 export function saveGovernancePolicy(policy: GovernancePolicySettings, storage: GovernanceAuditStorage | undefined = defaultAuditStorage()): GovernancePolicySettings {
-  const normalized = { ...DEFAULT_GOVERNANCE_POLICY, ...policy };
-  storage?.setItem(GOVERNANCE_POLICY_STORAGE_KEY, JSON.stringify(normalized));
-  return normalized;
+  if (!storage) throw new Error("Governance policy storage is unavailable");
+  const normalized = normalizeGovernancePolicy(policy);
+  storage.setItem(GOVERNANCE_POLICY_STORAGE_KEY, JSON.stringify(normalized));
+  const persisted = readGovernancePolicy(storage);
+  if (JSON.stringify(persisted) !== JSON.stringify(normalized)) {
+    throw new Error("Governance policy was not persisted");
+  }
+  return persisted;
 }
 
 export function readAutomationDrafts(storage: GovernanceAuditStorage | undefined = defaultAuditStorage()): AutomationDraft[] {

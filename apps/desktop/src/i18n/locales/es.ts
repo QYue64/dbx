@@ -2399,6 +2399,7 @@ export default {
       openConnectionFirst: "Abre una pestaña de conexión antes de guardar una política",
       connectionPolicySaved: "Política de conexión guardada",
       policySaved: "Política de gobernanza guardada",
+      policySaveFailed: "Error al guardar la política de gobernanza: {message}",
       automationSaved: "Borrador de automatización guardado",
       auditSavedAsAutomation: "SQL de auditoría guardado como automatización",
       automationDeleted: "Borrador de automatización eliminado",

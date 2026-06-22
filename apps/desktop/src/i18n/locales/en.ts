@@ -2751,6 +2751,7 @@ export default {
       openConnectionFirst: "Open a connection tab before saving a connection policy",
       connectionPolicySaved: "Connection policy saved",
       policySaved: "Governance policy saved",
+      policySaveFailed: "Failed to save governance policy: {message}",
       automationSaved: "Automation draft saved",
       auditSavedAsAutomation: "Audit SQL saved as automation",
       automationDeleted: "Automation draft deleted",

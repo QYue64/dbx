@@ -2705,6 +2705,7 @@ export default {
       openConnectionFirst: "接続ポリシーを保存する前に接続タブを開いてください",
       connectionPolicySaved: "接続ポリシーを保存しました",
       policySaved: "ガバナンスポリシーを保存しました",
+      policySaveFailed: "ガバナンスポリシーの保存に失敗しました: {message}",
       automationSaved: "自動化ドラフトを保存しました",
       auditSavedAsAutomation: "監査 SQL を自動化として保存しました",
       automationDeleted: "自動化ドラフトを削除しました",

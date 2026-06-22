@@ -2775,6 +2775,7 @@ export default {
       openConnectionFirst: "请先打开一个连接标签页再保存连接策略",
       connectionPolicySaved: "连接策略已保存",
       policySaved: "治理策略已保存",
+      policySaveFailed: "治理策略保存失败：{message}",
       automationSaved: "自动化草稿已保存",
       auditSavedAsAutomation: "审计 SQL 已保存为自动化",
       automationDeleted: "自动化草稿已删除",

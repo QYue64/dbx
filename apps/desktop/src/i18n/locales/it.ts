@@ -2474,6 +2474,7 @@ export default {
       openConnectionFirst: "Apri una scheda connessione prima di salvare una policy",
       connectionPolicySaved: "Policy connessione salvata",
       policySaved: "Policy governance salvata",
+      policySaveFailed: "Impossibile salvare la policy governance: {message}",
       automationSaved: "Bozza automazione salvata",
       auditSavedAsAutomation: "SQL audit salvato come automazione",
       automationDeleted: "Bozza automazione eliminata",

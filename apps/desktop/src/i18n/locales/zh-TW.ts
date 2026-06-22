@@ -2484,6 +2484,7 @@ export default {
       openConnectionFirst: "請先開啟一個連線分頁再儲存連線策略",
       connectionPolicySaved: "連線策略已儲存",
       policySaved: "治理策略已儲存",
+      policySaveFailed: "治理策略儲存失敗：{message}",
       automationSaved: "自動化草稿已儲存",
       auditSavedAsAutomation: "稽核 SQL 已儲存為自動化",
       automationDeleted: "自動化草稿已刪除",

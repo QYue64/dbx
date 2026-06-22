@@ -2485,6 +2485,7 @@ export default {
       openConnectionFirst: "Abra uma aba de conexão antes de salvar uma política",
       connectionPolicySaved: "Política da conexão salva",
       policySaved: "Política de governança salva",
+      policySaveFailed: "Falha ao salvar a política de governança: {message}",
       automationSaved: "Rascunho de automação salvo",
       auditSavedAsAutomation: "SQL de auditoria salvo como automação",
       automationDeleted: "Rascunho de automação excluído",
