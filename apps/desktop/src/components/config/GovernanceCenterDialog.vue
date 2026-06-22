@@ -1,53 +1,33 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Activity, Bot, CalendarClock, Clipboard, ClipboardCheck, FileSearch, GitPullRequest, Play, PlugZap, Save, ShieldCheck, Trash2 } from "@lucide/vue";
+import { Activity, Bot, ClipboardCheck, Save, ShieldCheck } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import {
-  appendAutomationDraft,
-  buildAuditReport,
-  buildAutomationPlan,
-  buildAutomationRunPlan,
-  buildChangeRequestArtifact,
-  buildChangeRequestPlan,
-  buildDataQualityReport,
   buildDiagnosticsSummary,
-  buildGovernanceBundleReport,
-  buildDiagnosticsReport,
-  buildPluginPublishReport,
-  clearGovernanceAuditRecords,
-  deleteAutomationDraft,
   createQueryAuditRecord,
   evaluateSqlGovernance,
   planAiGovernance,
   readConnectionSharePolicies,
-  profileQueryResultQuality,
-  readAutomationDrafts,
   readGovernanceAuditRecords,
   readGovernancePolicy,
   saveGovernancePolicy,
-  summarizePluginPublishing,
-  topDataQualityFindings,
+  normalizeGovernancePolicy,
   upsertConnectionSharePolicy,
-  updateAutomationDraft,
-  type AutomationDraft,
   type GovernanceSeverity,
   type GovernancePolicySettings,
   type WorkspaceRole,
   type WorkspacePrincipal,
   type ConnectionSharePolicy,
 } from "@/lib/workspaceGovernance";
-import { copyToClipboard } from "@/lib/clipboard";
 import { useToast } from "@/composables/useToast";
-import { getDriverRuntimeSummary, listPlugins, type DriverRuntimeSummary } from "@/lib/api";
-import type { InstalledPlugin } from "@/types/database";
+import { getDriverRuntimeSummary, loadDesktopSettings, saveDesktopSettings, type DriverRuntimeSummary } from "@/lib/api";
 
 const open = defineModel<boolean>("open", { default: false });
 const connectionStore = useConnectionStore();
@@ -56,12 +36,13 @@ const { toast } = useToast();
 const { t, te } = useI18n();
 
 const policy = ref<GovernancePolicySettings>(readGovernancePolicy());
-const automationDrafts = ref(readAutomationDrafts());
 const connectionPolicies = ref<ConnectionSharePolicy[]>(readConnectionSharePolicies());
 const connectionDefaultRole = ref<WorkspaceRole>("admin");
 const driverRuntime = ref<DriverRuntimeSummary | undefined>();
-const installedPlugins = ref<InstalledPlugin[]>([]);
-const pluginLoadError = ref("");
+const isPolicySaving = ref(false);
+const isPolicyDirty = ref(false);
+const auditRecordsOpen = ref(false);
+let policyLoadRunId = 0;
 const principal = computed<WorkspacePrincipal>(() => ({
   id: "local-user",
   role: policy.value.principalRole,
@@ -75,33 +56,50 @@ watch(
   open,
   (isOpen) => {
     if (!isOpen) return;
-    policy.value = readGovernancePolicy();
-    automationDrafts.value = readAutomationDrafts();
+    isPolicyDirty.value = false;
+    void loadPolicy();
     connectionPolicies.value = readConnectionSharePolicies();
     syncConnectionDefaultRole();
     refreshDriverRuntime();
-    refreshPlugins();
   },
   { immediate: true },
 );
 
 watch(activeConnection, syncConnectionDefaultRole);
 
+async function loadPolicy() {
+  const runId = ++policyLoadRunId;
+  const fallback = readGovernancePolicy();
+  if (!isPolicyDirty.value) {
+    policy.value = fallback;
+  }
+  try {
+    const settings = await loadDesktopSettings();
+    if (runId !== policyLoadRunId || isPolicyDirty.value) return;
+    policy.value = normalizeGovernancePolicy(settings.governance_policy || fallback);
+  } catch {
+    if (runId !== policyLoadRunId || isPolicyDirty.value) return;
+    policy.value = fallback;
+  }
+  syncConnectionDefaultRole();
+}
+
+function updatePolicy(patch: Partial<GovernancePolicySettings>) {
+  isPolicyDirty.value = true;
+  policy.value = normalizeGovernancePolicy({ ...policy.value, ...patch });
+  syncConnectionDefaultRole();
+}
+
+function updatePrincipalRole(value: unknown) {
+  if (typeof value !== "string" || !roleItems.includes(value as WorkspaceRole)) return;
+  updatePolicy({ principalRole: value as WorkspaceRole });
+}
+
 async function refreshDriverRuntime() {
   try {
     driverRuntime.value = await getDriverRuntimeSummary();
   } catch {
     driverRuntime.value = undefined;
-  }
-}
-
-async function refreshPlugins() {
-  try {
-    pluginLoadError.value = "";
-    installedPlugins.value = await listPlugins();
-  } catch (error) {
-    installedPlugins.value = [];
-    pluginLoadError.value = error instanceof Error ? error.message : String(error);
   }
 }
 
@@ -149,23 +147,6 @@ const auditRecord = computed(() =>
 );
 const storedAuditRecords = computed(() => readGovernanceAuditRecords());
 
-const changePlan = computed(() =>
-  buildChangeRequestPlan({
-    id: "preview",
-    title: activeTab.value?.title || "active query",
-    sql: activeSql.value,
-    createdAt: new Date().toISOString(),
-  }),
-);
-const changeArtifact = computed(() =>
-  buildChangeRequestArtifact({
-    id: "preview",
-    title: activeTab.value?.title || "active query",
-    sql: activeSql.value,
-    createdAt: new Date().toISOString(),
-  }),
-);
-
 const diagnostics = computed(() =>
   buildDiagnosticsSummary({
     connections: connectionStore.connections,
@@ -181,30 +162,6 @@ const aiPlan = computed(() =>
     requireDryRunForWrites: policy.value.aiRequireDryRunForWrites,
   }),
 );
-const automationPlan = computed(() =>
-  buildAutomationPlan(
-    {
-      kind: "sql",
-      connectionId: activeConnection.value?.id || "",
-      schedule: "manual",
-      sql: activeSql.value,
-    },
-    activeConnection.value,
-  ),
-);
-
-const qualityProfile = computed(() => {
-  const result = activeTab.value?.result;
-  return result ? profileQueryResultQuality(result) : undefined;
-});
-
-const pluginSummary = computed(() => summarizePluginPublishing(installedPlugins.value));
-const pluginSeverity = computed<GovernanceSeverity>(() => {
-  if (pluginSummary.value.blocked > 0 || pluginLoadError.value) return "critical";
-  if (pluginSummary.value.total === 0) return "warning";
-  return "ok";
-});
-const qualityFindings = computed(() => (qualityProfile.value ? topDataQualityFindings(qualityProfile.value) : []));
 
 function reasonLabel(reason: string) {
   const key = `governanceCenter.reason.${reason}`;
@@ -235,14 +192,6 @@ const sections = computed(
         detail: storedAuditRecords.value[0]?.sqlPreview || auditRecord.value.sqlPreview || t("governanceCenter.noActiveSql"),
       },
       {
-        id: "change",
-        icon: GitPullRequest,
-        title: t("governanceCenter.section.change"),
-        severity: changePlan.value.requiresApproval ? "warning" : "info",
-        metric: changePlan.value.migrationName,
-        detail: changePlan.value.rollbackRequired ? t("governanceCenter.rollbackRequired") : t("governanceCenter.noRollbackRequired"),
-      },
-      {
         id: "diagnostics",
         icon: Activity,
         title: t("governanceCenter.section.diagnostics"),
@@ -251,47 +200,12 @@ const sections = computed(
         detail: diagnostics.value.checks[0]?.message || t("governanceCenter.healthy"),
       },
       {
-        id: "plugins",
-        icon: PlugZap,
-        title: t("governanceCenter.section.plugins"),
-        severity: pluginSeverity.value,
-        metric: t("governanceCenter.metric.publishable", {
-          publishable: pluginSummary.value.publishable,
-          total: pluginSummary.value.total,
-        }),
-        detail: pluginLoadError.value || pluginSummary.value.issues[0]?.message || t("governanceCenter.pluginManifestsValid"),
-      },
-      {
         id: "ai",
         icon: Bot,
         title: t("governanceCenter.section.ai"),
         severity: aiPlan.value.requiresHumanApproval ? "warning" : "ok",
         metric: aiPlan.value.requiresDryRun ? t("governanceCenter.dryRun") : t("governanceCenter.direct"),
         detail: reasonText(aiPlan.value.reasons) || t("governanceCenter.policyReady"),
-      },
-      {
-        id: "automation",
-        icon: CalendarClock,
-        title: t("governanceCenter.section.automation"),
-        severity: automationPlan.value.safety,
-        metric: t("governanceCenter.metric.drafts", { count: automationDrafts.value.length }),
-        detail: reasonText(automationPlan.value.reasons) || t("governanceCenter.manualScheduleReady"),
-      },
-      {
-        id: "quality",
-        icon: FileSearch,
-        title: t("governanceCenter.section.quality"),
-        severity: qualityProfile.value ? "info" : "warning",
-        metric: qualityProfile.value ? t("governanceCenter.metric.rows", { count: qualityProfile.value.rowCount }) : t("governanceCenter.noResult"),
-        detail:
-          qualityFindings.value
-            .map((column) =>
-              t("governanceCenter.metric.nullRate", {
-                name: column.name,
-                rate: Math.round(column.nullRate * 100),
-              }),
-            )
-            .join(" | ") || t("governanceCenter.runQueryToProfile"),
       },
     ] satisfies Array<{
       id: string;
@@ -314,112 +228,34 @@ function badgeVariant(severity: GovernanceSeverity) {
   return severity === "critical" ? "destructive" : "secondary";
 }
 
-function savePolicy() {
+function openSection(sectionId: string) {
+  if (sectionId === "audit") {
+    auditRecordsOpen.value = true;
+  }
+}
+
+async function savePolicy() {
+  if (isPolicySaving.value) return;
+  isPolicySaving.value = true;
   try {
-    policy.value = saveGovernancePolicy(policy.value);
+    const normalized = normalizeGovernancePolicy({ ...policy.value });
+    const settings = await loadDesktopSettings();
+    await saveDesktopSettings({ ...settings, governance_policy: normalized });
+    const persistedSettings = await loadDesktopSettings();
+    const persisted = normalizeGovernancePolicy(persistedSettings.governance_policy || null);
+    if (JSON.stringify(persisted) !== JSON.stringify(normalized)) {
+      throw new Error("Governance policy was not persisted to desktop settings");
+    }
+    saveGovernancePolicy(persisted);
+    policy.value = persisted;
+    isPolicyDirty.value = false;
     toast(t("governanceCenter.toast.policySaved"), 1800);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     toast(t("governanceCenter.toast.policySaveFailed", { message }), 4000);
+  } finally {
+    isPolicySaving.value = false;
   }
-}
-
-function saveActiveSqlAutomation() {
-  automationDrafts.value = appendAutomationDraft({
-    name: activeTab.value?.title || "Active SQL",
-    kind: "sql",
-    connectionId: activeConnection.value?.id || "",
-    schedule: "manual",
-    sql: activeSql.value,
-    enabled: false,
-  });
-  toast(t("governanceCenter.toast.automationSaved"), 1800);
-}
-
-function saveAuditAutomation(record: { sqlPreview: string; connectionId: string; id: string }) {
-  automationDrafts.value = appendAutomationDraft({
-    name: `Audit ${record.id}`,
-    kind: "sql",
-    connectionId: record.connectionId,
-    schedule: "manual",
-    sql: record.sqlPreview,
-    enabled: false,
-  });
-  toast(t("governanceCenter.toast.auditSavedAsAutomation"), 1800);
-}
-
-function setAutomationEnabled(id: string | undefined, enabled: boolean) {
-  if (!id) return;
-  automationDrafts.value = updateAutomationDraft(id, { enabled });
-}
-
-function removeAutomation(id: string | undefined) {
-  if (!id) return;
-  automationDrafts.value = deleteAutomationDraft(id);
-  toast(t("governanceCenter.toast.automationDeleted"), 1800);
-}
-
-function openAutomation(draft: AutomationDraft) {
-  const runPlan = buildAutomationRunPlan(draft, connectionStore.getConfig(draft.connectionId));
-  if (!runPlan.executableSql?.trim()) {
-    toast(t("governanceCenter.toast.automationNoSql"), 2200);
-    return;
-  }
-  const connection = connectionStore.getConfig(draft.connectionId);
-  const tabId = queryStore.createTab(draft.connectionId, connection?.database || "", draft.name || t("governanceCenter.section.automation"), "query");
-  queryStore.updateSql(tabId, runPlan.executableSql);
-  open.value = false;
-}
-
-async function copyChangeArtifact(kind: "migration" | "rollback") {
-  await copyToClipboard(kind === "migration" ? changeArtifact.value.migrationSql : changeArtifact.value.rollbackSql);
-  toast(kind === "migration" ? t("governanceCenter.toast.migrationCopied") : t("governanceCenter.toast.rollbackCopied"), 1800);
-}
-
-async function copyAuditSql(sql: string) {
-  await copyToClipboard(sql);
-  toast(t("governanceCenter.toast.auditSqlCopied"), 1800);
-}
-
-async function copyAuditReport() {
-  await copyToClipboard(buildAuditReport(storedAuditRecords.value));
-  toast(t("governanceCenter.toast.auditReportCopied"), 1800);
-}
-
-function clearAudit() {
-  clearGovernanceAuditRecords();
-  toast(t("governanceCenter.toast.auditCleared"), 1800);
-}
-
-async function copyDiagnostics() {
-  await copyToClipboard(buildDiagnosticsReport(diagnostics.value));
-  toast(t("governanceCenter.toast.diagnosticsCopied"), 1800);
-}
-
-async function copyQualityReport() {
-  if (!qualityProfile.value) {
-    toast(t("governanceCenter.toast.runQueryBeforeQuality"), 2200);
-    return;
-  }
-  await copyToClipboard(buildDataQualityReport(qualityProfile.value));
-  toast(t("governanceCenter.toast.qualityCopied"), 1800);
-}
-
-async function copyPluginReport() {
-  await copyToClipboard(buildPluginPublishReport(pluginSummary.value));
-  toast(t("governanceCenter.toast.pluginReportCopied"), 1800);
-}
-
-async function copyGovernanceBundle() {
-  await copyToClipboard(
-    buildGovernanceBundleReport({
-      diagnostics: diagnostics.value,
-      auditRecords: storedAuditRecords.value,
-      automationDrafts: automationDrafts.value,
-      qualityProfile: qualityProfile.value,
-    }),
-  );
-  toast(t("governanceCenter.toast.bundleCopied"), 1800);
 }
 </script>
 
@@ -438,7 +274,7 @@ async function copyGovernanceBundle() {
           <div class="text-xs font-medium text-muted-foreground">
             {{ t("governanceCenter.localRole") }}
           </div>
-          <Select v-model="policy.principalRole">
+          <Select :model-value="policy.principalRole" @update:model-value="updatePrincipalRole">
             <SelectTrigger class="h-8 w-full">
               <SelectValue />
             </SelectTrigger>
@@ -451,27 +287,27 @@ async function copyGovernanceBundle() {
         <div class="grid gap-2 sm:grid-cols-3">
           <label class="flex items-center justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs">
             <span>{{ t("governanceCenter.approveWrites") }}</span>
-            <Switch v-model:checked="policy.requireApprovalForWrites" />
+            <Switch :model-value="policy.requireApprovalForWrites" @update:model-value="updatePolicy({ requireApprovalForWrites: Boolean($event) })" />
           </label>
           <label class="flex items-center justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs">
             <span>{{ t("governanceCenter.productionWrites") }}</span>
-            <Switch v-model:checked="policy.allowProductionWrites" />
+            <Switch :model-value="policy.allowProductionWrites" @update:model-value="updatePolicy({ allowProductionWrites: Boolean($event) })" />
           </label>
           <label class="flex items-center justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs">
             <span>{{ t("governanceCenter.dangerousSql") }}</span>
-            <Switch v-model:checked="policy.allowDangerousSql" />
+            <Switch :model-value="policy.allowDangerousSql" @update:model-value="updatePolicy({ allowDangerousSql: Boolean($event) })" />
           </label>
           <label class="flex items-center justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs">
             <span>{{ t("governanceCenter.aiWrites") }}</span>
-            <Switch v-model:checked="policy.aiAllowWrites" />
+            <Switch :model-value="policy.aiAllowWrites" @update:model-value="updatePolicy({ aiAllowWrites: Boolean($event) })" />
           </label>
           <label class="flex items-center justify-between gap-2 rounded border bg-background px-2 py-1.5 text-xs">
             <span>{{ t("governanceCenter.aiDryRun") }}</span>
-            <Switch v-model:checked="policy.aiRequireDryRunForWrites" />
+            <Switch :model-value="policy.aiRequireDryRunForWrites" @update:model-value="updatePolicy({ aiRequireDryRunForWrites: Boolean($event) })" />
           </label>
-          <Button size="sm" class="h-8 justify-start gap-2" @click="savePolicy">
+          <Button size="sm" class="h-8 justify-start gap-2" :disabled="isPolicySaving" @click="savePolicy">
             <Save class="h-3.5 w-3.5" />
-            {{ t("governanceCenter.savePolicy") }}
+            {{ isPolicySaving ? t("common.loading") : t("governanceCenter.savePolicy") }}
           </Button>
         </div>
       </div>
@@ -505,7 +341,17 @@ async function copyGovernanceBundle() {
       </div>
 
       <div class="grid gap-3 py-2 sm:grid-cols-2">
-        <div v-for="section in sections" :key="section.id" class="min-w-0 rounded-md border p-3" :class="severityClass(section.severity)">
+        <div
+          v-for="section in sections"
+          :key="section.id"
+          class="min-w-0 rounded-md border p-3"
+          :class="[severityClass(section.severity), section.id === 'audit' ? 'cursor-pointer transition-colors hover:bg-muted/30 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none' : '']"
+          :role="section.id === 'audit' ? 'button' : undefined"
+          :tabindex="section.id === 'audit' ? 0 : undefined"
+          @click="openSection(section.id)"
+          @keydown.enter.prevent="openSection(section.id)"
+          @keydown.space.prevent="openSection(section.id)"
+        >
           <div class="mb-2 flex min-w-0 items-center justify-between gap-2">
             <div class="flex min-w-0 items-center gap-2">
               <component :is="section.icon" class="h-4 w-4 shrink-0" />
@@ -517,171 +363,42 @@ async function copyGovernanceBundle() {
           <div class="mt-1 line-clamp-2 text-xs opacity-80">{{ section.detail }}</div>
         </div>
       </div>
+    </DialogContent>
+  </Dialog>
 
-      <Separator />
+  <Dialog v-model:open="auditRecordsOpen">
+    <DialogContent class="max-h-[82vh] overflow-auto sm:max-w-[760px]">
+      <DialogHeader>
+        <DialogTitle class="flex items-center gap-2">
+          <ClipboardCheck class="h-5 w-5" />
+          {{ t("governanceCenter.auditLog") }}
+          <Badge variant="secondary">{{ storedAuditRecords.length }}</Badge>
+        </DialogTitle>
+      </DialogHeader>
 
-      <div class="grid gap-2 sm:grid-cols-4">
-        <Button variant="outline" size="sm" class="justify-start gap-2" @click="saveActiveSqlAutomation">
-          <CalendarClock class="h-3.5 w-3.5" />
-          {{ t("governanceCenter.saveAutomation") }}
-        </Button>
-        <Button variant="outline" size="sm" class="justify-start gap-2" @click="copyDiagnostics">
-          <Activity class="h-3.5 w-3.5" />
-          {{ t("governanceCenter.copyDiagnostics") }}
-        </Button>
-        <Button variant="outline" size="sm" class="justify-start gap-2" @click="copyQualityReport">
-          <FileSearch class="h-3.5 w-3.5" />
-          {{ t("governanceCenter.copyQuality") }}
-        </Button>
-        <Button variant="outline" size="sm" class="justify-start gap-2" @click="copyGovernanceBundle">
-          <Clipboard class="h-3.5 w-3.5" />
-          {{ t("governanceCenter.copyBundle") }}
-        </Button>
-        <Button variant="outline" size="sm" class="justify-start gap-2" @click="copyAuditReport">
-          <ClipboardCheck class="h-3.5 w-3.5" />
-          {{ t("governanceCenter.copyAudit") }}
-        </Button>
-        <Button variant="outline" size="sm" class="justify-start gap-2" @click="copyPluginReport">
-          <PlugZap class="h-3.5 w-3.5" />
-          {{ t("governanceCenter.copyPlugins") }}
-        </Button>
-      </div>
-
-      <div class="grid gap-3 lg:grid-cols-3">
-        <div class="rounded-md border p-3">
-          <div class="mb-2 flex items-center justify-between gap-2">
-            <div class="text-sm font-medium">{{ t("governanceCenter.changeArtifact") }}</div>
-            <Badge variant="secondary">{{ changeArtifact.requiresApproval ? t("governanceCenter.approval") : t("governanceCenter.ready") }}</Badge>
+      <div v-if="storedAuditRecords.length" class="grid gap-2">
+        <div v-for="record in storedAuditRecords" :key="record.id" class="grid gap-2 rounded-md border bg-muted/20 p-3">
+          <div class="flex min-w-0 flex-wrap items-center gap-2">
+            <Badge :variant="record.status === 'error' ? 'destructive' : 'secondary'">{{ record.status }}</Badge>
+            <Badge :variant="badgeVariant(record.decision.auditLevel)">{{ record.decision.auditLevel }}</Badge>
+            <span class="text-xs text-muted-foreground">{{ record.createdAt }}</span>
+            <span v-if="record.executionTimeMs !== undefined" class="text-xs text-muted-foreground">{{ record.executionTimeMs }}ms</span>
           </div>
-          <div class="truncate text-xs text-muted-foreground">
-            {{ changeArtifact.migrationName }}
+          <div class="grid gap-1 text-xs text-muted-foreground sm:grid-cols-2">
+            <div class="truncate">{{ record.connectionId || t("governanceCenter.noActiveConnection") }}</div>
+            <div class="truncate">{{ record.principalId }}</div>
           </div>
-          <div class="mt-3 grid gap-2 sm:grid-cols-2">
-            <Button variant="outline" size="sm" class="justify-start gap-2" @click="copyChangeArtifact('migration')">
-              <GitPullRequest class="h-3.5 w-3.5" />
-              {{ t("governanceCenter.copyMigration") }}
-            </Button>
-            <Button variant="outline" size="sm" class="justify-start gap-2" @click="copyChangeArtifact('rollback')">
-              <Clipboard class="h-3.5 w-3.5" />
-              {{ t("governanceCenter.copyRollback") }}
-            </Button>
+          <pre class="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-background p-2 text-xs text-foreground">{{ record.sqlPreview }}</pre>
+          <div v-if="record.decision.reasons.length" class="text-xs text-muted-foreground">
+            {{ reasonText(record.decision.reasons) }}
           </div>
-        </div>
-
-        <div class="rounded-md border p-3">
-          <div class="mb-2 flex items-center justify-between gap-2">
-            <div class="text-sm font-medium">{{ t("governanceCenter.auditLog") }}</div>
-            <Badge variant="secondary">{{ storedAuditRecords.length }}</Badge>
-          </div>
-          <div class="truncate text-xs text-muted-foreground">
-            {{ storedAuditRecords[0]?.sqlPreview || t("governanceCenter.noAuditRecords") }}
-          </div>
-          <Button variant="outline" size="sm" class="mt-3 justify-start gap-2" @click="clearAudit">
-            <Trash2 class="h-3.5 w-3.5" />
-            {{ t("governanceCenter.clearAudit") }}
-          </Button>
-        </div>
-
-        <div class="rounded-md border p-3">
-          <div class="mb-2 flex items-center justify-between gap-2">
-            <div class="text-sm font-medium">{{ t("governanceCenter.pluginReadiness") }}</div>
-            <Badge variant="secondary">{{ t("governanceCenter.metric.blocked", { count: pluginSummary.blocked }) }}</Badge>
-          </div>
-          <div class="truncate text-xs text-muted-foreground">
-            {{ pluginLoadError || pluginSummary.issues[0]?.message || t("governanceCenter.noPluginIssues") }}
-          </div>
-          <div class="mt-3 text-xs text-muted-foreground">
-            {{
-              t("governanceCenter.metric.pluginInstalled", {
-                publishable: pluginSummary.publishable,
-                total: pluginSummary.total,
-              })
-            }}
+          <div v-if="record.error" class="rounded bg-destructive/10 p-2 text-xs text-destructive">
+            {{ record.error }}
           </div>
         </div>
       </div>
-
-      <div class="grid gap-3 lg:grid-cols-2">
-        <div class="rounded-md border p-3">
-          <div class="mb-3 flex items-center justify-between gap-2">
-            <div class="text-sm font-medium">{{ t("governanceCenter.recentAuditRecords") }}</div>
-            <Badge variant="secondary">{{ storedAuditRecords.length }}</Badge>
-          </div>
-          <div v-if="storedAuditRecords.length" class="grid gap-2">
-            <div v-for="record in storedAuditRecords.slice(0, 5)" :key="record.id" class="grid gap-2 rounded border bg-muted/20 p-2 sm:grid-cols-[1fr_auto] sm:items-center">
-              <div class="min-w-0">
-                <div class="truncate text-xs font-medium">{{ record.status }} · {{ record.decision.auditLevel }} · {{ record.createdAt }}</div>
-                <div class="truncate text-xs text-muted-foreground">{{ record.sqlPreview }}</div>
-              </div>
-              <div class="flex items-center gap-2">
-                <Button variant="outline" size="icon-sm" @click="copyAuditSql(record.sqlPreview)">
-                  <Clipboard class="h-3.5 w-3.5" />
-                </Button>
-                <Button variant="outline" size="icon-sm" @click="saveAuditAutomation(record)">
-                  <CalendarClock class="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </div>
-          </div>
-          <div v-else class="text-xs text-muted-foreground">
-            {{ t("governanceCenter.auditEmptyHint") }}
-          </div>
-        </div>
-
-        <div class="rounded-md border p-3">
-          <div class="mb-3 flex items-center justify-between gap-2">
-            <div class="text-sm font-medium">{{ t("governanceCenter.dataQualityFindings") }}</div>
-            <Badge variant="secondary">{{ qualityFindings.length }}</Badge>
-          </div>
-          <div v-if="qualityFindings.length" class="grid gap-2">
-            <div v-for="column in qualityFindings" :key="column.name" class="rounded border bg-muted/20 p-2">
-              <div class="truncate text-sm font-medium">{{ column.name }}</div>
-              <div class="truncate text-xs text-muted-foreground">
-                {{
-                  t("governanceCenter.qualityFinding", {
-                    nulls: column.nullCount,
-                    rate: Math.round(column.nullRate * 100),
-                    duplicates: column.duplicateCount,
-                    distinct: column.distinctCount,
-                  })
-                }}
-              </div>
-            </div>
-          </div>
-          <div v-else class="text-xs text-muted-foreground">
-            {{ t("governanceCenter.qualityEmptyHint") }}
-          </div>
-        </div>
-      </div>
-
-      <div class="rounded-md border p-3">
-        <div class="mb-3 flex items-center justify-between gap-2">
-          <div class="text-sm font-medium">{{ t("governanceCenter.automationDrafts") }}</div>
-          <Badge variant="secondary">{{ automationDrafts.length }}</Badge>
-        </div>
-        <div v-if="automationDrafts.length" class="grid gap-2">
-          <div v-for="draft in automationDrafts" :key="draft.id || draft.name" class="grid gap-2 rounded border bg-muted/20 p-2 sm:grid-cols-[1fr_auto] sm:items-center">
-            <div class="min-w-0">
-              <div class="truncate text-sm font-medium">{{ draft.name || draft.kind }}</div>
-              <div class="truncate text-xs text-muted-foreground">
-                {{ draft.kind }} · {{ draft.schedule }} ·
-                {{ draft.sql || draft.target || t("governanceCenter.notConfigured") }}
-              </div>
-            </div>
-            <div class="flex items-center gap-2">
-              <Switch :checked="!!draft.enabled" @update:checked="setAutomationEnabled(draft.id, $event)" />
-              <Button variant="outline" size="icon-sm" :disabled="!draft.sql" @click="openAutomation(draft)">
-                <Play class="h-3.5 w-3.5" />
-              </Button>
-              <Button variant="outline" size="icon-sm" @click="removeAutomation(draft.id)">
-                <Trash2 class="h-3.5 w-3.5" />
-              </Button>
-            </div>
-          </div>
-        </div>
-        <div v-else class="text-xs text-muted-foreground">
-          {{ t("governanceCenter.automationEmptyHint") }}
-        </div>
+      <div v-else class="rounded-md border bg-muted/20 p-4 text-sm text-muted-foreground">
+        {{ t("governanceCenter.noAuditRecords") }}
       </div>
     </DialogContent>
   </Dialog>

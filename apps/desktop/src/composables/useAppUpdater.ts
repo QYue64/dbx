@@ -12,16 +12,6 @@ export function canDownloadAndInstallUpdate(info: api.UpdateInfo | null, isDeskt
   return isDesktop && info?.update_available === true && info.portable_mode !== true;
 }
 
-export async function resolveUpdaterProxy(): Promise<string | undefined> {
-  if (!isTauriRuntime()) return undefined;
-  try {
-    const proxy = await api.getSystemProxyUrl();
-    return proxy || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 export function useAppUpdater() {
   const { t } = useI18n();
   const { toast } = useToast();
@@ -69,6 +59,28 @@ export function useAppUpdater() {
     }
   }
 
+  async function checkAndInstallUpdate() {
+    if (checkingUpdates.value || isDownloadingUpdate.value) return;
+    checkingUpdates.value = true;
+    updateCheckMessage.value = "";
+    updateReady.value = false;
+    try {
+      const info = await api.checkForUpdates();
+      updateInfo.value = info;
+      showUpdateDialog.value = true;
+      if (canDownloadAndInstallUpdate(info, isTauriRuntime())) {
+        await downloadAndInstallUpdate();
+      } else if (!info.update_available) {
+        updateCheckMessage.value = t("updates.upToDate", { version: info.current_version });
+      }
+    } catch (e: any) {
+      updateCheckMessage.value = formatUpdateError(String(e));
+      showUpdateDialog.value = true;
+    } finally {
+      checkingUpdates.value = false;
+    }
+  }
+
   function formatUpdateError(message: string): string {
     const lower = message.toLowerCase();
     if (lower.includes("403") || lower.includes("rate limit")) {
@@ -92,8 +104,7 @@ export function useAppUpdater() {
     downloadProgress.value = 0;
     try {
       const { check } = await import("@tauri-apps/plugin-updater");
-      const proxy = await resolveUpdaterProxy();
-      const update = await check(proxy ? { proxy } : undefined);
+      const update = await check();
       if (!update) return;
       let totalBytes = 0;
       let downloadedBytes = 0;
@@ -137,6 +148,7 @@ export function useAppUpdater() {
     latestReleaseUrl,
     openUrl,
     checkUpdates,
+    checkAndInstallUpdate,
     formatUpdateError,
     openLatestRelease,
     downloadAndInstallUpdate,

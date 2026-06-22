@@ -107,6 +107,7 @@ const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   quit_on_close: false,
   close_action_prompted: false,
   debug_logging_enabled: false,
+  governance_policy: null,
   saved_sql_sync_dir: null,
   driver_store_dir: null,
   plugin_store_dir: null,

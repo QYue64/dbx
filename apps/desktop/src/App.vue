@@ -97,7 +97,7 @@ const settingsStore = useSettingsStore();
 const savedSqlStore = useSavedSqlStore();
 const { message: toastMessage, visible: toastVisible, toast } = useToast();
 const { isDark, themeMode, applyTheme, setThemeMode } = useTheme();
-const { checkingUpdates, updateInfo, updateCheckMessage, showUpdateDialog, isDownloadingUpdate, downloadProgress, updateReady, hasUpdateAvailable, openUrl, checkUpdates, openLatestRelease, downloadAndInstallUpdate, restartApp } = useAppUpdater();
+const { checkingUpdates, updateInfo, updateCheckMessage, showUpdateDialog, isDownloadingUpdate, downloadProgress, updateReady, hasUpdateAvailable, openUrl, checkUpdates, downloadAndInstallUpdate, restartApp } = useAppUpdater();
 const { setupFileDrop } = useFileDrop();
 
 const isDesktop = isTauriRuntime();
@@ -1543,7 +1543,6 @@ onUnmounted(() => {
           :is-downloading-update="isDownloadingUpdate"
           :download-progress="downloadProgress"
           :update-ready="updateReady"
-          @open-latest-release="openLatestRelease"
           @download-and-install="downloadAndInstallUpdate"
           @restart="restartApp"
         />

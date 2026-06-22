@@ -19,7 +19,6 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  "open-latest-release": [];
   "download-and-install": [];
   restart: [];
 }>();
@@ -76,8 +75,8 @@ watch(
       <DialogHeader>
         <DialogTitle>{{ updateInfo?.update_available ? t("updates.availableTitle") : t("updates.title") }}</DialogTitle>
       </DialogHeader>
-      <div class="space-y-3 text-sm">
-        <p v-if="updateInfo?.update_available">
+      <div class="min-w-0 space-y-3 text-sm">
+        <p v-if="updateInfo?.update_available" class="break-words">
           {{
             t("updates.availableMessage", {
               current: updateInfo.current_version,
@@ -85,7 +84,7 @@ watch(
             })
           }}
         </p>
-        <p v-else class="text-muted-foreground">
+        <p v-else class="max-h-40 overflow-auto whitespace-pre-wrap break-words text-muted-foreground">
           {{ updateCheckMessage || t("updates.upToDate", { version: updateInfo?.current_version || "" }) }}
         </p>
         <div
@@ -103,10 +102,9 @@ watch(
           {{ t("updates.portableManualUpdate") }}
         </p>
       </div>
-      <DialogFooter>
+      <DialogFooter class="gap-2 sm:flex-wrap">
         <Button v-if="!isDownloadingUpdate && !updateReady" variant="outline" @click="open = false">{{ t("dangerDialog.cancel") }}</Button>
         <template v-if="updateInfo?.update_available">
-          <Button variant="outline" @click="emit('open-latest-release')">{{ t("updates.openRelease") }}</Button>
           <template v-if="canDownloadAndInstallUpdate(updateInfo, isDesktop)">
             <div v-if="updateReady" class="flex flex-col items-end gap-1">
               <Button @click="emit('restart')">{{ t("updates.restart") }}</Button>
@@ -119,7 +117,6 @@ watch(
             <Button v-else @click="emit('download-and-install')">{{ t("updates.downloadAndInstall") }}</Button>
           </template>
         </template>
-        <Button v-else-if="updateCheckMessage" @click="emit('open-latest-release')">{{ t("updates.openRelease") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

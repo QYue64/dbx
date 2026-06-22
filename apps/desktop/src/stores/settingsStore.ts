@@ -10,6 +10,7 @@ import type { SidebarActivation } from "@/lib/treeNodeClick";
 import type { SqlSnippet } from "@/types/database";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sqlCompletion";
 import { setDebugLoggingEnabled } from "@/lib/debugLog";
+import { normalizeGovernancePolicy, type GovernancePolicySettings } from "@/lib/workspaceGovernance";
 
 export type AiProvider = "claude" | "openai" | "gemini" | "deepseek" | "qwen" | "ollama" | "openai-compatible" | "codex-cli" | "custom";
 export type AiApiStyle = "completions" | "responses";
@@ -45,6 +46,7 @@ export interface DesktopSettings {
   quit_on_close: boolean;
   close_action_prompted: boolean;
   debug_logging_enabled: boolean;
+  governance_policy?: GovernancePolicySettings | null;
   saved_sql_sync_dir?: string | null;
   driver_store_dir?: string | null;
   plugin_store_dir?: string | null;
@@ -64,6 +66,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   quit_on_close: false,
   close_action_prompted: false,
   debug_logging_enabled: false,
+  governance_policy: null,
   saved_sql_sync_dir: null,
   driver_store_dir: null,
   plugin_store_dir: null,
@@ -80,6 +83,7 @@ function normalizeDesktopSettings(settings: Partial<DesktopSettings> | null | un
     quit_on_close: settings?.quit_on_close ?? DEFAULT_DESKTOP_SETTINGS.quit_on_close,
     close_action_prompted: settings?.close_action_prompted ?? DEFAULT_DESKTOP_SETTINGS.close_action_prompted,
     debug_logging_enabled: settings?.debug_logging_enabled ?? DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled,
+    governance_policy: settings?.governance_policy ? normalizeGovernancePolicy(settings.governance_policy) : DEFAULT_DESKTOP_SETTINGS.governance_policy,
     saved_sql_sync_dir: settings?.saved_sql_sync_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.saved_sql_sync_dir,
     driver_store_dir: settings?.driver_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.driver_store_dir,
     plugin_store_dir: settings?.plugin_store_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.plugin_store_dir,

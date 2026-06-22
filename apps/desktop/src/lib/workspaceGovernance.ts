@@ -188,7 +188,7 @@ export const DEFAULT_GOVERNANCE_POLICY: GovernancePolicySettings = {
   aiRequireDryRunForWrites: true,
 };
 
-function normalizeGovernancePolicy(policy: Partial<GovernancePolicySettings> | null | undefined): GovernancePolicySettings {
+export function normalizeGovernancePolicy(policy: Partial<GovernancePolicySettings> | null | undefined): GovernancePolicySettings {
   return {
     principalRole: policy?.principalRole && ROLE_PERMISSIONS[policy.principalRole] ? policy.principalRole : DEFAULT_GOVERNANCE_POLICY.principalRole,
     requireApprovalForWrites: typeof policy?.requireApprovalForWrites === "boolean" ? policy.requireApprovalForWrites : DEFAULT_GOVERNANCE_POLICY.requireApprovalForWrites,

@@ -43,6 +43,8 @@ pub struct DesktopSettings {
     #[serde(default)]
     pub debug_logging_enabled: bool,
     #[serde(default)]
+    pub governance_policy: Option<GovernancePolicySettings>,
+    #[serde(default)]
     pub saved_sql_sync_dir: Option<String>,
     #[serde(default)]
     pub driver_store_dir: Option<String>,
@@ -52,6 +54,17 @@ pub struct DesktopSettings {
     pub agent_store_dir: Option<String>,
     #[serde(default = "default_sidebar_table_page_size")]
     pub sidebar_table_page_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GovernancePolicySettings {
+    pub principal_role: String,
+    pub require_approval_for_writes: bool,
+    pub allow_production_writes: bool,
+    pub allow_dangerous_sql: bool,
+    pub ai_allow_writes: bool,
+    pub ai_require_dry_run_for_writes: bool,
 }
 
 fn default_sidebar_table_page_size() -> usize {
@@ -66,6 +79,7 @@ impl Default for DesktopSettings {
             quit_on_close: false,
             close_action_prompted: false,
             debug_logging_enabled: false,
+            governance_policy: None,
             saved_sql_sync_dir: None,
             driver_store_dir: None,
             plugin_store_dir: None,
@@ -572,6 +586,15 @@ impl Storage {
             "debug_logging_enabled".to_string(),
             serde_json::Value::Bool(desktop_settings.debug_logging_enabled),
         );
+        match desktop_settings.governance_policy.as_ref() {
+            Some(policy) => {
+                settings
+                    .insert("governance_policy".to_string(), serde_json::to_value(policy).map_err(|e| e.to_string())?);
+            }
+            None => {
+                settings.remove("governance_policy");
+            }
+        }
         match desktop_settings.saved_sql_sync_dir.as_ref().filter(|path| !path.trim().is_empty()) {
             Some(path) => {
                 settings.insert("saved_sql_sync_dir".to_string(), serde_json::Value::String(path.clone()));
@@ -632,6 +655,10 @@ impl Storage {
                 .get("debug_logging_enabled")
                 .and_then(|value| value.as_bool())
                 .unwrap_or_else(|| DesktopSettings::default().debug_logging_enabled),
+            governance_policy: settings
+                .get("governance_policy")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
             saved_sql_sync_dir: settings
                 .get("saved_sql_sync_dir")
                 .and_then(|value| value.as_str())
@@ -1863,7 +1890,7 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopIconTheme, DesktopSettings, Storage};
+    use super::{DesktopIconTheme, DesktopSettings, GovernancePolicySettings, Storage};
     use crate::connection_secrets::{MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY};
     use crate::models::connection::{ConnectionConfig, DatabaseType};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2106,6 +2133,7 @@ mod tests {
                 quit_on_close: true,
                 close_action_prompted: false,
                 debug_logging_enabled: true,
+                governance_policy: None,
                 saved_sql_sync_dir: None,
                 driver_store_dir: Some("/tmp/dbx-drivers".to_string()),
                 plugin_store_dir: Some("/tmp/dbx-plugins".to_string()),
@@ -2124,6 +2152,7 @@ mod tests {
                 quit_on_close: true,
                 close_action_prompted: false,
                 debug_logging_enabled: true,
+                governance_policy: None,
                 saved_sql_sync_dir: None,
                 driver_store_dir: Some("/tmp/dbx-drivers".to_string()),
                 plugin_store_dir: Some("/tmp/dbx-plugins".to_string()),
@@ -2171,6 +2200,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage.load_desktop_settings().await.unwrap().sidebar_table_page_size, 1234);
+    }
+
+    #[tokio::test]
+    async fn desktop_settings_persist_governance_policy() {
+        let path = temp_db_path("desktop-settings-governance-policy");
+        let storage = Storage::open(&path).await.unwrap();
+        let governance_policy = GovernancePolicySettings {
+            principal_role: "editor".to_string(),
+            require_approval_for_writes: false,
+            allow_production_writes: true,
+            allow_dangerous_sql: true,
+            ai_allow_writes: false,
+            ai_require_dry_run_for_writes: true,
+        };
+
+        storage
+            .save_desktop_settings(&DesktopSettings {
+                governance_policy: Some(governance_policy.clone()),
+                ..DesktopSettings::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(storage.load_desktop_settings().await.unwrap().governance_policy, Some(governance_policy));
     }
 
     #[tokio::test]
