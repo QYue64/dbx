@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 const JDBC_PLUGIN_DOWNLOAD_URL: &str =
-    "https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip";
+    "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JdbcDriverInfo {

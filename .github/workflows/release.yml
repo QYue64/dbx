@@ -279,7 +279,7 @@ jobs:
             "$RUNNER_TEMP/latest-json/latest.json" \
             "${{ steps.jdbc-plugin.outputs.version }}" \
             "1" \
-            "https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip"
+            "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip"
           gh release upload "${GITHUB_REF_NAME}" \
             "$RUNNER_TEMP/latest-json/latest.json" \
             --repo "${GITHUB_REPOSITORY}" \

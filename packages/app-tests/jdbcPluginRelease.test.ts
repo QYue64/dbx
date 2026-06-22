@@ -110,7 +110,7 @@ test("auto bump refuses mismatched JDBC plugin source versions", () => {
   );
 });
 
-test("adds JDBC plugin metadata to latest.json without disturbing updater fields", () => {
+test("adds JDBC plugin metadata and proxies GitHub download URLs without disturbing updater fields", () => {
   const result = augmentLatestJsonWithJdbcPlugin({
     latestJson: JSON.stringify({
       version: "0.5.12",
@@ -118,21 +118,30 @@ test("adds JDBC plugin metadata to latest.json without disturbing updater fields
       platforms: {
         "darwin-aarch64": {
           signature: "sig",
-          url: "https://example.com/app.dmg",
+          url: "https://github.com/QYue64/dbx/releases/download/v0.5.12/DBX_0.5.12_aarch64.dmg",
+        },
+        "linux-x86_64": {
+          signature: "sig",
+          url: "https://example.com/app.AppImage",
         },
       },
     }),
     jdbcVersion: "0.1.3",
     protocolVersion: 1,
-    url: "https://github.com/t8y2/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip",
+    url: "https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip",
   });
   const parsed = JSON.parse(result);
 
   assert.equal(parsed.version, "0.5.12");
   assert.equal(parsed.platforms["darwin-aarch64"].signature, "sig");
+  assert.equal(
+    parsed.platforms["darwin-aarch64"].url,
+    "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/download/v0.5.12/DBX_0.5.12_aarch64.dmg",
+  );
+  assert.equal(parsed.platforms["linux-x86_64"].url, "https://example.com/app.AppImage");
   assert.deepEqual(parsed.jdbc_plugin, {
     version: "0.1.3",
     protocol_version: 1,
-    url: "https://github.com/t8y2/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip",
+    url: "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip",
   });
 });

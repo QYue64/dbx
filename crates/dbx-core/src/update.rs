@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-const LATEST_JSON_PATH: &str = "https://github.com/QYue64/dbx/releases/latest/download/latest.json";
-const GITHUB_RELEASE_API_PREFIX: &str = "https://api.github.com/repos/QYue64/dbx/releases/tags/v";
+const LATEST_JSON_PATH: &str = "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/latest/download/latest.json";
+const GITHUB_RELEASE_API_PREFIX: &str = "https://gh-proxy.org/https://api.github.com/repos/QYue64/dbx/releases/tags/v";
 const RELEASE_URL_PREFIX: &str = "https://github.com/QYue64/dbx/releases/tag/v";
 
 #[derive(Debug, Deserialize)]
@@ -364,7 +364,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
               "jdbc_plugin": {
                 "version": "0.1.3",
                 "protocol_version": 1,
-                "url": "https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip"
+                "url": "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip"
               },
               "platforms": {}
             }"#,
@@ -375,7 +375,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
 
         assert_eq!(jdbc.version, "0.1.3");
         assert_eq!(jdbc.protocol_version, 1);
-        assert_eq!(jdbc.url, "https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip");
+        assert_eq!(jdbc.url, "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip");
     }
 
     #[test]
