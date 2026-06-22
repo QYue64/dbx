@@ -89,6 +89,7 @@ const store = useConnectionStore();
 const isTesting = ref(false);
 const isSaving = ref(false);
 const testResult = ref<{ ok: boolean; message: string } | null>(null);
+const showTestResultDialog = ref(false);
 const editingId = ref<string | null>(null);
 const showVisibleDatabasesDialog = ref(false);
 const isLoadingVisibleDatabases = ref(false);
@@ -1139,7 +1140,11 @@ const visibleDatabaseHasSystemDatabases = computed(() => {
 });
 const testResultMessage = computed(() => {
   if (!testResult.value) return "";
-  return testResult.value.ok ? t("connection.testSuccess") : testResult.value.message;
+  return testResult.value.ok ? testResult.value.message || t("connection.testSuccess") : testResult.value.message;
+});
+const testResultTitle = computed(() => {
+  if (!testResult.value) return "";
+  return testResult.value.ok ? t("connection.testSuccessTitle") : t("connection.testFailedTitle");
 });
 const hasRequiredConnectionTarget = computed(() => {
   if (form.value.db_type === "mq") return !!mqAdminUrl.value.trim();
@@ -1192,6 +1197,7 @@ async function testConnection() {
   const runId = ++testRunId;
   isTesting.value = true;
   testResult.value = null;
+  showTestResultDialog.value = false;
   try {
     const config = connectionConfigForSubmit(editingId.value || uuid());
     const msg = await api.testConnection(config);
@@ -1200,9 +1206,11 @@ async function testConnection() {
       mongoDriverMode.value = "legacy";
     }
     testResult.value = { ok: true, message: msg };
+    showTestResultDialog.value = true;
   } catch (e: any) {
     if (runId !== testRunId) return;
     testResult.value = { ok: false, message: mongodbAuthFailureHint(String(e)) };
+    showTestResultDialog.value = true;
   } finally {
     if (runId === testRunId) {
       isTesting.value = false;
@@ -1631,6 +1639,7 @@ function resetTestState() {
   testRunId += 1;
   isTesting.value = false;
   testResult.value = null;
+  showTestResultDialog.value = false;
 }
 
 function resetVisibleDatabaseDraftState() {
@@ -3563,6 +3572,31 @@ function openExternalUrl(url: string) {
           </Button>
         </DialogFooter>
       </template>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showTestResultDialog">
+    <DialogContent class="sm:max-w-[520px]">
+      <DialogHeader>
+        <DialogTitle class="flex items-center gap-2">
+          <span class="h-2.5 w-2.5 rounded-full" :class="testResult?.ok ? 'bg-green-600' : 'bg-destructive'" />
+          {{ testResultTitle }}
+        </DialogTitle>
+      </DialogHeader>
+
+      <div class="max-h-72 overflow-auto rounded-md border bg-muted/40 p-3">
+        <p class="whitespace-pre-wrap break-words text-sm leading-6" :class="testResult?.ok ? 'text-green-700 dark:text-green-400' : 'text-destructive'">
+          {{ testResultMessage }}
+        </p>
+      </div>
+
+      <DialogFooter>
+        <Button variant="outline" :disabled="!testResultMessage" @click="copyTestResult">
+          <Copy class="mr-1.5 h-4 w-4" />
+          {{ t("connection.copyTestResult") }}
+        </Button>
+        <Button @click="showTestResultDialog = false">{{ t("common.close") }}</Button>
+      </DialogFooter>
     </DialogContent>
   </Dialog>
 

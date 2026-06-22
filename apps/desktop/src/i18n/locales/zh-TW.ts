@@ -240,6 +240,8 @@ export default {
     test: "測試",
     testing: "測試中……",
     copyTestResult: "複製測試結果",
+    testSuccessTitle: "測試連線成功",
+    testFailedTitle: "測試連線失敗",
     saveAndConnect: "儲存並連線",
     save: "儲存",
     editTitle: "編輯連線",

@@ -256,6 +256,8 @@ export default {
     test: "测试",
     testing: "测试中...",
     copyTestResult: "复制测试结果",
+    testSuccessTitle: "测试连接成功",
+    testFailedTitle: "测试连接失败",
     saveAndConnect: "保存并连接",
     save: "保存",
     editTitle: "编辑连接",

@@ -255,6 +255,8 @@ export default {
     test: "Test",
     testing: "Testing...",
     copyTestResult: "Copy test result",
+    testSuccessTitle: "Connection test successful",
+    testFailedTitle: "Connection test failed",
     saveAndConnect: "Save & Connect",
     save: "Save",
     editTitle: "Edit Connection",

@@ -254,6 +254,8 @@ export default {
     test: "テスト",
     testing: "テスト中...",
     copyTestResult: "テスト結果をコピー",
+    testSuccessTitle: "接続テストに成功しました",
+    testFailedTitle: "接続テストに失敗しました",
     saveAndConnect: "保存して接続",
     save: "保存",
     editTitle: "接続を編集",

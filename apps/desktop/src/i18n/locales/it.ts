@@ -240,6 +240,8 @@ export default {
     test: "Test",
     testing: "Verifica in corso...",
     copyTestResult: "Copia risultato test",
+    testSuccessTitle: "Test connessione riuscito",
+    testFailedTitle: "Test connessione non riuscito",
     saveAndConnect: "Salva & Connetti",
     save: "Salva",
     editTitle: "Modifica Connessione",
