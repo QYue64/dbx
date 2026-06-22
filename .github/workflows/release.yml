@@ -69,20 +69,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            target: aarch64-apple-darwin
           - platform: macos-15-intel
             target: x86_64-apple-darwin
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - platform: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
+            bundles: dmg
           - platform: windows-2022
             target: x86_64-pc-windows-msvc
             arch: x64
-          - platform: windows-2022
-            target: aarch64-pc-windows-msvc
-            arch: arm64
+            bundles: nsis
+          # Temporarily disabled: only ship x64 DMG, x64 NSIS setup, and x64 portable ZIP.
+          # - platform: macos-latest
+          #   target: aarch64-apple-darwin
+          #   bundles: dmg
+          # - platform: ubuntu-22.04
+          #   target: x86_64-unknown-linux-gnu
+          #   bundles: appimage
+          # - platform: ubuntu-22.04-arm
+          #   target: aarch64-unknown-linux-gnu
+          #   bundles: appimage
+          # - platform: windows-2022
+          #   target: aarch64-pc-windows-msvc
+          #   arch: arm64
+          #   bundles: nsis
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -169,7 +176,7 @@ jobs:
           releaseBody: ${{ steps.release-notes.outputs.body }}
           releaseDraft: true
           prerelease: false
-          args: --target ${{ matrix.target }}
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       - name: Upload Windows portable ZIP
         if: matrix.arch == 'x64' || matrix.arch == 'arm64'
