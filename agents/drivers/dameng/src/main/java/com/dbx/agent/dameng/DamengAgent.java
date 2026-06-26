@@ -245,6 +245,7 @@ public final class DamengAgent extends BaseDatabaseAgent {
                 }
             }
 
+            Set<String> identityColumns = identityColumns(schema, table);
             List<ColumnInfo> result = new ArrayList<>();
             // DATA_DEFAULT is a LONG column — it must be selected first and read first
             // in JDBC, otherwise the data is truncated.
@@ -287,7 +288,7 @@ public final class DamengAgent extends BaseDatabaseAgent {
                             "Y".equals(rs.getString("NULLABLE")),
                             dataDefault,
                             pkColumns.contains(name),
-                            null,
+                            identityColumns.contains(name) ? "identity" : null,
                             rs.getString("COMMENTS"),
                             numPrec,
                             numScale,
@@ -299,6 +300,32 @@ public final class DamengAgent extends BaseDatabaseAgent {
             fillMissingColumnComments(schema, table, result);
             return result;
         });
+    }
+
+    private Set<String> identityColumns(String schema, String table) {
+        Set<String> result = new java.util.HashSet<>();
+        String sql = """
+            SELECT c.NAME
+            FROM SYS.SYSCOLUMNS c
+            JOIN SYS.SYSOBJECTS t ON c.ID = t.ID
+            JOIN SYS.SYSOBJECTS s ON t.SCHID = s.ID
+            WHERE s.NAME = ? AND t.NAME = ? AND (c.INFO2 & 0x01) = 0x01
+            """.stripIndent().trim();
+        try (PreparedStatement stmt = requireConnected().prepareStatement(sql)) {
+            stmt.setString(1, schema);
+            stmt.setString(2, table);
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    String column = rs.getString(1);
+                    if (notBlank(column)) {
+                        result.add(column);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Some Dameng versions or users do not expose SYS.SYSCOLUMNS.
+        }
+        return result;
     }
 
     @Override

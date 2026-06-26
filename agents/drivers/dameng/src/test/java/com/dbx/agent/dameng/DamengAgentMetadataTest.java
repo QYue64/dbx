@@ -110,6 +110,17 @@ class DamengAgentMetadataTest {
     }
 
     @Test
+    void mapsIdentityColumnExtraFromSysColumns() {
+        DamengAgent agent = new DamengAgent();
+        TestSupport.setPrivateConnection(agent, metadataConnection());
+
+        List<ColumnInfo> columns = agent.getColumns("APP", "USERS");
+
+        Assertions.assertEquals(1, columns.size());
+        Assertions.assertEquals("identity", columns.get(0).getExtra());
+    }
+
+    @Test
     void appendsTableAndColumnCommentsToTableDdl() {
         DamengAgent agent = new DamengAgent();
         TestSupport.setPrivateConnection(agent, metadataConnection());
@@ -134,6 +145,9 @@ class DamengAgentMetadataTest {
                     return metadataStatement(List.of(List.of("CREATE TABLE \"APP\".\"USERS\" (\n  \"ID\" NUMBER\n);")));
                 }
                 if (sql.contains("ALL_CONS_COLUMNS")) {
+                    return metadataStatement(List.of(List.of("ID")));
+                }
+                if (sql.contains("SYS.SYSCOLUMNS")) {
                     return metadataStatement(List.of(List.of("ID")));
                 }
                 if (sql.startsWith("SELECT COMMENTS")) {
