@@ -51,6 +51,9 @@ export default withEnglishFallback({
     updatableDriverCount: "更新可能なドライバー数",
     blockDangerousRedisCommands: "危険なコマンドをブロック",
   },
+  automationCenter: {
+    title: "自動化",
+  },
   updates: {
     title: "アップデート",
     check: "アップデートを確認",

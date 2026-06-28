@@ -30,6 +30,7 @@ import { useTauriEvents } from "@/composables/useTauriEvents";
 import { useCloseActionPrompt } from "@/composables/useCloseActionPrompt";
 import { useVisibilityChange } from "@/composables/useVisibilityChange";
 import { useWebDavAutoUpload } from "@/composables/useWebDavAutoUpload";
+import { useAutomationScheduler } from "@/composables/useAutomationScheduler";
 import "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/api";
@@ -84,6 +85,7 @@ const QueryHistory = defineAsyncComponent(() => import("@/components/editor/Quer
 const SqlLibraryPanel = defineAsyncComponent(() => import("@/components/layout/SqlLibraryPanel.vue"));
 const DriverStorePage = defineAsyncComponent(() => import("@/components/config/DriverStoreDialog.vue"));
 const GovernanceCenterDialog = defineAsyncComponent(() => import("@/components/config/GovernanceCenterDialog.vue"));
+const AutomationCenterDialog = defineAsyncComponent(() => import("@/components/config/AutomationCenterDialog.vue"));
 const UpdateDialog = defineAsyncComponent(() => import("@/components/layout/UpdateDialog.vue"));
 const CloseActionPromptDialog = defineAsyncComponent(() => import("@/components/layout/CloseActionPromptDialog.vue"));
 const LoginPage = defineAsyncComponent(() => import("@/components/auth/LoginPage.vue"));
@@ -114,6 +116,7 @@ const showConnectionDialog = ref(false);
 const connectionDialogPrefill = ref<ConnectionDeepLinkDraft | null>(null);
 const showSettingsDialog = ref(false);
 const showGovernanceCenter = ref(false);
+const showAutomationCenter = ref(false);
 const settingsInitialTab = ref("editor");
 const settingsInitialSection = ref<string | undefined>(undefined);
 const showQueryEditorDdlDialog = ref(false);
@@ -247,6 +250,7 @@ const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
 const { showCloseActionPrompt, chooseQuit, chooseMinimize, setupCloseActionPromptListener, cleanupCloseActionPromptListener } = useCloseActionPrompt();
 useVisibilityChange();
 useWebDavAutoUpload();
+useAutomationScheduler();
 
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
@@ -1467,6 +1471,7 @@ onUnmounted(() => {
           @toggle-sql-library="toggleSqlLibrary"
           @open-github="openGitHub"
           @open-settings="openSettings()"
+          @open-automation="showAutomationCenter = true"
           @open-governance="showGovernanceCenter = true"
           @open-driver-store="
             driverStoreTabOpen = true;
@@ -1671,6 +1676,7 @@ onUnmounted(() => {
           @open-database-search-target="openDatabaseSearchTarget"
         />
         <GovernanceCenterDialog v-if="showGovernanceCenter" v-model:open="showGovernanceCenter" />
+        <AutomationCenterDialog v-if="showAutomationCenter" v-model:open="showAutomationCenter" :active-sql="executableSql" :active-connection-id="activeTab?.connectionId" :active-database="activeTab?.database" :active-schema="activeTab?.schema" />
         <UpdateDialog
           v-if="showUpdateDialog"
           v-model:open="showUpdateDialog"

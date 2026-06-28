@@ -51,6 +51,9 @@ export default withEnglishFallback({
     updatableDriverCount: "Quantidade de drivers atualizáveis",
     blockDangerousRedisCommands: "Bloquear comandos perigosos",
   },
+  automationCenter: {
+    title: "Automação",
+  },
   updates: {
     title: "Atualizações",
     check: "Verificar atualizações",
