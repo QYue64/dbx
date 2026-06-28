@@ -1,5 +1,5 @@
 <div align="center">
-  <p style="font-size: 18px; white-space: nowrap;"><strong>50+ databases in 15 MB. Desktop app and self-hostable web, with built-in AI assistant.</strong></p>
+  <p style="font-size: 18px; white-space: nowrap;"><strong>60+ databases in 15 MB. Desktop & Docker self-hosting, with built-in AI assistant.</strong></p>
 
   <p>
     <a href="https://github.com/QYue64/dbx/releases"><img src="https://img.shields.io/github/downloads/QYue64/dbx/total?style=for-the-badge&color=blue" /></a>
@@ -68,9 +68,9 @@
 
 ## Features
 
-### 50+ Databases, One Tool
+### 60+ Databases, One Tool
 
-MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KWDB, KingBase, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Manticore Search, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, and more. Agent/JDBC-oriented profiles extend DBX to H2, Snowflake, Trino, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, and custom JDBC connections. New native and agent-driven drivers also cover Databricks, SAP HANA, Teradata, Vertica, Firebird, Exasol, YashanDB, GBase, Databend, RQLite, Turso, InfluxDB, QuestDB, IoTDB, etcd, IRIS, and more. All in a single ~15 MB app. No bundled Chromium.
+MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, Qdrant, Milvus, Weaviate, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KWDB, KingBase, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Manticore Search, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, and more. Agent/JDBC-oriented profiles extend DBX to H2, Snowflake, Trino, PrestoSQL, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, and custom JDBC connections. New native and agent-driven drivers also cover Databricks, SAP HANA, Teradata, Vertica, Firebird, Exasol, YashanDB, GBase 8a/8s, Databend, RQLite, Turso, InfluxDB, QuestDB, IoTDB, etcd, ZooKeeper, Nacos, IRIS, and more. Message queue admin is also available for Pulsar, Kafka, and RocketMQ. All in a single ~15 MB app. No bundled Chromium.
 
 ### Query Editor
 
@@ -203,9 +203,10 @@ No additional dependencies required.
 ### Development
 
 ```bash
-pnpm install
-pnpm dev:tauri
+make
 ```
+
+`make` installs root dependencies when needed and starts the local Tauri desktop development environment.
 
 > [!TIP]
 > DuckDB compilation takes a while. If you're not working on DuckDB features,
@@ -213,11 +214,11 @@ pnpm dev:tauri
 >
 > ```bash
 > # Fast checks (skip DuckDB)
-> cargo check --no-default-features
-> cargo test  --no-default-features
+> make cargo-check-fast
+> make cargo-test-fast
 >
 > # Tauri dev without DuckDB
-> pnpm tauri dev -- --no-default-features
+> make dev-fast
 > ```
 >
 > The `--no-default-features` flag only affects local development.
@@ -226,25 +227,31 @@ pnpm dev:tauri
 Web version:
 
 ```bash
-pnpm dev:web       # frontend
-pnpm dev:backend   # backend
+make dev-web       # frontend
+make dev-backend   # backend
 ```
 
-[dbx-agents](https://github.com/t8y2/dbx-agents) is a separate repository containing JDBC agent driver development projects. For local development, clone it alongside `dbx/` under the same workspace directory and open the parent folder in your IDE:
+Documentation site:
 
 ```bash
-mkdir dbx-workspace && cd dbx-workspace
-git clone https://github.com/QYue64/dbx.git
-git clone https://github.com/t8y2/dbx-agents.git
-# Open dbx-workspace/ in your IDE to work on both projects together
+make docs
 ```
 
-This keeps the two repositories independent (separate git histories) while making it easy to navigate between them during development.
+The official DBX documentation site lives in `docs/`. If you want to improve the website content or documentation pages, edit the files under `docs/` and run `make docs` to preview the site locally.
+
+JDBC agent driver development projects live in `agents/`:
+
+```bash
+cd agents
+./gradlew test
+```
+
+Build artifacts from `agents/drivers/<db-type>/build/libs/` are picked up by local driver install flows when available.
 
 ### Build
 
 ```bash
-pnpm tauri build
+make package
 ```
 
 The installer will be in `src-tauri/target/release/bundle/`.
@@ -282,12 +289,12 @@ Yes. The desktop app works fully offline. For air-gapped driver installs, prepar
 
 <details>
 <summary><strong>How is DBX different from DBeaver / TablePlus / Beekeeper Studio?</strong></summary>
-DBX is 15 MB with no runtime dependencies (no Java, no Python). It includes AI and MCP natively — not as plugins. It supports 50+ databases across desktop, Docker, and web from a single codebase.
+DBX is 15 MB with no runtime dependencies (no Java, no Python). It includes AI and MCP natively — not as plugins. It supports 60+ databases across desktop, Docker, and web from a single codebase.
 </details>
 
 <details>
 <summary><strong>What databases are supported?</strong></summary>
-MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KWDB, KingBase, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Manticore Search, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, and more. Agent/JDBC-oriented profiles extend support to H2, Snowflake, Trino, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, Databricks, SAP HANA, Teradata, Vertica, Firebird, Exasol, YashanDB, GBase, Databend, RQLite, Turso, InfluxDB, QuestDB, IoTDB, etcd, IRIS, and custom JDBC connections.
+MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, Qdrant, Milvus, Weaviate, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KWDB, KingBase, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Manticore Search, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, and more. Agent/JDBC-oriented profiles extend support to H2, Snowflake, Trino, PrestoSQL, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, Databricks, SAP HANA, Teradata, Vertica, Firebird, Exasol, YashanDB, GBase 8a/8s, Databend, RQLite, Turso, InfluxDB, QuestDB, IoTDB, etcd, ZooKeeper, Nacos, IRIS, and custom JDBC connections. Message queue admin (Pulsar, Kafka, RocketMQ) is also supported.
 </details>
 
 <details>

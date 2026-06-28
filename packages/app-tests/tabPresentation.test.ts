@@ -9,6 +9,7 @@ import {
   resultGridCacheKey,
   resultRunItems,
   tabDisplayTitle,
+  tabModeLabel,
   tabularResultItems,
 } from "../../apps/desktop/src/lib/tabPresentation.ts";
 import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
@@ -57,12 +58,13 @@ function queryTab(overrides: Partial<QueryTab> = {}): QueryTab {
   };
 }
 
-function result(columns: string[]): QueryResult {
+function result(columns: string[], overrides: Partial<QueryResult> = {}): QueryResult {
   return {
     columns,
     rows: [],
     affected_rows: 0,
     execution_time_ms: 1,
+    ...overrides,
   };
 }
 
@@ -113,6 +115,26 @@ test("jdbc tabs use the connection target when database is empty", () => {
   }
 });
 
+test("zookeeper tabs use key browser labels", () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  useConnectionStore().addEphemeralConnection({
+    ...conn("conn-1"),
+    name: "ZK Prod",
+    db_type: "zookeeper",
+    port: 2181,
+  });
+  const t = (key: string) => (key === "tabs.zookeeper" ? "ZooKeeper" : key);
+
+  try {
+    const tab = queryTab({ mode: "zookeeper", database: "", title: "ZooKeeper Keys" });
+    assert.equal(tabDisplayTitle(tab, t), "ZK Prod@keys");
+    assert.equal(tabModeLabel(tab, t), "ZooKeeper");
+  } finally {
+    restoreStorage();
+  }
+});
+
 test("tabular result items hide statement results without returned columns", () => {
   const results = [result([]), result(["id"]), result([]), result(["name"])];
 
@@ -125,6 +147,19 @@ test("tabular result items hide statement results without returned columns", () 
   );
   assert.deepEqual(tabularResultItems([result([])]), []);
   assert.deepEqual(tabularResultItems(undefined), []);
+});
+
+test("tabular result items expose source labels when available", () => {
+  const results = [result([]), result(["id"], { sourceLabel: "public.users" }), result(["name"])];
+
+  assert.deepEqual(
+    tabularResultItems(results).map((item) => ({ index: item.index, n: item.n, label: item.label })),
+    [
+      { index: 1, n: 1, label: "public.users" },
+      { index: 2, n: 2, label: undefined },
+    ],
+  );
+  assert.deepEqual(tabularResultItems([result(["id"], { sourceLabel: "db.users" })]).map((item) => item.label), ["db.users"]);
 });
 
 test("result run items expose ordered labels and active state", () => {

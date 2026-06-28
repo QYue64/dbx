@@ -2,7 +2,7 @@
 import { computed, ref, watch, nextTick } from "vue";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { X, Pin, ChevronDown, Table2, Code2, TableProperties, PencilRuler, KeyRound, Pencil, Package, Check, Lock, Copy, AlertTriangle } from "@lucide/vue";
+import { X, Pin, ChevronDown, Table2, Code2, TableProperties, PencilRuler, KeyRound, Pencil, Package, Check, Lock, Copy, AlertTriangle, Network } from "@lucide/vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
@@ -19,12 +19,14 @@ import { useToast } from "@/composables/useToast";
 import type { QueryTab } from "@/types/database";
 
 const props = defineProps<{
-  showDriverStore?: boolean;
+  driverStoreOpen?: boolean;
+  driverStoreActive?: boolean;
   agentDriverUpdateCount?: number;
 }>();
 
 const emit = defineEmits<{
-  "toggle-driver-store": [];
+  "activate-tab": [];
+  "activate-driver-store": [];
   "close-driver-store": [];
   "save-tab": [tabId: string];
 }>();
@@ -172,7 +174,7 @@ watch(
 );
 
 watch(
-  () => props.showDriverStore,
+  () => props.driverStoreActive,
   (show) => {
     if (!show) return;
     nextTick(() => {
@@ -189,7 +191,7 @@ watch(
 
 function tabColorStyle(tab: QueryTab) {
   const color = connectionColor(tab.connectionId);
-  const isActive = tab.id === queryStore.activeTabId && !props.showDriverStore;
+  const isActive = tab.id === queryStore.activeTabId && !props.driverStoreActive;
   const isClassic = settingsStore.editorSettings.appLayout === "classic";
   if (!color) {
     if (isClassic) {
@@ -235,7 +237,8 @@ const openTabMenuItems = computed(() =>
 function tabMenuIcon(tab: QueryTab) {
   if (tab.mode === "data" || tab.mode === "mongo" || tab.mode === "redis") return Table2;
   if (tab.mode === "vector") return TableProperties;
-  if (tab.mode === "etcd") return KeyRound;
+  if (tab.mode === "etcd" || tab.mode === "zookeeper") return KeyRound;
+  if (tab.mode === "nacos") return Network;
   if (tab.mode === "objects") return TableProperties;
   if (tab.mode === "structure") return PencilRuler;
   return Code2;
@@ -293,12 +296,12 @@ function activateTab(tabId: string) {
   dispatchBeforeTabSwitch(tabId);
   tabScrollBehavior.value = "auto";
   queryStore.activeTabId = tabId;
-  emit("close-driver-store");
+  emit("activate-tab");
 }
 </script>
 
 <template>
-  <div v-if="queryStore.tabs.length > 0 || showDriverStore" class="relative flex border-b shrink-0" :class="settingsStore.editorSettings.appLayout === 'classic' ? 'h-9 items-stretch bg-muted' : 'h-10 items-center bg-background px-2'">
+  <div v-if="queryStore.tabs.length > 0 || driverStoreOpen" class="relative flex border-b shrink-0" :class="settingsStore.editorSettings.appLayout === 'classic' ? 'h-9 items-stretch bg-muted' : 'h-10 items-center bg-background px-2'">
     <div class="app-tab-strip relative h-full min-w-0 flex-1">
       <div v-if="showTabOverflowControls" class="app-tab-scrollbar" :class="{ 'app-tab-scrollbar--dragging': isScrollbarDragging }" @pointerdown="startScrollbarDrag">
         <div class="app-tab-scrollbar__thumb" :style="tabScrollbarThumbStyle" />
@@ -312,11 +315,11 @@ function activateTab(tabId: string) {
                   class="group flex items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap select-none"
                   :class="
                     settingsStore.editorSettings.appLayout === 'classic'
-                      ? [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-full border-r border-border/80 font-medium dark:border-border/45', tab.id === queryStore.activeTabId && !showDriverStore ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90']
-                      : [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-7 rounded-md border', tab.id === queryStore.activeTabId && !showDriverStore ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
+                      ? [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-full border-r border-border/80 font-medium dark:border-border/45', tab.id === queryStore.activeTabId && !driverStoreActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90']
+                      : [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-7 rounded-md border', tab.id === queryStore.activeTabId && !driverStoreActive ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
                   "
                   :style="[tabColorStyle(tab), tabDropStyle(tab.id)]"
-                  :data-active-tab="tab.id === queryStore.activeTabId && !showDriverStore"
+                  :data-active-tab="tab.id === queryStore.activeTabId && !driverStoreActive"
                   @click="handleTabClick(tab)"
                   @dblclick.stop="startRenameTab(tab)"
                   @mousedown.middle.prevent="queryStore.closeTab(tab.id)"
@@ -328,7 +331,8 @@ function activateTab(tabId: string) {
                   <span class="shrink-0" :class="tabIconClass(tab)">
                     <Table2 v-if="tab.mode === 'data' || tab.mode === 'mongo' || tab.mode === 'redis'" class="h-3.5 w-3.5" />
                     <TableProperties v-else-if="tab.mode === 'vector'" class="h-3.5 w-3.5" />
-                    <KeyRound v-else-if="tab.mode === 'etcd'" class="h-3.5 w-3.5" />
+                    <KeyRound v-else-if="tab.mode === 'etcd' || tab.mode === 'zookeeper'" class="h-3.5 w-3.5" />
+                    <Network v-else-if="tab.mode === 'nacos'" class="h-3.5 w-3.5" />
                     <TableProperties v-else-if="tab.mode === 'objects'" class="h-3.5 w-3.5" />
                     <PencilRuler v-else-if="tab.mode === 'structure'" class="h-3.5 w-3.5" />
                     <Code2 v-else class="h-3.5 w-3.5" />
@@ -352,14 +356,7 @@ function activateTab(tabId: string) {
                     </TooltipTrigger>
                     <TooltipContent>{{ t("connection.readOnlyBadge") }}</TooltipContent>
                   </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <button class="inline-flex rounded p-0.5 text-muted-foreground hover:bg-muted-foreground/20 hover:text-foreground focus:opacity-100" :class="tab.pinned ? 'visible text-primary' : 'invisible group-hover:visible'" @click.stop="queryStore.togglePinnedTab(tab.id)">
-                        <Pin class="h-3 w-3" :class="{ 'fill-current': tab.pinned }" />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>{{ tab.pinned ? t("contextMenu.unpin") : t("contextMenu.pin") }}</TooltipContent>
-                  </Tooltip>
+                  <Pin v-if="tab.pinned" class="h-3 w-3 shrink-0 text-primary fill-current" aria-hidden="true" />
                   <button class="rounded hover:bg-muted-foreground/20 p-0.5 shrink-0" @click.stop="queryStore.closeTab(tab.id)">
                     <X class="h-3 w-3" />
                   </button>
@@ -377,12 +374,16 @@ function activateTab(tabId: string) {
 
         <!-- Driver Store Tab -->
         <div
-          v-if="showDriverStore"
+          v-if="driverStoreOpen"
           data-driver-store-tab
           class="group flex min-w-38 items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap"
-          :class="settingsStore.editorSettings.appLayout === 'classic' ? ['h-full border-r border-border/80 dark:border-border/45 bg-background text-foreground font-medium'] : ['h-7 rounded-md border text-foreground font-medium', 'border-ring']"
-          :style="settingsStore.editorSettings.appLayout === 'classic' ? { boxShadow: '0 1px 0 0 var(--color-background)' } : {}"
-          @click="emit('toggle-driver-store')"
+          :class="
+            settingsStore.editorSettings.appLayout === 'classic'
+              ? ['h-full border-r border-border/80 dark:border-border/45 font-medium', driverStoreActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90']
+              : ['h-7 rounded-md border font-medium', driverStoreActive ? 'border-ring text-foreground' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
+          "
+          :style="settingsStore.editorSettings.appLayout === 'classic' && driverStoreActive ? { boxShadow: '0 1px 0 0 var(--color-background)' } : {}"
+          @click="emit('activate-driver-store')"
         >
           <span class="shrink-0 text-amber-600 dark:text-amber-400">
             <Package class="h-3.5 w-3.5" />

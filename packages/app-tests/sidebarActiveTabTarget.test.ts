@@ -86,6 +86,58 @@ test("MQ tabs with a selected tenant target the matching tenant node", () => {
   assert.equal(findSidebarNodeForActiveTab(tab, [flat(tenant)])?.id, "tenant-node");
 });
 
+test("ZooKeeper tabs target the matching visible zookeeper root node", () => {
+  const tab: QueryTab = {
+    id: "tab-1",
+    title: "ZooKeeper Keys",
+    connectionId: "conn-1",
+    database: "",
+    sql: "",
+    isExecuting: false,
+    mode: "zookeeper",
+  };
+  const root: TreeNode = {
+    id: "zookeeper-root",
+    label: "Keys",
+    type: "zookeeper-root",
+    connectionId: "conn-1",
+  };
+
+  assert.deepEqual(activeTabSidebarTarget(tab), {
+    type: "zookeeper-root",
+    connectionId: "conn-1",
+  });
+  assert.equal(findSidebarNodeForActiveTab(tab, [flat(root)])?.id, "zookeeper-root");
+});
+
+test("Nacos tabs target the matching namespace node", () => {
+  const tab: QueryTab = {
+    id: "tab-1",
+    title: "Nacos:dev",
+    connectionId: "conn-1",
+    database: "",
+    sql: "",
+    isExecuting: false,
+    mode: "nacos",
+    nacosNamespace: "dev",
+    nacosNamespaceName: "Development",
+  };
+  const namespace: TreeNode = {
+    id: "namespace-node",
+    label: "Development",
+    type: "nacos-namespace",
+    connectionId: "conn-1",
+    nacosNamespace: "dev",
+  };
+
+  assert.deepEqual(activeTabSidebarTarget(tab), {
+    type: "nacos-namespace",
+    connectionId: "conn-1",
+    namespace: "dev",
+  });
+  assert.equal(findSidebarNodeForActiveTab(tab, [flat(namespace)])?.id, "namespace-node");
+});
+
 test("saved SQL tabs target the matching visible saved SQL file node", () => {
   const tab: QueryTab = {
     id: "tab-1",
@@ -161,6 +213,7 @@ test("sidebar node scrolling keeps visible rows in place and reveals hidden rows
   assert.equal(scrollTopForSidebarNode({ index: 2, currentScrollTop: 0, viewportHeight: 140 }), 0);
   assert.equal(scrollTopForSidebarNode({ index: 20, currentScrollTop: 0, viewportHeight: 140 }), 448);
   assert.equal(scrollTopForSidebarNode({ index: 1, currentScrollTop: 280, viewportHeight: 140 }), 28);
+  assert.equal(scrollTopForSidebarNode({ index: 11, currentScrollTop: 300, viewportHeight: 140, topOcclusionHeight: 28 }), 280);
 });
 
 test("active sidebar selection only scrolls on tab or setting changes", () => {

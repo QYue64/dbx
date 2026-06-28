@@ -602,6 +602,7 @@ mod tests {
             password: "secret".to_string(),
             database: None,
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: vec![TransportLayerConfig::Ssh(crate::models::connection::SshTunnelConfig {
@@ -638,6 +639,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),

@@ -82,6 +82,10 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
     if (compact) return connectionDisplayName(tab.connectionId);
     return `${connectionDisplayName(tab.connectionId)}@keys`;
   }
+  if (tab.mode === "zookeeper") {
+    if (compact) return connectionDisplayName(tab.connectionId);
+    return `${connectionDisplayName(tab.connectionId)}@keys`;
+  }
   if (tab.mode === "objects") {
     const schema = tab.objectBrowser?.schema;
     if (compact) return schema || tab.title;
@@ -119,12 +123,12 @@ export function tabTooltipLines(tab: QueryTab, t: Translate): { label: string; v
   return lines;
 }
 
-export function tabularResultItems(results: QueryResult[] | undefined): { result: QueryResult; index: number; n: number }[] {
+export function tabularResultItems(results: QueryResult[] | undefined): { result: QueryResult; index: number; n: number; label?: string }[] {
   if (!results) return [];
   return results
     .map((result, index) => ({ result, index }))
     .filter((item) => item.result.columns.length > 0)
-    .map((item, ordinal) => ({ ...item, n: ordinal + 1 }));
+    .map((item, ordinal) => ({ ...item, n: ordinal + 1, label: item.result.sourceLabel }));
 }
 
 export function activeResultRun(tab: Pick<QueryTab, "resultRuns" | "activeResultRunId">) {
@@ -181,6 +185,8 @@ export function tabModeLabel(tab: QueryTab, t: Translate): string {
   if (tab.mode === "vector") return t("tabs.vector");
   if (tab.mode === "redis") return t("tabs.redis");
   if (tab.mode === "etcd") return t("tabs.etcd");
+  if (tab.mode === "zookeeper") return t("tabs.zookeeper");
+  if (tab.mode === "nacos") return "Nacos";
   if (tab.mode === "objects") return t("tabs.objects");
   if (tab.mode === "users") return t("tabs.users");
   return tab.mode;

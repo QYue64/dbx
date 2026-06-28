@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::models::connection::DatabaseType;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -158,7 +160,7 @@ const AGENT_CATALOG: &[AgentCatalogEntry] = &[
     AgentCatalogEntry {
         db_type: DatabaseType::Trino,
         key: "trino",
-        label: "Trino (Presto)",
+        label: "Trino",
         store_visible: true,
         profiles: &[],
     },
@@ -249,6 +251,13 @@ const AGENT_CATALOG: &[AgentCatalogEntry] = &[
     },
     AgentCatalogEntry { db_type: DatabaseType::Etcd, key: "etcd", label: "etcd", store_visible: true, profiles: &[] },
     AgentCatalogEntry {
+        db_type: DatabaseType::ZooKeeper,
+        key: "zookeeper",
+        label: "Apache ZooKeeper",
+        store_visible: true,
+        profiles: &[],
+    },
+    AgentCatalogEntry {
         db_type: DatabaseType::MongoDb,
         key: "mongodb",
         label: "MongoDB (Legacy)",
@@ -283,12 +292,19 @@ pub fn is_agent_type(db_type: &DatabaseType) -> bool {
 }
 
 pub fn driver_store_entries() -> impl Iterator<Item = (&'static str, &'static str)> {
-    entries().iter().flat_map(|entry| {
-        let base = entry.store_visible.then_some((entry.key, entry.label));
-        let profiles =
-            entry.profiles.iter().filter(|profile| profile.store_visible).map(|profile| (profile.key, profile.label));
-        base.into_iter().chain(profiles)
-    })
+    let mut seen = HashSet::new();
+    entries()
+        .iter()
+        .flat_map(move |entry| {
+            let base = entry.store_visible.then_some((entry.key, entry.label));
+            let profiles = entry
+                .profiles
+                .iter()
+                .filter(|profile| profile.store_visible)
+                .map(|profile| (profile.key, profile.label));
+            base.into_iter().chain(profiles)
+        })
+        .filter(move |(key, _)| seen.insert(*key))
 }
 
 pub fn label_for_key(agent_key: &str) -> Option<&'static str> {

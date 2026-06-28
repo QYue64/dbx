@@ -262,6 +262,7 @@ public final class DbxJdbcPlugin {
                 optionalText(params, "database"),
                 optionalText(params, "schema")
             );
+            case "listDataTypes", "list_data_types" -> listDataTypes(connection, optionalText(params, "database"));
             case "getObjectSource", "get_object_source" -> getObjectSource(
                 connection,
                 optionalText(params, "database"),
@@ -1093,6 +1094,9 @@ public final class DbxJdbcPlugin {
         if (quirks.useOracleMetadata()) {
             return oracleListTables(conn, oracleEffectiveSchema(conn, schema));
         }
+        if (usePrestoInformationSchemaTables(connection)) {
+            return prestoListTables(conn, database, schema);
+        }
         DatabaseMetaData meta = conn.getMetaData();
         String[] types = jdbcTableTypes(meta);
         String catalog = metadataCatalog(database, quirks);
@@ -1109,6 +1113,9 @@ public final class DbxJdbcPlugin {
         Connection conn = openConnection(connection);
         if (driverQuirks(connection).useOracleMetadata()) {
             return oracleListObjects(conn, oracleEffectiveSchema(conn, schema), schema);
+        }
+        if (usePrestoInformationSchemaTables(connection)) {
+            return prestoListObjects(conn, database, schema);
         }
         DatabaseMetaData meta = conn.getMetaData();
         JdbcDriverQuirks quirks = driverQuirks(connection);
@@ -1157,11 +1164,41 @@ public final class DbxJdbcPlugin {
         return result;
     }
 
+    private static JsonNode listDataTypes(JsonNode connection, String database) throws SQLException {
+        Connection conn = openConnection(connection);
+        JdbcDriverQuirks quirks = driverQuirks(connection);
+        String catalog = metadataCatalog(database, quirks);
+        if (catalog != null) {
+            try {
+                conn.setCatalog(catalog);
+            } catch (SQLFeatureNotSupportedException | AbstractMethodError | UnsupportedOperationException ignored) {
+            }
+        }
+        ArrayNode result = MAPPER.createArrayNode();
+        Set<String> seen = new HashSet<>();
+        try (ResultSet rs = conn.getMetaData().getTypeInfo()) {
+            while (rs.next()) {
+                String name = rs.getString("TYPE_NAME");
+                if (name == null || name.isBlank()) {
+                    continue;
+                }
+                String trimmed = name.trim();
+                if (seen.add(trimmed.toLowerCase(Locale.ROOT))) {
+                    result.add(trimmed);
+                }
+            }
+        }
+        return result;
+    }
+
     private static JsonNode getColumns(JsonNode connection, String database, String schema, String table) throws SQLException {
         ArrayNode result = MAPPER.createArrayNode();
         Connection conn = openConnection(connection);
         if (driverQuirks(connection).useOracleMetadata()) {
             return oracleGetColumns(conn, oracleEffectiveSchema(conn, schema), table);
+        }
+        if (isKingbaseUrl(optionalText(connection, "connection_string"))) {
+            return kingbaseGetColumns(conn, schema, table);
         }
         DatabaseMetaData meta = conn.getMetaData();
         JdbcDriverQuirks quirks = driverQuirks(connection);
@@ -1324,6 +1361,149 @@ public final class DbxJdbcPlugin {
         }
     }
 
+    private static boolean usePrestoInformationSchemaTables(JsonNode connection) {
+        String url = optionalText(connection, "connection_string");
+        return urlMatchesPrefix(url, "jdbc:presto:") || urlMatchesPrefix(url, "jdbc:trino:");
+    }
+
+    private static JsonNode prestoListTables(Connection conn, String database, String schema) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database))) {
+            ps.setString(1, schema);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", rs.getString(1));
+                    item.put("table_type", normalizeInformationSchemaTableType(rs.getString(2)));
+                    item.putNull("comment");
+                    result.add(item);
+                }
+            }
+        }
+        return result;
+    }
+
+    private static JsonNode prestoListObjects(Connection conn, String database, String schema) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        try (PreparedStatement ps = conn.prepareStatement(prestoInformationSchemaTablesSql(database))) {
+            ps.setString(1, schema);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ObjectNode item = MAPPER.createObjectNode();
+                    item.put("name", rs.getString(1));
+                    item.put("object_type", normalizeInformationSchemaTableType(rs.getString(2)));
+                    putNullable(item, "schema", schema);
+                    item.putNull("comment");
+                    result.add(item);
+                }
+            }
+        }
+        return result;
+    }
+
+    static String prestoInformationSchemaTablesSql(String database) {
+        String source = emptyToNull(database) == null
+            ? "information_schema.tables"
+            : quoteAnsiIdentifier(database) + ".information_schema.tables";
+        return "SELECT table_name, table_type FROM " + source +
+            " WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW')" +
+            " ORDER BY table_type, table_name";
+    }
+
+    static String normalizeInformationSchemaTableType(String tableType) {
+        if (tableType == null) {
+            return "TABLE";
+        }
+        String normalized = tableType.trim().toUpperCase(Locale.ROOT).replace(' ', '_');
+        return switch (normalized) {
+            case "BASE_TABLE" -> "TABLE";
+            case "MATERIALIZED_VIEW" -> "MATERIALIZED_VIEW";
+            case "VIEW" -> "VIEW";
+            default -> tableType;
+        };
+    }
+
+    private static JsonNode kingbaseGetColumns(Connection conn, String schema, String table) throws SQLException {
+        ArrayNode result = MAPPER.createArrayNode();
+        String effectiveSchema = emptyToNull(schema) == null ? "PUBLIC" : schema;
+        Set<String> primaryKeys = kingbasePrimaryKeys(conn, effectiveSchema, table);
+        String sql = "SELECT a.attname AS column_name, " +
+            "format_type(a.atttypid, a.atttypmod) AS data_type, " +
+            "NOT a.attnotnull AS is_nullable, " +
+            "sys_get_expr(ad.adbin, ad.adrelid) AS column_default, " +
+            "d.description AS column_comment, " +
+            "CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 " +
+            "THEN ((a.atttypmod - 4) >> 16) & 65535 ELSE NULL END AS numeric_precision, " +
+            "CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 " +
+            "THEN (a.atttypmod - 4) & 65535 ELSE NULL END AS numeric_scale, " +
+            "CASE WHEN t.typname IN ('varchar', 'bpchar') AND a.atttypmod > 0 " +
+            "THEN a.atttypmod - 4 ELSE NULL END AS character_maximum_length " +
+            "FROM sys_catalog.sys_attribute a " +
+            "JOIN sys_catalog.sys_type t ON t.oid = a.atttypid " +
+            "JOIN sys_catalog.sys_class c ON c.oid = a.attrelid " +
+            "JOIN sys_catalog.sys_namespace n ON n.oid = c.relnamespace " +
+            "LEFT JOIN sys_catalog.sys_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum " +
+            "LEFT JOIN sys_catalog.sys_description d ON d.objoid = a.attrelid AND d.objsubid = a.attnum " +
+            "WHERE n.nspname = " + sqlString(effectiveSchema) +
+            " AND c.relname = " + sqlString(table) + " " +
+            "AND a.attnum > 0 AND NOT a.attisdropped " +
+            "ORDER BY a.attnum";
+        try (Statement statement = conn.createStatement()) {
+            try (ResultSet rs = statement.executeQuery(sql)) {
+                while (rs.next()) {
+                    String name = rs.getString("column_name");
+                    ObjectNode item = columnNode(result, name);
+                    item.put("data_type", rs.getString("data_type"));
+                    item.put("is_nullable", rs.getBoolean("is_nullable"));
+                    putNullablePreferValue(item, "column_default", rs.getString("column_default"));
+                    item.put("is_primary_key", primaryKeys.contains(name));
+                    item.putNull("extra");
+                    putNullablePreferValue(item, "comment", rs.getString("column_comment"));
+                    putNullableInt(item, "numeric_precision", rs.getObject("numeric_precision"));
+                    putNullableInt(item, "numeric_scale", rs.getObject("numeric_scale"));
+                    putNullableInt(item, "character_maximum_length", rs.getObject("character_maximum_length"));
+                }
+            }
+        }
+        return result;
+    }
+
+    private static Set<String> kingbasePrimaryKeys(Connection conn, String schema, String table) {
+        Set<String> primaryKeys = new HashSet<>();
+        String sql = "SELECT a.attname AS column_name " +
+            "FROM sys_catalog.sys_constraint co " +
+            "JOIN sys_catalog.sys_class c ON c.oid = co.conrelid " +
+            "JOIN sys_catalog.sys_namespace n ON n.oid = c.relnamespace " +
+            "JOIN LATERAL (SELECT unnest(co.conkey) AS attnum, generate_series(1, array_length(co.conkey, 1)) AS ord) AS pk_cols ON true " +
+            "JOIN sys_catalog.sys_attribute a ON a.attrelid = c.oid AND a.attnum = pk_cols.attnum " +
+            "WHERE co.contype = 'p' " +
+            "AND n.nspname = " + sqlString(schema) + " " +
+            "AND c.relname = " + sqlString(table) + " " +
+            "ORDER BY pk_cols.ord";
+        try (Statement statement = conn.createStatement()) {
+            try (ResultSet rs = statement.executeQuery(sql)) {
+                while (rs.next()) {
+                    primaryKeys.add(rs.getString("column_name"));
+                }
+            }
+        } catch (SQLException ignored) {
+            return Collections.emptySet();
+        }
+        return primaryKeys;
+    }
+
+    private static boolean isKingbaseUrl(String url) {
+        return urlMatchesPrefix(url, "jdbc:kingbase");
+    }
+
+    private static String quoteAnsiIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
+    private static String sqlString(String value) {
+        return "'" + (value == null ? "" : value).replace("'", "''") + "'";
+    }
+
     private static void appendColumns(
         ArrayNode result,
         DatabaseMetaData meta,
@@ -1337,7 +1517,7 @@ public final class DbxJdbcPlugin {
                 String name = rs.getString("COLUMN_NAME");
                 ObjectNode item = columnNode(result, name);
                 item.put("data_type", rs.getString("TYPE_NAME"));
-                item.put("is_nullable", rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls);
+                item.put("is_nullable", columnIsNullable(rs));
                 putNullablePreferValue(item, "column_default", rs.getString("COLUMN_DEF"));
                 item.put("is_primary_key", primaryKeys.contains(name));
                 item.putNull("extra");
@@ -1347,6 +1527,20 @@ public final class DbxJdbcPlugin {
                 putNullableInt(item, "character_maximum_length", rs.getObject("COLUMN_SIZE"));
             }
         }
+    }
+
+    private static boolean columnIsNullable(ResultSet rs) throws SQLException {
+        try {
+            String isNullableStr = rs.getString("IS_NULLABLE");
+            if ("YES".equalsIgnoreCase(isNullableStr)) {
+                return true;
+            }
+            if ("NO".equalsIgnoreCase(isNullableStr)) {
+                return false;
+            }
+        } catch (SQLException ignored) {
+        }
+        return rs.getInt("NULLABLE") != DatabaseMetaData.columnNoNulls;
     }
 
     private static void mergeShowFullColumnMetadata(Connection conn, ArrayNode result, String schema, String table) {
@@ -1510,7 +1704,7 @@ public final class DbxJdbcPlugin {
     }
 
     private static String jdbcUrlParamSeparator(String base) {
-        if (urlMatchesPrefix(base, "jdbc:sqlserver:")) {
+        if (urlMatchesPrefix(base, "jdbc:sqlserver:") || urlMatchesPrefix(base, "jdbc:dremio:")) {
             return base.endsWith(";") ? "" : ";";
         }
         if (jdbcUrlUsesColonProperties(base)) {

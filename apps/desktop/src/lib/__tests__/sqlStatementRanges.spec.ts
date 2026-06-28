@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildExecutionCandidates, fullSqlRange, splitSqlStatementRanges, statementRangeAtCursor, supportsExecutionTargetPicker } from "../sqlStatementRanges";
+import { buildExecutionCandidates, executableStatementRanges, fullSqlRange, hasMultipleExecutionTargets, splitSqlStatementRanges, statementRangeAtCursor, supportsExecutionTargetPicker } from "../sqlStatementRanges";
 
 function indexOf(sql: string, needle: string, occurrence = 1): number {
   let from = 0;
@@ -84,6 +84,11 @@ describe("splitSqlStatementRanges", () => {
     const sql = "SELECT $$ a; b $$;\nSELECT 2";
     expect(rangeSqlTexts(splitSqlStatementRanges(sql))).toEqual(["SELECT $$ a; b $$", "SELECT 2"]);
   });
+
+  it("skips MySQL delimiter commands and empty custom delimiter statements", () => {
+    const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "mysql"))).toEqual(["select COUNT(1) FROM your_table", "select COUNT(1) FROM your_table;"]);
+  });
 });
 
 describe("statementRangeAtCursor", () => {
@@ -108,10 +113,24 @@ describe("statementRangeAtCursor", () => {
     expect(range?.sql.trim()).toBe("SELECT 2");
   });
 
-  it("returns the next same-line statement when the cursor is in whitespace before it", () => {
+  it("returns the previous statement when the cursor is in same-line whitespace after its semicolon", () => {
     const sql = "SELECT 1;   SELECT 2;";
     const gapPos = sql.indexOf(";") + 2;
     const range = statementRangeAtCursor(sql, gapPos);
+    expect(range?.sql.trim()).toBe("SELECT 1");
+  });
+
+  it("returns the previous statement when the cursor is just after its semicolon before a later statement", () => {
+    const sql = "SELECT *\nFROM system_dept;\n\nSELECT *\nFROM sys;";
+    const gapPos = sql.indexOf(";") + 1;
+    const range = statementRangeAtCursor(sql, gapPos);
+    expect(range?.sql.trim()).toBe("SELECT *\nFROM system_dept");
+  });
+
+  it("returns the next same-line statement when the cursor is inside it", () => {
+    const sql = "SELECT 1;   SELECT 2;";
+    const pos = indexOf(sql, "SELECT 2") + 1;
+    const range = statementRangeAtCursor(sql, pos);
     expect(range?.sql.trim()).toBe("SELECT 2");
   });
 
@@ -205,6 +224,28 @@ describe("statementRangeAtCursor", () => {
     expect(range?.from).toBe(2);
     expect(range?.sql).toBe("SELECT 1");
   });
+
+  it("skips MySQL delimiter commands when resolving the cursor statement", () => {
+    const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
+    expect(statementRangeAtCursor(sql, indexOf(sql, "COUNT", 2), "mysql")?.sql.trim()).toBe("select COUNT(1) FROM your_table;");
+    expect(statementRangeAtCursor(sql, indexOf(sql, "delimiter"), "mysql")).toBeNull();
+  });
+});
+
+describe("executableStatementRanges", () => {
+  it("returns statement ranges starting only at statement starts", () => {
+    const sql = "SELECT *\nFROM users\nWHERE active = 1;\nSELECT 2;";
+    const ranges = executableStatementRanges(sql);
+    expect(rangeSqlTexts(ranges)).toEqual(["SELECT *\nFROM users\nWHERE active = 1", "SELECT 2"]);
+    expect(ranges.map((range) => range.from)).toEqual([0, sql.indexOf("SELECT 2")]);
+  });
+
+  it("returns Redis executable command lines", () => {
+    const sql = "GET user:1\n# comment\n  DEL user:2  ";
+    const ranges = executableStatementRanges(sql, "redis");
+    expect(rangeSqlTexts(ranges)).toEqual(["GET user:1", "DEL user:2"]);
+    expect(ranges.map((range) => range.from)).toEqual([0, sql.indexOf("DEL")]);
+  });
 });
 
 describe("fullSqlRange", () => {
@@ -233,10 +274,11 @@ describe("buildExecutionCandidates", () => {
     expect(candidateKinds(candidates)).toEqual(["cursor", "all"]);
   });
 
-  it("uses only the cursor SQL for the first candidate when it is missing a semicolon", () => {
-    const sql = "SELECT 1\nSELECT 2;\nSELECT 3;";
-    const candidates = buildExecutionCandidates(sql, indexOf(sql, "1"));
-    expect(candidateSummaries(candidates)).toEqual(["cursor:SELECT 1", "all:SELECT 1\nSELECT 2;\nSELECT 3;"]);
+  it("uses the cursor statement for the first candidate when there is no selection", () => {
+    const sql = "SELECT *\nFROM users\nWHERE active = 1";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "users"));
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].kind).toBe("all");
   });
 
   it("uses the current command line for Redis cursor candidates", () => {
@@ -283,6 +325,36 @@ describe("buildExecutionCandidates", () => {
     const candidates = buildExecutionCandidates(sql, sql.length);
     expect(candidateKinds(candidates)).toEqual(["all"]);
   });
+
+  it("uses the MySQL statement body for delimiter scripts", () => {
+    const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
+    const candidates = buildExecutionCandidates(sql, indexOf(sql, "COUNT", 2), "mysql");
+    expect(candidateSummaries(candidates)).toEqual(["cursor:select COUNT(1) FROM your_table;", "all:select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;"]);
+  });
+});
+
+describe("hasMultipleExecutionTargets", () => {
+  it("returns false for a single SQL statement", () => {
+    expect(hasMultipleExecutionTargets("SELECT 1;")).toBe(false);
+  });
+
+  it("returns true for multiple SQL statements", () => {
+    expect(hasMultipleExecutionTargets("SELECT 1;\nSELECT 2;")).toBe(true);
+  });
+
+  it("ignores comments when counting SQL statements", () => {
+    expect(hasMultipleExecutionTargets("-- check one thing\nSELECT 1;")).toBe(false);
+  });
+
+  it("counts executable Redis command lines", () => {
+    expect(hasMultipleExecutionTargets("GET user:1", "redis")).toBe(false);
+    expect(hasMultipleExecutionTargets("GET user:1\n# comment\nDEL user:2", "redis")).toBe(true);
+  });
+
+  it("counts MySQL delimiter scripts by executable statements", () => {
+    const sql = "select COUNT(1) FROM your_table;\ndelimiter ;;\nselect COUNT(1) FROM your_table;\n\n;;\ndelimiter ;";
+    expect(hasMultipleExecutionTargets(sql, "mysql")).toBe(true);
+  });
 });
 
 describe("supportsExecutionTargetPicker", () => {
@@ -297,7 +369,10 @@ describe("supportsExecutionTargetPicker", () => {
     expect(supportsExecutionTargetPicker("elasticsearch")).toBe(false);
     expect(supportsExecutionTargetPicker("qdrant")).toBe(false);
     expect(supportsExecutionTargetPicker("milvus")).toBe(false);
+    expect(supportsExecutionTargetPicker("weaviate")).toBe(false);
+    expect(supportsExecutionTargetPicker("chromadb")).toBe(false);
     expect(supportsExecutionTargetPicker("etcd")).toBe(false);
+    expect(supportsExecutionTargetPicker("zookeeper")).toBe(false);
     expect(supportsExecutionTargetPicker("mq")).toBe(false);
     expect(supportsExecutionTargetPicker("neo4j")).toBe(false);
     expect(supportsExecutionTargetPicker(undefined)).toBe(false);

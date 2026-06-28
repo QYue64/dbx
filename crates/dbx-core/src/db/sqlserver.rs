@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tiberius::{AuthMethod, Client, ColumnData, Config, FromSql, QueryItem, QueryStream, SqlBrowser};
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+use tokio_util::sync::CancellationToken;
 
 pub type SqlServerClient = Client<Compat<TcpStream>>;
 pub const SQLSERVER_DRIVER_PANIC_ERROR_PREFIX: &str = "SQL Server driver panic:";
@@ -160,6 +161,16 @@ struct SqlServerResultSet {
     column_types: Vec<String>,
     rows: Vec<Vec<serde_json::Value>>,
     truncated: bool,
+}
+
+pub struct SqlServerStreamExportSummary {
+    pub columns: Vec<String>,
+    pub rows_exported: u64,
+}
+
+pub enum SqlServerStreamItem<'a> {
+    Columns(&'a [String]),
+    Row(&'a [serde_json::Value]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +524,75 @@ async fn collect_result_sets_limited(
     Ok(results)
 }
 
+pub async fn stream_first_result_set(
+    client: &mut SqlServerClient,
+    sql: &str,
+    row_limit: Option<usize>,
+    cancel_token: Option<CancellationToken>,
+    mut on_item: impl for<'a> FnMut(SqlServerStreamItem<'a>) -> Result<(), String>,
+) -> Result<SqlServerStreamExportSummary, String> {
+    let query_sql = match spatial_safe_sqlserver_query(client, sql).await {
+        Ok(Some(sql)) => sql,
+        Ok(None) | Err(_) => sql.to_string(),
+    };
+    let mut stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
+    let mut active_result_index: Option<usize> = None;
+    let mut columns: Vec<String> = Vec::new();
+    let mut columns_emitted = false;
+    let mut rows_exported = 0_u64;
+
+    loop {
+        if cancel_token.as_ref().is_some_and(|token| token.is_cancelled()) {
+            return Err(crate::query::canceled_error());
+        }
+        let item = match cancel_token.as_ref() {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(crate::query::canceled_error()),
+                    item = stream.try_next() => item.map_err(|e| e.to_string())?,
+                }
+            }
+            None => stream.try_next().await.map_err(|e| e.to_string())?,
+        };
+        let Some(item) = item else {
+            break;
+        };
+        match item {
+            QueryItem::Metadata(metadata) => {
+                if active_result_index.is_none() {
+                    active_result_index = Some(metadata.result_index());
+                    columns = columns_from_metadata(&metadata);
+                    on_item(SqlServerStreamItem::Columns(&columns))?;
+                    columns_emitted = true;
+                }
+            }
+            QueryItem::Row(row) => {
+                if active_result_index.is_none() {
+                    active_result_index = Some(row.result_index());
+                    columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                    on_item(SqlServerStreamItem::Columns(&columns))?;
+                    columns_emitted = true;
+                }
+                if Some(row.result_index()) != active_result_index {
+                    continue;
+                }
+                if row_limit.is_some_and(|limit| rows_exported as usize >= limit) {
+                    break;
+                }
+                let values = row_to_json(&row);
+                on_item(SqlServerStreamItem::Row(&values))?;
+                rows_exported += 1;
+            }
+        }
+    }
+
+    if !columns_emitted {
+        on_item(SqlServerStreamItem::Columns(&columns))?;
+    }
+    Ok(SqlServerStreamExportSummary { columns, rows_exported })
+}
+
 fn sqlserver_cell_to_json(cell: &ColumnData<'static>) -> serde_json::Value {
     if let Ok(Some(v)) = <&str as FromSql>::from_sql(cell) {
         return serde_json::Value::String(v.to_string());
@@ -803,24 +883,21 @@ fn linked_i32(row: &tiberius::Row, index: usize) -> Option<i32> {
 }
 
 pub async fn list_schemas(client: &mut SqlServerClient) -> Result<Vec<String>, String> {
-    let stream = client
-        .query(
-            "SELECT s.name \
-         FROM sys.schemas s \
-         WHERE s.name NOT IN ('guest','INFORMATION_SCHEMA','sys') \
-           AND EXISTS ( \
-             SELECT 1 FROM sys.objects o \
-             WHERE o.schema_id = s.schema_id \
-               AND o.type IN ('U','V') \
-               AND o.is_ms_shipped = 0 \
-           ) \
-         ORDER BY CASE WHEN s.name = 'dbo' THEN 0 ELSE 1 END, s.name",
-            &[],
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let sql = sqlserver_list_schemas_sql();
+    let stream = client.query(&*sql, &[]).await.map_err(|e| e.to_string())?;
     let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
     Ok(rows.iter().map(|row| row.get::<&str, _>(0).unwrap_or("").to_string()).collect())
+}
+
+fn sqlserver_list_schemas_sql() -> String {
+    let excluded_schemas =
+        sqlserver_hidden_schema_names().iter().map(|name| format!("'{name}'")).collect::<Vec<_>>().join(",");
+    format!(
+        "SELECT s.name \
+         FROM sys.schemas s \
+         WHERE s.name NOT IN ({excluded_schemas}) \
+         ORDER BY CASE WHEN s.name = 'dbo' THEN 0 ELSE 1 END, s.name"
+    )
 }
 
 pub async fn list_tables(
@@ -830,9 +907,228 @@ pub async fn list_tables(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<TableInfo>, String> {
+    let sql = sqlserver_list_tables_sql(schema, filter, limit, offset);
+    let stream = client.query(&*sql, &[]).await.map_err(|e| e.to_string())?;
+    let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|row| TableInfo {
+            name: row.get::<&str, _>(0).unwrap_or("").to_string(),
+            table_type: row.get::<&str, _>(1).unwrap_or("BASE TABLE").to_string(),
+            comment: row.get::<&str, _>(2).filter(|s: &&str| !s.is_empty()).map(|s: &str| s.to_string()),
+            parent_schema: None,
+            parent_name: None,
+        })
+        .collect())
+}
+
+pub async fn completion_assistant_search(
+    client: &mut SqlServerClient,
+    request: &crate::types::CompletionAssistantRequest,
+) -> Result<crate::types::CompletionAssistantResponse, String> {
+    let limit = request.max_results.unwrap_or(100).clamp(1, 1000);
+    let sql = sqlserver_completion_assistant_sql(request, limit);
+    let stream = client.query(&*sql, &[]).await.map_err(|e| e.to_string())?;
+    let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
+    let candidates = rows
+        .iter()
+        .map(|row| {
+            let object_type = row.get::<&str, _>(2).unwrap_or("OBJECT");
+            crate::types::CompletionAssistantCandidate {
+                name: row.get::<&str, _>(0).unwrap_or("").to_string(),
+                kind: sqlserver_completion_candidate_kind(object_type),
+                database: Some(request.database.clone()),
+                schema: row.get::<&str, _>(1).map(str::to_string),
+                parent_schema: row.get::<&str, _>(3).map(str::to_string),
+                parent_name: row.get::<&str, _>(4).map(str::to_string),
+                comment: row.get::<&str, _>(5).filter(|s: &&str| !s.is_empty()).map(|s| (*s).to_string()),
+                data_type: row.get::<&str, _>(6).map(str::to_string),
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(crate::types::CompletionAssistantResponse {
+        incomplete: candidates.len() >= limit,
+        candidates,
+        fallback_used: false,
+    })
+}
+
+fn sqlserver_completion_candidate_kind(object_type: &str) -> crate::types::CompletionAssistantCandidateKind {
+    match object_type.to_ascii_uppercase().as_str() {
+        "SCHEMA" => crate::types::CompletionAssistantCandidateKind::Schema,
+        "TABLE" | "BASE TABLE" => crate::types::CompletionAssistantCandidateKind::Table,
+        "VIEW" => crate::types::CompletionAssistantCandidateKind::View,
+        "PROCEDURE" => crate::types::CompletionAssistantCandidateKind::Procedure,
+        "FUNCTION" => crate::types::CompletionAssistantCandidateKind::Function,
+        "COLUMN" => crate::types::CompletionAssistantCandidateKind::Column,
+        _ => crate::types::CompletionAssistantCandidateKind::Object,
+    }
+}
+
+fn sqlserver_completion_assistant_sql(request: &crate::types::CompletionAssistantRequest, limit: usize) -> String {
+    let object_kinds = if request.object_kinds.is_empty() {
+        vec![crate::types::CompletionAssistantObjectKind::Table, crate::types::CompletionAssistantObjectKind::View]
+    } else {
+        request.object_kinds.clone()
+    };
+    let mask = request.mask.trim();
+    let like_pattern = completion_like_pattern(mask, request.match_mode.as_ref());
+    let like_clause = if like_pattern == "%" {
+        String::new()
+    } else {
+        format!(" AND LOWER({}) LIKE LOWER('{like_pattern}') ESCAPE '\\' ", "name_expr")
+    };
+    let schema_filter = request
+        .schema
+        .as_deref()
+        .or(request.parent_schema.as_deref())
+        .filter(|schema| !schema.trim().is_empty())
+        .map(|schema| format!(" AND s.name = '{}' ", schema.replace('\'', "''")))
+        .unwrap_or_default();
+
+    let mut queries = Vec::new();
+    if (mask.starts_with('#') || mask.starts_with("%#"))
+        && object_kinds.iter().any(crate::types::CompletionAssistantObjectKind::is_table_like)
+    {
+        let object_like = sqlserver_completion_object_search_clause(request, &like_pattern);
+        queries.push(format!(
+            "SELECT TOP ({limit}) o.name, s.name AS schema_name, 'TABLE' AS object_type, CAST(NULL AS NVARCHAR(128)) AS parent_schema, CAST(NULL AS NVARCHAR(128)) AS parent_name, CAST(NULL AS NVARCHAR(MAX)) AS object_comment, CAST(NULL AS NVARCHAR(128)) AS data_type \
+             FROM tempdb.sys.all_objects o \
+             JOIN tempdb.sys.schemas s ON s.schema_id = o.schema_id \
+             WHERE o.type = 'U' {object_like}"
+        ));
+        return format!("SELECT * FROM ({}) AS dbx_completion ORDER BY name", queries.remove(0));
+    }
+    if object_kinds.iter().any(|kind| matches!(kind, crate::types::CompletionAssistantObjectKind::Schema)) {
+        let schema_like = like_clause.replace("name_expr", "s.name");
+        queries.push(format!(
+            "SELECT TOP ({limit}) s.name, s.name AS schema_name, 'SCHEMA' AS object_type, CAST(NULL AS NVARCHAR(128)) AS parent_schema, CAST(NULL AS NVARCHAR(128)) AS parent_name, CAST(NULL AS NVARCHAR(MAX)) AS object_comment, CAST(NULL AS NVARCHAR(128)) AS data_type \
+             FROM sys.schemas s \
+             WHERE s.name NOT IN ('guest','INFORMATION_SCHEMA','sys') {schema_like}"
+        ));
+    }
+    if object_kinds.iter().any(crate::types::CompletionAssistantObjectKind::is_table_like)
+        || object_kinds.iter().any(crate::types::CompletionAssistantObjectKind::is_routine_like)
+    {
+        let mut type_ids = Vec::new();
+        if object_kinds.iter().any(|kind| matches!(kind, crate::types::CompletionAssistantObjectKind::Table)) {
+            type_ids.push("'U'");
+        }
+        if object_kinds.iter().any(|kind| matches!(kind, crate::types::CompletionAssistantObjectKind::View)) {
+            type_ids.push("'V'");
+        }
+        if object_kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                crate::types::CompletionAssistantObjectKind::Procedure
+                    | crate::types::CompletionAssistantObjectKind::Routine
+            )
+        }) {
+            type_ids.push("'P'");
+        }
+        if object_kinds.iter().any(|kind| {
+            matches!(
+                kind,
+                crate::types::CompletionAssistantObjectKind::Function
+                    | crate::types::CompletionAssistantObjectKind::Routine
+            )
+        }) {
+            type_ids.extend(["'FN'", "'IF'", "'TF'", "'FS'", "'FT'"]);
+        }
+        let object_like = sqlserver_completion_object_search_clause(request, &like_pattern);
+        let object_visibility = sqlserver_visible_object_predicate();
+        queries.push(format!(
+            "SELECT TOP ({limit}) o.name, s.name AS schema_name, \
+             CASE o.type WHEN 'U' THEN 'TABLE' WHEN 'V' THEN 'VIEW' WHEN 'P' THEN 'PROCEDURE' WHEN 'FN' THEN 'FUNCTION' WHEN 'IF' THEN 'FUNCTION' WHEN 'TF' THEN 'FUNCTION' WHEN 'FS' THEN 'FUNCTION' WHEN 'FT' THEN 'FUNCTION' ELSE o.type_desc END AS object_type, \
+             CAST(NULL AS NVARCHAR(128)) AS parent_schema, CAST(NULL AS NVARCHAR(128)) AS parent_name, ep.value AS object_comment, CAST(NULL AS NVARCHAR(128)) AS data_type \
+             FROM sys.objects o \
+             JOIN sys.schemas s ON s.schema_id = o.schema_id \
+             OUTER APPLY (SELECT CAST(ep.value AS NVARCHAR(MAX)) AS value FROM sys.extended_properties ep WHERE ep.major_id = o.object_id AND ep.minor_id = 0 AND ep.name = N'MS_Description') ep \
+             WHERE o.type IN ({}) AND {object_visibility} {schema_filter} {object_like}",
+            type_ids.join(",")
+        ));
+    }
+    if object_kinds.iter().any(|kind| matches!(kind, crate::types::CompletionAssistantObjectKind::Column)) {
+        let column_like = like_clause.replace("name_expr", "c.name");
+        let parent_table_filter = request
+            .parent_name
+            .as_deref()
+            .filter(|table| !table.trim().is_empty())
+            .map(|table| format!(" AND o.name = '{}' ", table.replace('\'', "''")))
+            .unwrap_or_default();
+        let object_visibility = sqlserver_visible_object_predicate();
+        queries.push(format!(
+            "SELECT TOP ({limit}) c.name, s.name AS schema_name, 'COLUMN' AS object_type, s.name AS parent_schema, o.name AS parent_name, CAST(NULL AS NVARCHAR(MAX)) AS object_comment, TYPE_NAME(c.user_type_id) AS data_type \
+             FROM sys.columns c \
+             JOIN sys.objects o ON o.object_id = c.object_id \
+             JOIN sys.schemas s ON s.schema_id = o.schema_id \
+             WHERE o.type IN ('U','V') AND {object_visibility} {schema_filter} {parent_table_filter} {column_like}"
+        ));
+    }
+
+    if queries.is_empty() {
+        format!("SELECT TOP (0) CAST('' AS NVARCHAR(128)) AS name, CAST('' AS NVARCHAR(128)) AS schema_name, CAST('' AS NVARCHAR(60)) AS object_type, CAST(NULL AS NVARCHAR(128)) AS parent_schema, CAST(NULL AS NVARCHAR(128)) AS parent_name, CAST(NULL AS NVARCHAR(MAX)) AS object_comment, CAST(NULL AS NVARCHAR(128)) AS data_type")
+    } else if queries.len() == 1 {
+        format!("SELECT * FROM ({}) AS dbx_completion ORDER BY name", queries.remove(0))
+    } else {
+        format!("SELECT TOP ({limit}) * FROM ({}) AS dbx_completion ORDER BY name", queries.join(" UNION ALL "))
+    }
+}
+
+fn sqlserver_completion_object_search_clause(
+    request: &crate::types::CompletionAssistantRequest,
+    like_pattern: &str,
+) -> String {
+    if like_pattern == "%" {
+        return String::new();
+    }
+    let mut predicates = vec![format!("LOWER(o.name) LIKE LOWER('{like_pattern}') ESCAPE '\\'")];
+    if request.search_in_comments {
+        predicates.push(format!("LOWER(COALESCE(ep.value, '')) LIKE LOWER('{like_pattern}') ESCAPE '\\'"));
+    }
+    if request.search_in_definitions {
+        predicates.push(format!(
+            "LOWER(COALESCE(OBJECT_DEFINITION(o.object_id), '')) LIKE LOWER('{like_pattern}') ESCAPE '\\'"
+        ));
+    }
+    format!(" AND ({}) ", predicates.join(" OR "))
+}
+
+fn completion_like_pattern(mask: &str, mode: Option<&crate::types::CompletionAssistantMatchMode>) -> String {
+    if mask.is_empty() || mask == "%" {
+        return "%".to_string();
+    }
+    let has_wildcard = mask.contains('%');
+    if has_wildcard {
+        return mask.split('%').map(escape_like_literal).collect::<Vec<_>>().join("%");
+    }
+    let escaped = escape_like_literal(mask);
+    match mode.unwrap_or(&crate::types::CompletionAssistantMatchMode::Prefix) {
+        crate::types::CompletionAssistantMatchMode::Prefix => format!("{escaped}%"),
+        crate::types::CompletionAssistantMatchMode::Contains => format!("%{escaped}%"),
+    }
+}
+
+fn sqlserver_list_tables_sql(
+    schema: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> String {
     let filter_clause = filter
         .filter(|value| !value.trim().is_empty())
-        .map(|value| format!(" AND o.name LIKE '%{}%' ESCAPE '\\' ", escape_like_literal(value.trim())))
+        .map(|value| {
+            let contains_pattern = format!("%{}%", escape_like_literal(value.trim()));
+            if crate::sql::fuzzy_filter_enabled(value) {
+                let fuzzy_pattern =
+                    crate::sql::fuzzy_like_pattern_with_escape(value.trim(), escape_like_literal);
+                format!(
+                    " AND (LOWER(o.name) LIKE LOWER('{contains_pattern}') ESCAPE '\\' OR LOWER(o.name) LIKE LOWER('{fuzzy_pattern}') ESCAPE '\\') "
+                )
+            } else {
+                format!(" AND LOWER(o.name) LIKE LOWER('{contains_pattern}') ESCAPE '\\' ")
+            }
+        })
         .unwrap_or_default();
     let schema_escaped = schema.replace('\'', "''");
     let base_columns = "o.name, CASE WHEN o.type = 'V' THEN 'VIEW' ELSE 'BASE TABLE' END, ep.value AS TABLE_COMMENT";
@@ -840,13 +1136,14 @@ pub async fn list_tables(
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
          OUTER APPLY (SELECT CAST(ep.value AS NVARCHAR(MAX)) AS value FROM sys.extended_properties ep \
            WHERE ep.major_id = o.object_id AND ep.minor_id = 0 AND ep.name = N'MS_Description') ep";
+    let object_visibility = sqlserver_visible_object_predicate();
     let base_where =
-        format!("WHERE s.name = '{schema_escaped}' AND o.type IN ('U','V') AND o.is_ms_shipped = 0 {filter_clause}");
+        format!("WHERE s.name = '{schema_escaped}' AND o.type IN ('U','V') AND {object_visibility} {filter_clause}");
     let order_by = "ORDER BY o.name";
 
     // Use SELECT TOP for broad SQL Server version compatibility.
     // OFFSET / FETCH NEXT is only available in SQL Server 2012+.
-    let sql = match (limit, offset) {
+    match (limit, offset) {
         (Some(limit), Some(offset)) if offset > 0 => {
             let end = offset + limit.min(1000);
             format!(
@@ -862,23 +1159,32 @@ pub async fn list_tables(
         _ => {
             format!("SELECT {base_columns} {base_from} {base_where} {order_by}")
         }
-    };
-    let stream = client.query(&*sql, &[]).await.map_err(|e| e.to_string())?;
-    let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
-    Ok(rows
-        .iter()
-        .map(|row| TableInfo {
-            name: row.get::<&str, _>(0).unwrap_or("").to_string(),
-            table_type: row.get::<&str, _>(1).unwrap_or("BASE TABLE").to_string(),
-            comment: row.get::<&str, _>(2).filter(|s: &&str| !s.is_empty()).map(|s: &str| s.to_string()),
-            parent_schema: None,
-            parent_name: None,
-        })
-        .collect())
+    }
 }
 
 fn escape_like_literal(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "''").replace('%', "\\%").replace('_', "\\_").replace('[', "\\[")
+}
+
+fn sqlserver_visible_object_predicate() -> &'static str {
+    "(o.is_ms_shipped = 0 OR s.name = 'cdc')"
+}
+
+fn sqlserver_hidden_schema_names() -> &'static [&'static str] {
+    &[
+        "guest",
+        "INFORMATION_SCHEMA",
+        "sys",
+        "db_owner",
+        "db_accessadmin",
+        "db_securityadmin",
+        "db_ddladmin",
+        "db_backupoperator",
+        "db_datareader",
+        "db_datawriter",
+        "db_denydatareader",
+        "db_denydatawriter",
+    ]
 }
 
 pub async fn list_objects(client: &mut SqlServerClient, schema: &str) -> Result<Vec<crate::types::ObjectInfo>, String> {
@@ -902,6 +1208,7 @@ pub async fn list_objects(client: &mut SqlServerClient, schema: &str) -> Result<
 
 fn sqlserver_list_objects_sql(schema: &str) -> String {
     let s = schema.replace('\'', "''");
+    let object_visibility = sqlserver_visible_object_predicate();
     format!(
         "SELECT o.name, \
          CASE o.type \
@@ -923,7 +1230,7 @@ fn sqlserver_list_objects_sql(schema: &str) -> String {
          OUTER APPLY (SELECT CAST(ep.value AS NVARCHAR(MAX)) AS value FROM sys.extended_properties ep WHERE ep.major_id = o.object_id AND ep.minor_id = 0 AND ep.name = N'MS_Description') ep \
          WHERE s.name = '{s}' \
            AND o.type IN ('U','V','P','FN','IF','TF','FS','FT') \
-           AND o.is_ms_shipped = 0 \
+           AND {object_visibility} \
          ORDER BY CASE o.type \
            WHEN 'U' THEN 0 \
            WHEN 'V' THEN 1 \
@@ -938,6 +1245,7 @@ pub async fn list_object_statistics(
     schema: &str,
 ) -> Result<Vec<ObjectStatistics>, String> {
     let s = schema.replace('\'', "''");
+    let object_visibility = sqlserver_visible_object_predicate();
     let sql = format!(
         "SELECT o.name, \
                 SUM(CASE WHEN ps.index_id IN (0, 1) THEN ps.row_count ELSE 0 END) AS estimated_rows, \
@@ -945,7 +1253,7 @@ pub async fn list_object_statistics(
          FROM sys.objects o \
          JOIN sys.schemas s ON s.schema_id = o.schema_id \
          JOIN sys.dm_db_partition_stats ps ON ps.object_id = o.object_id \
-         WHERE s.name = '{s}' AND o.type = 'U' AND o.is_ms_shipped = 0 \
+         WHERE s.name = '{s}' AND o.type = 'U' AND {object_visibility} \
          GROUP BY o.object_id, o.name \
          ORDER BY o.name"
     );
@@ -1223,7 +1531,9 @@ pub async fn execute_query_with_max_rows(
             Ok(None) | Err(_) => sql.to_string(),
         };
         let stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
-        sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows)).await
+        let mut result = sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows)).await?;
+        strip_dbx_sqlserver_row_number_column(&mut result, sql);
+        Ok(result)
     } else if requires_simple_query_batch(sql) || is_transaction_control(sql) {
         let stream = sqlserver_driver_result(client.simple_query(sql)).await?;
         let _ = sqlserver_driver_result(collect_result_sets_limited(stream, start, max_rows)).await?;
@@ -1282,13 +1592,19 @@ pub async fn execute_batch_with_max_rows(
     if is_single_sqlserver_select(sql) {
         if let Ok(Some(query_sql)) = spatial_safe_sqlserver_query(client, sql).await {
             let stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
-            return sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows))
-                .await
-                .map(|result| vec![result]);
+            return sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows)).await.map(
+                |mut result| {
+                    strip_dbx_sqlserver_row_number_column(&mut result, sql);
+                    vec![result]
+                },
+            );
         }
     }
     let stream = sqlserver_driver_result(client.simple_query(sql)).await?;
     let mut results = sqlserver_driver_result(collect_result_sets_limited(stream, start, max_rows)).await?;
+    for result in &mut results {
+        strip_dbx_sqlserver_row_number_column(result, sql);
+    }
 
     if results.is_empty() {
         results.push(QueryResult {
@@ -1307,10 +1623,44 @@ pub async fn execute_batch_with_max_rows(
     Ok(results)
 }
 
+fn strip_dbx_sqlserver_row_number_column(result: &mut QueryResult, sql: &str) {
+    if !is_dbx_sqlserver_row_number_page_sql(sql) {
+        return;
+    }
+    if !result.columns.last().is_some_and(|column| column.eq_ignore_ascii_case("__dbx_row_num")) {
+        return;
+    }
+
+    result.columns.pop();
+    if result.column_types.len() > result.columns.len() {
+        result.column_types.pop();
+    }
+    if result.column_sortables.len() > result.columns.len() {
+        result.column_sortables.pop();
+    }
+    for row in &mut result.rows {
+        if row.len() > result.columns.len() {
+            row.pop();
+        }
+    }
+}
+
+fn is_dbx_sqlserver_row_number_page_sql(sql: &str) -> bool {
+    let normalized = sql.to_ascii_uppercase();
+    normalized.contains("ROW_NUMBER() OVER")
+        && normalized.contains("[__DBX_ROW_NUM]")
+        && normalized.contains("DBX_PAGE_SOURCE.*")
+}
+
 fn sqlserver_batch_can_use_execute(sql: &str) -> bool {
     !requires_simple_query_batch(sql)
-        && !starts_with_executable_sql_keyword(sql, &["SELECT", "EXEC", "WITH", "TABLE"])
+        && !sqlserver_batch_may_return_result_set(sql)
         && !sqlserver_dml_output_returns_rows(sql)
+}
+
+fn sqlserver_batch_may_return_result_set(sql: &str) -> bool {
+    let tokens = top_level_sqlserver_tokens(sql);
+    tokens.iter().any(|token| matches!(token.text.as_str(), "SELECT" | "EXEC" | "EXECUTE" | "WITH" | "TABLE"))
 }
 
 fn sqlserver_dml_output_returns_rows(sql: &str) -> bool {
@@ -1335,6 +1685,10 @@ fn is_transaction_control(sql: &str) -> bool {
 
 fn requires_simple_query_batch(sql: &str) -> bool {
     let tokens = first_sql_tokens(sql, 4);
+    if tokens.len() >= 2 && tokens[0].eq_ignore_ascii_case("CREATE") && tokens[1].eq_ignore_ascii_case("SCHEMA") {
+        return true;
+    }
+
     if tokens.len() >= 4
         && tokens[0].eq_ignore_ascii_case("CREATE")
         && tokens[1].eq_ignore_ascii_case("OR")
@@ -1397,8 +1751,13 @@ mod tests {
     use super::{
         build_spatial_safe_sqlserver_query, is_sqlserver_spatial_column, requires_simple_query_batch,
         sqlserver_batch_can_use_execute, sqlserver_cell_to_json, sqlserver_columns_sql,
-        sqlserver_dml_output_returns_rows, sqlserver_indexes_sql, sqlserver_list_objects_sql,
-        sqlserver_table_comment_sql, SqlServerDescribedColumn, SqlServerResultSet,
+        sqlserver_completion_assistant_sql, sqlserver_dml_output_returns_rows, sqlserver_hidden_schema_names,
+        sqlserver_indexes_sql, sqlserver_list_objects_sql, sqlserver_list_schemas_sql, sqlserver_list_tables_sql,
+        sqlserver_table_comment_sql, sqlserver_visible_object_predicate, strip_dbx_sqlserver_row_number_column,
+        SqlServerDescribedColumn, SqlServerResultSet,
+    };
+    use crate::types::{
+        CompletionAssistantMatchMode, CompletionAssistantObjectKind, CompletionAssistantRequest, QueryResult,
     };
     use chrono::NaiveDate;
     use std::time::Instant;
@@ -1438,6 +1797,7 @@ mod tests {
 
     #[test]
     fn sqlserver_module_definitions_require_simple_query_batch() {
+        assert!(requires_simple_query_batch("CREATE SCHEMA [analytics];"));
         assert!(requires_simple_query_batch("CREATE FUNCTION dbo.fn_demo() RETURNS INT AS BEGIN RETURN 1; END;"));
         assert!(requires_simple_query_batch("ALTER PROCEDURE dbo.usp_demo AS SELECT 1;"));
         assert!(requires_simple_query_batch("CREATE OR ALTER VIEW dbo.vw_demo AS SELECT 1 AS id;"));
@@ -1448,6 +1808,7 @@ mod tests {
 
     #[test]
     fn sqlserver_regular_ddl_can_use_execute() {
+        assert!(!sqlserver_batch_can_use_execute("CREATE SCHEMA [analytics];"));
         assert!(!requires_simple_query_batch("ALTER TABLE dbo.t ADD name NVARCHAR(20);"));
         assert!(!requires_simple_query_batch("CREATE TABLE dbo.t(id INT);"));
         assert!(!requires_simple_query_batch("UPDATE dbo.t SET id = 1;"));
@@ -1467,8 +1828,15 @@ mod tests {
     fn sqlserver_result_returning_batches_keep_simple_query_path() {
         assert!(!sqlserver_batch_can_use_execute("SELECT * FROM dbo.users;"));
         assert!(!sqlserver_batch_can_use_execute("EXEC dbo.list_users;"));
+        assert!(!sqlserver_batch_can_use_execute("DECLARE @id INT = 1; EXEC dbo.list_users @id;"));
+        assert!(!sqlserver_batch_can_use_execute(
+            "DECLARE @id INT = 1; CREATE TABLE #t(id INT); INSERT INTO #t VALUES (@id); SELECT id FROM #t;"
+        ));
         assert!(!sqlserver_batch_can_use_execute("WITH cte AS (SELECT 1 AS id) SELECT * FROM cte;"));
         assert!(!sqlserver_batch_can_use_execute("UPDATE dbo.users SET active = 0 OUTPUT inserted.id WHERE id = 1;"));
+        assert!(sqlserver_batch_can_use_execute(
+            "DECLARE @id INT = 1; UPDATE dbo.users SET active = 0 WHERE id = @id;"
+        ));
         assert!(sqlserver_dml_output_returns_rows("DELETE FROM dbo.users OUTPUT deleted.id WHERE id = 1;"));
     }
 
@@ -1533,6 +1901,218 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_metadata_allows_cdc_system_shipped_objects() {
+        let predicate = sqlserver_visible_object_predicate();
+
+        assert_eq!(predicate, "(o.is_ms_shipped = 0 OR s.name = 'cdc')");
+        assert!(sqlserver_list_tables_sql("cdc", None, Some(200), None).contains(predicate));
+        assert!(sqlserver_list_objects_sql("cdc").contains(predicate));
+    }
+
+    #[test]
+    fn sqlserver_list_schemas_includes_empty_user_schemas() {
+        let sql = sqlserver_list_schemas_sql();
+
+        assert!(!sql.contains("sys.objects"));
+        assert!(sql.contains("s.name NOT IN"));
+        assert!(sql.contains("'db_owner'"));
+        assert!(sql.contains("'db_datareader'"));
+        assert!(sqlserver_hidden_schema_names().contains(&"sys"));
+    }
+
+    #[test]
+    fn sqlserver_list_tables_filter_is_case_insensitive() {
+        let sql = sqlserver_list_tables_sql("dbo", Some("temp"), Some(200), None);
+
+        assert!(sql.contains("LOWER(o.name) LIKE LOWER('%temp%') ESCAPE '\\'"));
+        assert!(sql.contains("LOWER(o.name) LIKE LOWER('%t%e%m%p%') ESCAPE '\\'"));
+        assert!(sql.contains("SELECT TOP (200)"));
+    }
+
+    #[test]
+    fn sqlserver_list_tables_filter_escapes_like_literals() {
+        let sql = sqlserver_list_tables_sql("dbo", Some("Temp_Table[%]"), Some(200), None);
+
+        assert!(sql.contains("LOWER(o.name) LIKE LOWER('%Temp\\_Table\\[\\%]%') ESCAPE '\\'"));
+        assert!(sql.contains("LOWER(o.name) LIKE LOWER('%T%e%m%p%\\_%T%a%b%l%e%\\[%\\%%]%') ESCAPE '\\'"));
+    }
+
+    #[test]
+    fn sqlserver_list_tables_filter_adds_fuzzy_pattern() {
+        let sql = sqlserver_list_tables_sql("dbo", Some("sysu"), Some(200), None);
+
+        assert!(sql.contains("LOWER(o.name) LIKE LOWER('%sysu%') ESCAPE '\\'"));
+        assert!(sql.contains("LOWER(o.name) LIKE LOWER('%s%y%s%u%') ESCAPE '\\'"));
+        assert!(sql.contains("SELECT TOP (200)"));
+    }
+
+    #[test]
+    fn sqlserver_list_tables_filter_skips_fuzzy_pattern_for_single_character() {
+        let sql = sqlserver_list_tables_sql("dbo", Some("u"), Some(200), None);
+
+        assert!(sql.contains("LOWER(o.name) LIKE LOWER('%u%') ESCAPE '\\'"));
+        assert!(!sql.contains(" OR LOWER(o.name) LIKE"));
+        assert!(sql.contains("SELECT TOP (200)"));
+    }
+
+    #[test]
+    fn sqlserver_completion_assistant_searches_objects_before_limiting() {
+        let request = CompletionAssistantRequest {
+            connection_id: "c1".to_string(),
+            database: "app".to_string(),
+            schema: Some("dbo".to_string()),
+            object_kinds: vec![CompletionAssistantObjectKind::Table, CompletionAssistantObjectKind::View],
+            mask: "Temp".to_string(),
+            case_sensitive: false,
+            global_search: false,
+            max_results: Some(100),
+            search_in_comments: false,
+            search_in_definitions: false,
+            parent_schema: None,
+            parent_name: None,
+            match_mode: Some(CompletionAssistantMatchMode::Prefix),
+        };
+
+        let sql = sqlserver_completion_assistant_sql(&request, 100);
+
+        assert!(sql.contains("SELECT TOP (100)"));
+        assert!(sql.contains("FROM sys.objects o"));
+        assert!(sql.contains("o.type IN ('U','V')"));
+        assert!(sql.contains("s.name = 'dbo'"));
+        assert!(sql.contains("LOWER(o.name) LIKE LOWER('Temp%') ESCAPE '\\'"));
+        assert!(sql.contains("CAST(NULL AS NVARCHAR(128)) AS parent_schema"));
+        assert!(sql.contains("CAST(NULL AS NVARCHAR(128)) AS parent_name"));
+        assert!(sql.contains("CAST(NULL AS NVARCHAR(128)) AS data_type"));
+    }
+
+    #[test]
+    fn sqlserver_completion_assistant_searches_columns_by_parent_table() {
+        let request = CompletionAssistantRequest {
+            connection_id: "c1".to_string(),
+            database: "app".to_string(),
+            schema: Some("dbo".to_string()),
+            object_kinds: vec![CompletionAssistantObjectKind::Column],
+            mask: "id".to_string(),
+            case_sensitive: false,
+            global_search: false,
+            max_results: Some(50),
+            search_in_comments: false,
+            search_in_definitions: false,
+            parent_schema: Some("dbo".to_string()),
+            parent_name: Some("Users".to_string()),
+            match_mode: Some(CompletionAssistantMatchMode::Contains),
+        };
+
+        let sql = sqlserver_completion_assistant_sql(&request, 50);
+
+        assert!(sql.contains("FROM sys.columns c"));
+        assert!(sql.contains("o.name = 'Users'"));
+        assert!(sql.contains("LOWER(c.name) LIKE LOWER('%id%') ESCAPE '\\'"));
+        assert!(sql.contains("CAST(NULL AS NVARCHAR(MAX)) AS object_comment"));
+    }
+
+    #[test]
+    fn sqlserver_completion_assistant_searches_tempdb_for_temp_table_masks() {
+        let request = CompletionAssistantRequest {
+            connection_id: "c1".to_string(),
+            database: "app".to_string(),
+            schema: Some("dbo".to_string()),
+            object_kinds: vec![CompletionAssistantObjectKind::Table],
+            mask: "#Temp".to_string(),
+            case_sensitive: false,
+            global_search: false,
+            max_results: Some(100),
+            search_in_comments: false,
+            search_in_definitions: false,
+            parent_schema: None,
+            parent_name: None,
+            match_mode: Some(CompletionAssistantMatchMode::Prefix),
+        };
+
+        let sql = sqlserver_completion_assistant_sql(&request, 100);
+
+        assert!(sql.contains("FROM tempdb.sys.all_objects o"));
+        assert!(sql.contains("o.type = 'U'"));
+        assert!(sql.contains("LOWER(o.name) LIKE LOWER('#Temp%') ESCAPE '\\'"));
+        assert!(sql.contains("CAST(NULL AS NVARCHAR(128)) AS parent_schema"));
+        assert!(sql.contains("CAST(NULL AS NVARCHAR(MAX)) AS object_comment"));
+    }
+
+    #[test]
+    fn sqlserver_completion_assistant_generates_scoped_search_masks() {
+        assert_eq!(super::completion_like_pattern("Temp", Some(&CompletionAssistantMatchMode::Prefix)), "Temp%");
+        assert_eq!(super::completion_like_pattern("Temp", Some(&CompletionAssistantMatchMode::Contains)), "%Temp%");
+        assert_eq!(
+            super::completion_like_pattern("dbo.Temp%", Some(&CompletionAssistantMatchMode::Prefix)),
+            "dbo.Temp%"
+        );
+        assert_eq!(
+            super::completion_like_pattern("Temp_Table", Some(&CompletionAssistantMatchMode::Prefix)),
+            "Temp\\_Table%"
+        );
+    }
+
+    #[test]
+    fn sqlserver_completion_assistant_can_search_comments_and_definitions() {
+        let request = CompletionAssistantRequest {
+            connection_id: "c1".to_string(),
+            database: "app".to_string(),
+            schema: Some("dbo".to_string()),
+            object_kinds: vec![CompletionAssistantObjectKind::Procedure],
+            mask: "audit".to_string(),
+            case_sensitive: false,
+            global_search: false,
+            max_results: Some(100),
+            search_in_comments: true,
+            search_in_definitions: true,
+            parent_schema: None,
+            parent_name: None,
+            match_mode: Some(CompletionAssistantMatchMode::Contains),
+        };
+
+        let sql = sqlserver_completion_assistant_sql(&request, 100);
+
+        assert!(sql.contains("COALESCE(ep.value, '')"));
+        assert!(sql.contains("OBJECT_DEFINITION(o.object_id)"));
+        assert!(sql.contains("LOWER('%audit%')"));
+    }
+
+    #[test]
+    fn sqlserver_completion_assistant_casts_schema_and_empty_result_placeholders() {
+        let schema_request = CompletionAssistantRequest {
+            connection_id: "c1".to_string(),
+            database: "app".to_string(),
+            schema: None,
+            object_kinds: vec![CompletionAssistantObjectKind::Schema],
+            mask: "d".to_string(),
+            case_sensitive: false,
+            global_search: false,
+            max_results: Some(100),
+            search_in_comments: false,
+            search_in_definitions: false,
+            parent_schema: None,
+            parent_name: None,
+            match_mode: Some(CompletionAssistantMatchMode::Prefix),
+        };
+        let schema_sql = sqlserver_completion_assistant_sql(&schema_request, 100);
+
+        assert!(schema_sql.contains("CAST(NULL AS NVARCHAR(128)) AS parent_schema"));
+        assert!(schema_sql.contains("CAST(NULL AS NVARCHAR(128)) AS parent_name"));
+        assert!(schema_sql.contains("CAST(NULL AS NVARCHAR(MAX)) AS object_comment"));
+        assert!(schema_sql.contains("CAST(NULL AS NVARCHAR(128)) AS data_type"));
+
+        let empty_request = CompletionAssistantRequest {
+            object_kinds: vec![CompletionAssistantObjectKind::Database],
+            ..schema_request
+        };
+        let empty_sql = sqlserver_completion_assistant_sql(&empty_request, 100);
+
+        assert!(empty_sql.contains("CAST('' AS NVARCHAR(128)) AS name"));
+        assert!(empty_sql.contains("CAST(NULL AS NVARCHAR(128)) AS parent_schema"));
+        assert!(empty_sql.contains("CAST(NULL AS NVARCHAR(MAX)) AS object_comment"));
+    }
+
+    #[test]
     fn sqlserver_tinyint_cells_are_json_numbers() {
         assert_eq!(sqlserver_cell_to_json(&ColumnData::U8(Some(7))), serde_json::json!(7));
     }
@@ -1543,6 +2123,36 @@ mod tests {
         let cell: ColumnData<'static> = datetime.into_sql();
 
         assert_eq!(sqlserver_cell_to_json(&cell), serde_json::json!("2026-05-13 09:08:07.123"));
+    }
+
+    #[test]
+    fn sqlserver_binary_cells_are_json_hex_strings() {
+        let cell =
+            ColumnData::Binary(Some(std::borrow::Cow::Owned(vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xCF, 0x53])));
+
+        assert_eq!(sqlserver_cell_to_json(&cell), serde_json::json!("0x000000000001cf53"));
+    }
+
+    #[test]
+    fn sqlserver_strips_generated_row_number_pagination_column() {
+        let sql = "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS [__dbx_row_num] FROM (SELECT id FROM users) dbx_page_source) dbx_page WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 200 ORDER BY [__dbx_row_num];";
+        let mut result = QueryResult {
+            columns: vec!["id".to_string(), "__dbx_row_num".to_string()],
+            column_types: vec!["int".to_string(), "bigint".to_string()],
+            column_sortables: vec![],
+            rows: vec![vec![serde_json::json!(42), serde_json::json!(101)]],
+            affected_rows: 0,
+            execution_time_ms: 1,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+        };
+
+        strip_dbx_sqlserver_row_number_column(&mut result, sql);
+
+        assert_eq!(result.columns, vec!["id"]);
+        assert_eq!(result.column_types, vec!["int"]);
+        assert_eq!(result.rows, vec![vec![serde_json::json!(42)]]);
     }
 
     #[test]

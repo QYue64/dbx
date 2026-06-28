@@ -127,13 +127,6 @@ pub async fn call_daemon_method_with_timeout<T: DeserializeOwned + Send + 'stati
 
 fn runtime_agent_key_candidates(db_type: &DatabaseType, driver_profile: Option<&str>) -> Option<Vec<&'static str>> {
     let primary = db_type_to_agent_key(db_type, driver_profile)?;
-    if *db_type == DatabaseType::Oracle {
-        return match driver_profile {
-            Some("oracle-legacy") => Some(vec![primary, "oracle-legacy"]),
-            Some("oracle-10g") => Some(vec![primary, "oracle-10g"]),
-            _ => Some(vec![primary]),
-        };
-    }
     Some(vec![primary])
 }
 
@@ -163,4 +156,19 @@ async fn spawn_client_for_key(manager: &AgentManager, key: &str) -> Result<Agent
     let mut client = AgentDriverClient::spawn(launch).await?;
     client.try_optional_handshake(manager.agent_app_version()).await;
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prestosql_does_not_use_agent_driver() {
+        assert_eq!(runtime_agent_key_candidates(&DatabaseType::PrestoSql, None), None);
+    }
+
+    #[test]
+    fn trino_uses_only_trino_agent_driver() {
+        assert_eq!(runtime_agent_key_candidates(&DatabaseType::Trino, None).unwrap(), vec!["trino"]);
+    }
 }

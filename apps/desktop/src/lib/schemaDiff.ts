@@ -76,6 +76,7 @@ export interface TableDiff {
   targetDdl?: string;
   sourceTableComment?: string | null;
   targetTableComment?: string | null;
+  syncSql?: string;
 }
 
 export interface TableSchemaDetail {
@@ -104,6 +105,7 @@ export interface SchemaDiffPreparationOptions {
   targetSchema?: string;
   ignoreComments?: boolean;
   cascadeDelete?: boolean;
+  compareColumnOrder?: boolean;
 }
 
 export interface SchemaDiffPreparation {
@@ -113,6 +115,20 @@ export interface SchemaDiffPreparation {
   ruleDiffs?: RuleDiff[];
   ownerDiffs?: OwnerDiff[];
   syncSql: string;
+}
+
+const MYSQL_LIKE_SCHEMA_DIFF_TARGET_TYPES = new Set<DatabaseType>(["mysql", "doris", "starrocks", "goldendb", "sundb", "databend", "gbase"]);
+
+export function schemaDiffDeployTargetSchema(databaseType: DatabaseType | undefined, targetDatabase: string, targetSchema?: string): string | undefined {
+  const schema = targetSchema?.trim();
+  if (schema) return schema;
+
+  const database = targetDatabase.trim();
+  if (databaseType && MYSQL_LIKE_SCHEMA_DIFF_TARGET_TYPES.has(databaseType) && database) {
+    return database;
+  }
+
+  return undefined;
 }
 
 // Unified object type for UI display
@@ -202,6 +218,7 @@ export function convertToSchemaDiffObjects(tableDiffs: TableDiff[], functionDiff
       selected: opType !== "none",
       sourceDdl: diff.ddl,
       targetDdl: diff.targetDdl,
+      deploySql: diff.syncSql,
       changes: diff.columns?.flatMap((c) => c.changes || []),
       children: [
         ...(diff.columns?.map((c) => ({
@@ -308,6 +325,61 @@ export function convertToSchemaDiffObjects(tableDiffs: TableDiff[], functionDiff
   }
 
   return objects;
+}
+
+export function buildDeploySqlForObjects(objects: SchemaDiffObject[]): string {
+  const selected = objects.filter((o) => {
+    const isTopLevel = !o.id.startsWith("col-") && !o.id.startsWith("idx-") && !o.id.startsWith("fk-") && !o.id.startsWith("trg-");
+    return o.selected && o.operationType !== "none" && isTopLevel;
+  });
+
+  if (selected.length === 0) {
+    return "-- No objects selected";
+  }
+
+  const lines: string[] = [];
+
+  for (const obj of selected) {
+    if (obj.deploySql?.trim()) {
+      lines.push(obj.deploySql.trim());
+      lines.push("");
+      continue;
+    }
+
+    if (obj.operationType === "create") {
+      if (obj.sourceDdl) {
+        lines.push(`-- Create ${obj.objectKind}: ${obj.name}`);
+        lines.push(obj.sourceDdl);
+        lines.push("");
+      }
+    } else if (obj.operationType === "delete") {
+      lines.push(`-- Drop ${obj.objectKind}: ${obj.name}`);
+      const dropSql = generateDropSql(obj);
+      lines.push(dropSql);
+      lines.push("");
+    } else if (obj.operationType === "modify") {
+      if (obj.sourceDdl) {
+        lines.push(`-- Modify ${obj.objectKind}: ${obj.name}`);
+        lines.push(obj.sourceDdl);
+        lines.push("");
+      }
+    }
+  }
+
+  return lines.join("\n") || "-- No DDL available for selected objects";
+}
+
+function generateDropSql(obj: SchemaDiffObject): string {
+  const typeMap: Record<string, string> = {
+    table: "TABLE",
+    view: "VIEW",
+    function: "FUNCTION",
+    sequence: "SEQUENCE",
+    rule: "RULE",
+    owner: "OWNED BY",
+  };
+  const sqlType = typeMap[obj.objectKind] || obj.objectKind.toUpperCase();
+  return `DROP ${sqlType} IF EXISTS ${obj.name};`;
 }
 
 export interface ObjectTypeGroup {

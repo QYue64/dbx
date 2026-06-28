@@ -7,7 +7,7 @@ import { orderPinnedFirst } from "@/lib/pinnedItems";
 import { canCancelQueryExecution } from "@/lib/queryExecutionState";
 import { closeAllTabsState, closeOtherTabsState } from "@/lib/tabCloseActions";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText } from "@/lib/explainPlan";
-import { allEditableColumnsWriteable, allPrimaryKeysPresent, sourceColumnsForResult, type EditableQueryInfo } from "@/lib/sqlAnalysis";
+import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQuery, sourceColumnsForResult, type EditableQueryInfo } from "@/lib/sqlAnalysis";
 import { restoreOpenTabsState, serializeOpenTabs } from "@/lib/openTabsPersistence";
 import {
   evaluateMongoAggregateSafety,
@@ -15,34 +15,52 @@ import {
   mongoDocumentsToQueryResult,
   mongoIndexesToQueryResult,
   mongoWriteToQueryResult,
+  mongoUseToQueryResult,
   parseMongoAggregateCommand,
   parseMongoCountDocumentsCommand,
   parseMongoFindCommand,
   parseMongoGetIndexesCommand,
   parseMongoWriteCommand,
+  parseMongoUseCommand,
   type MongoAggregateSafetyOptions,
 } from "@/lib/mongoShellCommand";
 import { redisCommandResultToQueryResult } from "@/lib/redisQueryResult";
 import { nextRedisCommandDb } from "@/lib/redisCommandSession";
 import { isRedisMutatingCommand } from "@/lib/redisCommandTable";
-import { supportsDatabaseFeature } from "@/lib/databaseCapabilities";
-import { editablePrimaryKeys } from "@/lib/tableEditing";
+import { usesAgentCursorForQuery } from "@/lib/databaseDriverManifest";
+import { canUseKeylessRowPredicate, editableRowIdentifierColumns } from "@/lib/tableEditing";
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/tableDataExport";
 import { tableMetaForDataTab } from "@/lib/tableDataTabMeta";
 import { quoteTableIdentifier } from "@/lib/tableSelectSql";
 import { connectionUsesDatabaseObjectTreeMode, connectionUsesSchemaExecutionContext, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { queryTimeoutSecsForConnection } from "@/lib/queryTimeout";
+import { sortDataGridRows, type DataGridSortDirection } from "@/lib/dataGridSort";
+import { normalizeResultPageSize } from "@/lib/paginationPageSize";
+import { splitSqlStatementRanges } from "@/lib/sqlStatementRanges";
 import { clearDataGridPendingSnapshotsForTab } from "@/composables/useDataGridEditor";
 import { buildTabResultSnapshot, deleteTabResultSnapshot, readTabResultSnapshot, tabResultCacheKey, writeTabResultSnapshot } from "@/lib/tabResultCache";
 import { decodeQueryResultArchive, encodeQueryResultArchive, type DecodedQueryResultArchive } from "@/lib/queryResultArchive";
 import * as api from "@/lib/api";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import type { SavedSqlFile } from "@/types/database";
 
 const STORAGE_KEY = "dbx-open-tabs";
 const ACTIVE_TAB_KEY = "dbx-active-tab";
 const ORACLE_LIKE_METADATA_TYPES = new Set<string>(["oracle", "dameng", "oceanbase-oracle"]);
+const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export"] as const;
+const CANCEL_QUERY_TIMEOUT_MS = 10_000;
+
+interface BuildQueryResultExportRequestOptions {
+  exportId: string;
+  filePath: string;
+  format: "csv" | "xlsx";
+}
+
+function tabClientSessionId(tab: Pick<QueryTab, "id">, suffix?: (typeof BACKGROUND_CLIENT_SESSION_SUFFIXES)[number]): string {
+  return suffix ? `${tab.id}:${suffix}` : tab.id;
+}
 
 function resultRunCacheKey(tabId: string, runId: string): string {
   return `tab:${tabId}:run:${runId}`;
@@ -66,6 +84,27 @@ function markQueryResultRunsRowsRaw(resultRuns: NonNullable<QueryTab["resultRuns
   return resultRuns;
 }
 
+function queryResultSourceLabel(sql: string, database: string | undefined): string | undefined {
+  const analysis = analyzeEditableQuery(sql);
+  if (!analysis) return undefined;
+  const qualifier = analysis.schema || database?.trim();
+  return qualifier ? `${qualifier}.${analysis.tableName}` : analysis.tableName;
+}
+
+function annotateQueryResultSources(results: QueryResult[], sql: string, database: string | undefined, databaseType?: DatabaseType): QueryResult[] {
+  const statements = splitSqlStatementRanges(sql, databaseType);
+  let statementIndex = 0;
+  for (const result of results) {
+    const statement = statements[statementIndex++];
+    if (result.columns.length === 0) continue;
+    if (!statement) continue;
+    result.sourceStatement = statement.sql;
+    const label = queryResultSourceLabel(statement.sql, database);
+    if (label) result.sourceLabel = label;
+  }
+  return results;
+}
+
 async function withFrontendQueryTimeout<T>(promise: Promise<T>, timeoutSecs: number, message: string): Promise<T> {
   if (timeoutSecs === 0) return promise;
 
@@ -75,6 +114,20 @@ async function withFrontendQueryTimeout<T>(promise: Promise<T>, timeoutSecs: num
       promise,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error(message)), timeoutSecs * 1000);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function withCancelQueryTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Cancel request timed out after 10s.")), CANCEL_QUERY_TIMEOUT_MS);
       }),
     ]);
   } finally {
@@ -166,12 +219,19 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
+  async function closeClientSessionId(connectionId: string, database: string, clientSessionId: string, logContext: Record<string, unknown> = {}) {
+    try {
+      await api.closeClientConnectionSession(connectionId, database, clientSessionId);
+    } catch (error) {
+      console.warn("[DBX][client-session:close:error]", { ...logContext, clientSessionId, error });
+    }
+  }
+
   async function closeClientConnectionSession(tab: QueryTab | undefined) {
     if (!tab?.connectionId) return;
-    try {
-      await api.closeClientConnectionSession(tab.connectionId, tab.database, tab.id);
-    } catch (error) {
-      console.warn("[DBX][client-session:close:error]", { tabId: tab.id, error });
+    const clientSessionIds = [tabClientSessionId(tab), ...BACKGROUND_CLIENT_SESSION_SUFFIXES.map((suffix) => tabClientSessionId(tab, suffix))];
+    for (const clientSessionId of clientSessionIds) {
+      await closeClientSessionId(tab.connectionId, tab.database, clientSessionId, { tabId: tab.id });
     }
   }
 
@@ -187,6 +247,8 @@ export const useQueryStore = defineStore("query", () => {
     tab.result = undefined;
     tab.results = undefined;
     tab.activeResultIndex = undefined;
+    tab.resultLocalSortOriginalRows = undefined;
+    tab.resultSortMode = undefined;
     tab.resultSessionId = undefined;
     tab.resultAccessedAt = undefined;
     tab.queryAnalysis = undefined;
@@ -218,6 +280,8 @@ export const useQueryStore = defineStore("query", () => {
     tab.resultSortColumn = run.resultSortColumn;
     tab.resultSortColumnIndex = run.resultSortColumnIndex;
     tab.resultSortDirection = run.resultSortDirection;
+    tab.resultSortMode = run.resultSortMode;
+    tab.resultLocalSortOriginalRows = undefined;
     tab.orderByInput = run.orderByInput;
     tab.resultPageSql = run.resultPageSql;
     tab.resultPageLimit = run.resultPageLimit;
@@ -336,6 +400,7 @@ export const useQueryStore = defineStore("query", () => {
       resultSortColumn: tab.resultSortColumn,
       resultSortColumnIndex: tab.resultSortColumnIndex,
       resultSortDirection: tab.resultSortDirection,
+      resultSortMode: tab.resultSortMode,
       orderByInput: tab.orderByInput,
       resultPageSql: tab.resultPageSql,
       resultPageLimit: tab.resultPageLimit,
@@ -382,6 +447,7 @@ export const useQueryStore = defineStore("query", () => {
       resultSortColumn: tab.resultSortColumn,
       resultSortColumnIndex: tab.resultSortColumnIndex,
       resultSortDirection: tab.resultSortDirection,
+      resultSortMode: tab.resultSortMode,
       orderByInput: tab.orderByInput,
       resultPageSql: tab.resultPageSql,
       resultPageLimit: tab.resultPageLimit,
@@ -412,6 +478,38 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
+  function assignDisplayedResult(tab: QueryTab, result: QueryResult) {
+    tab.result = markQueryResultRowsRaw(result);
+    if (tab.results?.length) {
+      const activeIndex = tab.activeResultIndex ?? 0;
+      if (activeIndex >= 0 && activeIndex < tab.results.length) {
+        tab.results[activeIndex] = tab.result;
+      }
+    }
+  }
+
+  function sortTabResultLocally(id: string, column: string, columnIndex: number, direction: DataGridSortDirection | null) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab?.result) return;
+
+    if (!tab.resultLocalSortOriginalRows) {
+      tab.resultLocalSortOriginalRows = tab.result.rows.slice();
+    }
+
+    const rows = direction ? sortDataGridRows(tab.resultLocalSortOriginalRows, columnIndex, direction) : tab.resultLocalSortOriginalRows;
+    assignDisplayedResult(tab, { ...tab.result, rows });
+
+    tab.resultSortColumn = direction ? column : undefined;
+    tab.resultSortColumnIndex = direction ? columnIndex : undefined;
+    tab.resultSortDirection = direction ?? undefined;
+    tab.resultSortMode = direction ? "local" : undefined;
+    tab.resultSortedSql = undefined;
+    if (!direction) tab.resultLocalSortOriginalRows = undefined;
+
+    touchResult(tab);
+    syncDisplayedResultRun(tab, tab.resultBaseSql ?? tab.lastExecutedSql ?? tab.sql);
+  }
+
   function resultRunHasPayload(run: NonNullable<QueryTab["resultRuns"]>[number]): boolean {
     return !!run.result || !!run.results?.length;
   }
@@ -438,12 +536,14 @@ export const useQueryStore = defineStore("query", () => {
       schema: t.schema,
       sql: t.sql,
       savedSqlId: t.savedSqlId,
+      externalSqlPath: t.externalSqlPath,
       lastExecutedSql: t.lastExecutedSql,
       resultBaseSql: t.resultBaseSql,
       resultSortedSql: t.resultSortedSql,
       resultSortColumn: t.resultSortColumn,
       resultSortColumnIndex: t.resultSortColumnIndex,
       resultSortDirection: t.resultSortDirection,
+      resultSortMode: t.resultSortMode,
       orderByInput: t.orderByInput,
       resultPageLimit: t.resultPageLimit,
       resultPageOffset: t.resultPageOffset,
@@ -472,6 +572,18 @@ export const useQueryStore = defineStore("query", () => {
     },
     { flush: "post" },
   );
+
+  // Immediately flush any pending debounced persist so the on-disk content
+  // reflects the latest in-memory tabs without waiting for the 300ms debounce.
+  // Lets callers (e.g. tests that reload the store) read back persisted state
+  // deterministically instead of racing the debounce timer.
+  function flushPendingPersist() {
+    if (_persistTimer) {
+      clearTimeout(_persistTimer);
+      _persistTimer = null;
+    }
+    saveTabs(tabs.value, activeTabId.value);
+  }
 
   function findTabByIdentity(connectionId: string, database: string, title: string, mode: QueryTab["mode"], schema?: string) {
     return tabs.value.find((tab) => tab.connectionId === connectionId && tab.database === database && tab.title === title && tab.mode === mode && (tab.schema || "") === (schema || ""));
@@ -588,6 +700,37 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openNacosAdmin(connectionId: string, target?: { namespace?: string; namespaceName?: string }) {
+    const namespace = target?.namespace ?? "";
+    const namespaceName = target?.namespaceName || (namespace ? namespace : "public");
+    const existing = tabs.value.find((tab) => tab.mode === "nacos" && tab.connectionId === connectionId && (tab.nacosNamespace || "") === namespace);
+    if (existing) {
+      existing.nacosNamespaceName = namespaceName;
+      if (!existing.customTitle) existing.title = `${useConnectionStore().getConfig(connectionId)?.name || "Nacos"}:${namespaceName}`;
+      activeTabId.value = existing.id;
+      return existing.id;
+    }
+
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: `${conn?.name || "Nacos"}:${namespaceName}`,
+      connectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "nacos",
+      nacosNamespace: namespace,
+      nacosNamespaceName: namespaceName,
+    };
+    tabs.value.push(tab);
+    activeTabId.value = id;
+    return id;
+  }
+
   function openTableStructure(connectionId: string, database: string, schema?: string, tableName?: string) {
     const resolvedTableName = tableName || "";
     if (resolvedTableName) {
@@ -620,7 +763,7 @@ export const useQueryStore = defineStore("query", () => {
 
   function isTabDirty(tab: QueryTab): boolean {
     if (tab.mode !== "query") return false;
-    if (!tab.sql.trim()) return false;
+    if (!tab.externalSqlPath && !tab.sql.trim()) return false;
     const original = tab.originalSql;
     if (original === undefined) return !!tab.savedSqlId;
     return tab.sql !== original;
@@ -725,6 +868,8 @@ export const useQueryStore = defineStore("query", () => {
       resultSortColumn: undefined,
       resultSortColumnIndex: undefined,
       resultSortDirection: undefined,
+      resultSortMode: undefined,
+      resultLocalSortOriginalRows: undefined,
       orderByInput: undefined,
       resultPageSql: undefined,
       resultPageLimit: undefined,
@@ -754,6 +899,8 @@ export const useQueryStore = defineStore("query", () => {
       explainExecutionId: undefined,
       mode: original.mode,
       mqTenant: original.mqTenant,
+      nacosNamespace: original.nacosNamespace,
+      nacosNamespaceName: original.nacosNamespaceName,
       structureTableName: original.structureTableName,
       objectBrowser: original.objectBrowser ? { ...original.objectBrowser } : undefined,
       objectSource: original.objectSource ? { ...original.objectSource } : undefined,
@@ -854,15 +1001,32 @@ export const useQueryStore = defineStore("query", () => {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab) return;
     tab.savedSqlId = savedSqlId;
+    tab.externalSqlPath = undefined;
     if (title) {
       tab.title = title;
       tab.customTitle = true;
     }
   }
 
+  function linkExternalSqlPath(id: string, path: string, title?: string) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab) return;
+    tab.externalSqlPath = path;
+    tab.savedSqlId = undefined;
+    if (title) {
+      tab.title = title;
+      tab.customTitle = true;
+    }
+    markTabClean(tab);
+  }
+
   function openSavedSql(file: SavedSqlFile) {
     const existing = tabs.value.find((tab) => tab.savedSqlId === file.id);
     if (existing) {
+      if (!existing.sql && file.sql) {
+        existing.sql = file.sql;
+        existing.originalSql = file.sql;
+      }
       activeTabId.value = existing.id;
       return existing.id;
     }
@@ -886,6 +1050,21 @@ export const useQueryStore = defineStore("query", () => {
     tabs.value.push(tab);
     activeTabId.value = id;
     return id;
+  }
+
+  async function hydrateSavedSqlTabs() {
+    const savedSqlStore = useSavedSqlStore();
+    const linkedTabs = tabs.value.filter((tab) => tab.savedSqlId && tab.sql === "");
+    for (const tab of linkedTabs) {
+      const file = await savedSqlStore.ensureFileContent(tab.savedSqlId!);
+      if (!file) continue;
+      tab.title = tab.customTitle ? tab.title : file.name;
+      tab.connectionId = file.connectionId;
+      tab.database = file.database;
+      tab.schema = file.schema;
+      tab.sql = file.sql;
+      tab.originalSql = file.sql;
+    }
   }
 
   function togglePinnedTab(id: string) {
@@ -942,11 +1121,30 @@ export const useQueryStore = defineStore("query", () => {
     tab.resultSortedSql = undefined;
     clearExplain(tab);
     tab.tableMeta = undefined;
+
+    // Sync connection change back to the saved SQL file if this tab is linked
+    if (tab.savedSqlId) {
+      const savedSqlStore = useSavedSqlStore();
+      void savedSqlStore.ensureFileContent(tab.savedSqlId).then((existing) => {
+        if (!existing) return;
+        return savedSqlStore.saveFile({
+          id: existing.id,
+          connectionId,
+          name: existing.name,
+          database,
+          schema: existing.schema,
+          sql: existing.sql,
+        });
+      });
+    }
   }
 
   function setTableMeta(id: string, meta: NonNullable<QueryTab["tableMeta"]>) {
     const tab = tabs.value.find((t) => t.id === id);
-    if (tab) tab.tableMeta = meta;
+    if (tab) {
+      tab.tableMeta = meta;
+      tab.tableMetaUpdatedAt = Date.now();
+    }
   }
 
   function setObjectSource(id: string, objectSource: NonNullable<QueryTab["objectSource"]>) {
@@ -1091,7 +1289,8 @@ export const useQueryStore = defineStore("query", () => {
         columnCount: columns.length,
         elapsed: elapsed?.(),
       });
-      const primaryKeys = editablePrimaryKeys(dbType as DatabaseType, columns);
+      const indexes = await api.listIndexes(tab.connectionId, tab.database, metadataSchema, metadataTableName).catch(() => []);
+      const primaryKeys = editableRowIdentifierColumns(dbType as DatabaseType, columns, indexes);
       const tableMeta = {
         schema: metadataSchema || undefined,
         tableName: metadataTableName,
@@ -1099,7 +1298,7 @@ export const useQueryStore = defineStore("query", () => {
         primaryKeys,
       };
 
-      if (primaryKeys.length === 0) {
+      if (primaryKeys.length === 0 && !canUseKeylessRowPredicate(dbType as DatabaseType, primaryKeys)) {
         return {
           queryAnalysis: undefined,
           querySourceColumns: undefined,
@@ -1176,6 +1375,8 @@ export const useQueryStore = defineStore("query", () => {
       return;
     }
     const countSql = options.countSql;
+    const clientSessionId = tabClientSessionId({ id: options.tabId }, "count");
+    const countExecutionId = `${options.executionId}:count`;
 
     if (typeof options.pageLimit === "number" && resultRowCount < options.pageLimit) {
       setQueryTotalRowCountIfCurrent(options.tabId, options.executionId, options.result, (options.pageOffset ?? 0) + resultRowCount);
@@ -1185,7 +1386,10 @@ export const useQueryStore = defineStore("query", () => {
     void (async () => {
       try {
         console.info("[DBX][executeTabSql:count:start]", { traceId: options.traceId, elapsed: options.elapsed() });
-        const countResult = await api.executeQuery(options.connectionId, options.database, countSql, options.schema, undefined, { timeoutSecs: options.timeoutSecs });
+        const countResult = await api.executeQuery(options.connectionId, options.database, countSql, options.schema, countExecutionId, {
+          clientSessionId,
+          timeoutSecs: options.timeoutSecs,
+        });
         const total = Number(countResult.rows?.[0]?.[0] ?? 0);
         if (!Number.isFinite(total) || total < 0) {
           setQueryTotalRowCountIfCurrent(options.tabId, options.executionId, options.result, undefined);
@@ -1204,6 +1408,8 @@ export const useQueryStore = defineStore("query", () => {
           elapsed: options.elapsed(),
           error,
         });
+      } finally {
+        void closeClientSessionId(options.connectionId, options.database, clientSessionId, { tabId: options.tabId });
       }
     })();
   }
@@ -1219,6 +1425,8 @@ export const useQueryStore = defineStore("query", () => {
       preserveResultDuringExecution?: boolean;
       preserveTotalRowCountDuringExecution?: boolean;
       skipRedisSafetyCheck?: boolean;
+      sourceTraceId?: string;
+      skipEnsureConnected?: boolean;
     },
   ) {
     const tab = tabs.value.find((t) => t.id === id);
@@ -1235,6 +1443,7 @@ export const useQueryStore = defineStore("query", () => {
     }
     tab.executionId = executionId;
     tab.lastExecutedSql = sql;
+    tab.resultLocalSortOriginalRows = undefined;
     const updateActiveResultRun = !!tab.activeResultRunId && options?.preserveResultDuringExecution === true;
     if (!updateActiveResultRun) {
       tab.activeResultRunId = undefined;
@@ -1254,6 +1463,7 @@ export const useQueryStore = defineStore("query", () => {
       connectionId: tab.connectionId,
       database: tab.database,
       schema: tab.schema,
+      sourceTraceId: options?.sourceTraceId,
       sql,
     });
     const queryBaseSql = options?.resultBaseSql ?? sql;
@@ -1265,13 +1475,21 @@ export const useQueryStore = defineStore("query", () => {
     let useAgentResultSession = false;
     try {
       const connStore = useConnectionStore();
-      await connStore.ensureConnected(tab.connectionId);
+      if (options?.skipEnsureConnected) {
+        console.info("[DBX][executeTabSql:ensure-connected:skip]", { traceId, elapsed: elapsed(), reason: "caller" });
+      } else {
+        console.info("[DBX][executeTabSql:ensure-connected:start]", { traceId, elapsed: elapsed() });
+        await connStore.ensureConnected(tab.connectionId);
+        console.info("[DBX][executeTabSql:ensure-connected:done]", { traceId, elapsed: elapsed() });
+      }
       const conn = connStore.getConfig(tab.connectionId);
       const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
-      const useAgentCursor = conn?.db_type === "jdbc" || supportsDatabaseFeature(conn?.db_type, "driverManagement");
+      const useAgentCursor = usesAgentCursorForQuery(conn?.db_type);
       const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
       const settingsStore = useSettingsStore();
+      console.info("[DBX][executeTabSql:previous-session-close:start]", { traceId, elapsed: elapsed() });
       await previousResultSessionClose;
+      console.info("[DBX][executeTabSql:previous-session-close:done]", { traceId, elapsed: elapsed() });
 
       // Redis command execution — split multi-line input into individual commands
       if (conn?.db_type === "redis") {
@@ -1422,7 +1640,8 @@ export const useQueryStore = defineStore("query", () => {
         }
         await connStore.ensureConnected(tab.connectionId);
         console.info("[DBX][executeTabSql:mongo-aggregate:start]", { traceId, collection: mongoAggregate.collection });
-        const result = await api.mongoAggregateDocuments(tab.connectionId, tab.database, mongoAggregate.collection, mongoAggregate.pipeline, pageLimit, executionId);
+        const aggregateMaxRows = normalizeResultPageSize(pageLimit ?? options?.pagination?.limit ?? settingsStore.editorSettings.pageSize);
+        const result = await api.mongoAggregateDocuments(tab.connectionId, tab.database, mongoAggregate.collection, mongoAggregate.pipeline, aggregateMaxRows, executionId);
         console.info("[DBX][executeTabSql:mongo-aggregate:done]", {
           traceId,
           rowCount: result.documents.length,
@@ -1514,8 +1733,34 @@ export const useQueryStore = defineStore("query", () => {
         return;
       }
 
+      const mongoUse = conn?.db_type === "mongodb" ? parseMongoUseCommand(sql) : null;
+      if (mongoUse) {
+        console.info("[DBX][executeTabSql:mongo-use:start]", { traceId, database: mongoUse.database });
+        const current = tabs.value.find((t) => t.id === id);
+        if (current?.executionId === executionId) {
+          current.database = mongoUse.database;
+          current.results = undefined;
+          current.activeResultIndex = undefined;
+          current.result = markQueryResultRowsRaw(mongoUseToQueryResult(mongoUse.database, performance.now() - startedAt));
+          touchResult(current);
+          current.queryAnalysis = undefined;
+          current.querySourceColumns = undefined;
+          current.queryEditabilityReason = undefined;
+          current.tableMeta = undefined;
+          current.resultBaseSql = options?.resultBaseSql ?? sql;
+          current.resultSortedSql = options?.resultSortedSql;
+          syncDisplayedResultRun(current, options?.resultBaseSql ?? sql);
+        }
+        console.info("[DBX][executeTabSql:mongo-use:done]", {
+          traceId,
+          database: mongoUse.database,
+          elapsed: elapsed(),
+        });
+        return;
+      }
+
       console.info("[DBX][executeTabSql:execute-multi:start]", { traceId, elapsed: elapsed() });
-      const clientSessionId = tab.mode === "query" ? tab.id : undefined;
+      const clientSessionId = tab.mode === "query" ? tabClientSessionId(tab) : undefined;
       const executionOptions = {
         ...(typeof pageLimit === "number"
           ? useAgentResultSession
@@ -1530,9 +1775,17 @@ export const useQueryStore = defineStore("query", () => {
         timeoutSecs: queryTimeoutSecs,
       };
       const executionSchema = connectionUsesSchemaExecutionContext(conn) ? tab.schema || tab.database : tab.mode === "data" || connectionUsesDatabaseObjectTreeMode(conn) ? undefined : tab.schema;
+      console.info("[DBX][executeTabSql:execute-multi:invoke]", {
+        traceId,
+        elapsed: elapsed(),
+        executionSchema,
+        optionKeys: Object.keys(executionOptions),
+        clientSession: Boolean(clientSessionId),
+      });
       const executionPromise = api.executeMulti(tab.connectionId, tab.database, sqlToExecute, executionSchema, executionId, executionOptions);
       const frontendTimeoutSecs = Math.max(queryTimeoutSecs * 2, 60);
-      const results = markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, queryTimeoutSecs === 0 ? 0 : frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs })));
+      const sourceLabelDatabase = tab.database || conn?.database;
+      const results = annotateQueryResultSources(markQueryResultsRowsRaw(await withFrontendQueryTimeout(executionPromise, queryTimeoutSecs === 0 ? 0 : frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }))), queryBaseSql, sourceLabelDatabase, effectiveDbType);
       console.info("[DBX][executeTabSql:execute-multi:done]", {
         traceId,
         resultCount: results.length,
@@ -1608,6 +1861,8 @@ export const useQueryStore = defineStore("query", () => {
       }
     } catch (e: any) {
       console.error("[DBX][executeTabSql:error]", { traceId, elapsed: elapsed(), error: e });
+      // Sync connection state if the error indicates a lost connection
+      useConnectionStore().recordConnectionLostError(tab.connectionId, e);
       const current = tabs.value.find((t) => t.id === id);
       if (current?.executionId === executionId) {
         current.result = toErrorResult(e);
@@ -1712,8 +1967,10 @@ export const useQueryStore = defineStore("query", () => {
     }
 
     tab.explainSql = built.sql;
+    const clientSessionId = tabClientSessionId(tab, "explain");
     try {
       const result = await api.executeQuery(tab.connectionId, tab.database, built.sql, tab.schema, executionId, {
+        clientSessionId,
         timeoutSecs: queryTimeoutSecs,
       });
       const current = tabs.value.find((t) => t.id === id);
@@ -1733,6 +1990,7 @@ export const useQueryStore = defineStore("query", () => {
         current.isExplaining = false;
         current.explainExecutionId = undefined;
       }
+      void closeClientSessionId(tab.connectionId, tab.database, clientSessionId, { tabId: tab.id });
     }
     return { ok: true as const, sql: built.sql };
   }
@@ -1745,7 +2003,7 @@ export const useQueryStore = defineStore("query", () => {
     if (!executionId) return false;
     tab.isCancelling = true;
     try {
-      const canceled = await api.cancelQuery(executionId);
+      const canceled = await withCancelQueryTimeout(api.cancelQuery(executionId));
       if (!canceled) {
         const current = tabs.value.find((t) => t.id === id);
         if (current && current.executionId === executionId) {
@@ -1757,9 +2015,14 @@ export const useQueryStore = defineStore("query", () => {
       }
       return canceled;
     } catch (e: any) {
+      // Sync connection state if the error indicates a lost connection
+      if (tab) useConnectionStore().recordConnectionLostError(tab.connectionId, e);
       const current = tabs.value.find((t) => t.id === id);
       if (current && current.executionId === executionId) {
+        current.isExecuting = false;
         current.isCancelling = false;
+        current.executionId = undefined;
+        current.queryExecutionStartedAt = undefined;
         current.result = toErrorResult(e);
       }
       return false;
@@ -1793,6 +2056,11 @@ export const useQueryStore = defineStore("query", () => {
     if (!tab?.results || index < 0 || index >= tab.results.length) return;
     tab.activeResultIndex = index;
     tab.result = tab.results[index];
+    tab.resultLocalSortOriginalRows = undefined;
+    tab.resultSortColumn = undefined;
+    tab.resultSortColumnIndex = undefined;
+    tab.resultSortDirection = undefined;
+    tab.resultSortMode = undefined;
     touchResult(tab);
     tab.queryAnalysis = undefined;
     tab.querySourceColumns = undefined;
@@ -1803,12 +2071,15 @@ export const useQueryStore = defineStore("query", () => {
   function notifyConnectionMayBeLost() {
     const stuck = tabs.value.filter((t) => t.isExecuting);
     if (stuck.length > 0) {
+      const connStore = useConnectionStore();
       stuck.forEach((tab) => {
         tab.isExecuting = false;
         tab.isCancelling = false;
         tab.queryExecutionStartedAt = undefined;
         tab.executionId = undefined;
-        tab.result = toErrorResult(new Error(t("editor.connectionMayBeLost")));
+        const error = new Error(t("editor.connectionMayBeLost"));
+        tab.result = toErrorResult(error);
+        connStore.markConnectionLost(tab.connectionId, error);
       });
     }
   }
@@ -1944,8 +2215,7 @@ export const useQueryStore = defineStore("query", () => {
       const totalRows = typeof tab.resultTotalRowCount === "number" ? tab.resultTotalRowCount : null;
       const pageLimit = TABLE_DATA_EXPORT_PAGE_SIZE;
       const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
-      const primaryKeys = tab.tableMeta ? editablePrimaryKeys(effectiveDbType, tab.tableMeta.columns, tab.tableMeta.tableType) : tableMeta.primaryKeys;
-      const fallbackOrderColumns = effectiveDbType === "sqlserver" && !primaryKeys.length ? tableMeta.columns.slice(0, 1).map((column) => column.name) : undefined;
+      const primaryKeys = tab.tableMeta ? tab.tableMeta.primaryKeys : tableMeta.primaryKeys;
       const sortOrder = tab.resultSortColumn && tab.resultSortDirection ? `${quoteTableIdentifier(effectiveDbType, tab.resultSortColumn)} ${tab.resultSortDirection.toUpperCase()}` : undefined;
       const orderBy = tab.orderByInput?.trim() || sortOrder;
       const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
@@ -1953,33 +2223,40 @@ export const useQueryStore = defineStore("query", () => {
       let columns: string[] = [];
       let executionTimeMs = 0;
       let offset = 0;
+      const clientSessionId = tabClientSessionId(tab, "export");
+      const exportExecutionId = uuid();
 
-      while (true) {
-        const sql = await api.buildTableSelectSql({
-          databaseType: effectiveDbType,
-          schema: tableMeta.schema,
-          tableName: tableMeta.tableName,
-          columns: tableMeta.columns.map((column) => column.name),
-          primaryKeys,
-          fallbackOrderColumns,
-          whereInput: tab.whereInput,
-          orderBy,
-          limit: pageLimit,
-          offset,
-        });
-        const results = await api.executeMulti(tab.connectionId, tab.database, sql, undefined, undefined, {
-          maxRows: pageLimit,
-          fetchSize: pageLimit,
-          timeoutSecs: queryTimeoutSecs,
-        });
-        const result = results[0];
-        if (!result) break;
-        if (columns.length === 0) columns = result.columns;
-        rows.push(...result.rows);
-        executionTimeMs += result.execution_time_ms ?? 0;
-        onProgress?.({ rowsExported: rows.length, totalRows });
-        if (result.rows.length < pageLimit) break;
-        offset += result.rows.length;
+      try {
+        while (true) {
+          const sql = await api.buildTableSelectSql({
+            databaseType: effectiveDbType,
+            schema: tableMeta.schema,
+            tableName: tableMeta.tableName,
+            tableType: tableMeta.tableType,
+            columns: tableMeta.columns.map((column) => column.name),
+            primaryKeys,
+            whereInput: tab.whereInput,
+            orderBy,
+            limit: pageLimit,
+            offset,
+          });
+          const results = await api.executeMulti(tab.connectionId, tab.database, sql, undefined, exportExecutionId, {
+            maxRows: pageLimit,
+            fetchSize: pageLimit,
+            clientSessionId,
+            timeoutSecs: queryTimeoutSecs,
+          });
+          const result = results[0];
+          if (!result) break;
+          if (columns.length === 0) columns = result.columns;
+          rows.push(...result.rows);
+          executionTimeMs += result.execution_time_ms ?? 0;
+          onProgress?.({ rowsExported: rows.length, totalRows });
+          if (result.rows.length < pageLimit) break;
+          offset += result.rows.length;
+        }
+      } finally {
+        void closeClientSessionId(tab.connectionId, tab.database, clientSessionId, { tabId: tab.id });
       }
 
       return {
@@ -2002,39 +2279,47 @@ export const useQueryStore = defineStore("query", () => {
     const conn = connStore.getConfig(tab.connectionId);
     const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
     const queryTimeoutSecs = queryTimeoutSecsForConnection(conn);
-    const useAgentCursor = conn?.db_type === "jdbc" || supportsDatabaseFeature(conn?.db_type, "driverManagement");
+    const useAgentCursor = usesAgentCursorForQuery(conn?.db_type);
     const queryBaseSql = tab.resultBaseSql ?? sql;
+    const exportSettings = useSettingsStore().editorSettings;
+    const exportRowLimit = exportSettings.exportRowLimitEnabled ? exportSettings.exportRowLimit : Number.POSITIVE_INFINITY;
+    const agentExportMaxRows = exportSettings.exportRowLimitEnabled ? exportSettings.exportRowLimit : 2_147_483_647;
     // Use the already-computed total row count as a progress estimate so the
     // export dialog shows a moving bar instead of a stuck 0 while paginating.
-    const totalRows = typeof tab.resultTotalRowCount === "number" ? tab.resultTotalRowCount : null;
+    const totalRows = typeof tab.resultTotalRowCount === "number" ? Math.min(tab.resultTotalRowCount, exportRowLimit) : null;
     const pageLimit = Math.max(tab.resultPageLimit ?? 0, TABLE_DATA_EXPORT_PAGE_SIZE);
     const rows: QueryResult["rows"] = [];
     let columns: string[] = [];
     let executionTimeMs = 0;
     let offset = 0;
     let sessionId: string | undefined;
-    const clientSessionId = `${tab.id}:export`;
+    const clientSessionId = tabClientSessionId(tab, "export");
+    const exportExecutionId = uuid();
 
     try {
-      while (true) {
+      while (rows.length < exportRowLimit) {
+        const remaining = exportRowLimit - rows.length;
+        const effectivePageLimit = Math.min(pageLimit, remaining);
         const plan = await api.prepareQueryPaginationExecutionPlan({
           sql,
           queryBaseSql,
           databaseType: effectiveDbType,
-          pagination: { limit: pageLimit, offset, sessionId },
+          pagination: { limit: effectivePageLimit, offset, sessionId },
           useAgentCursor,
+          firstPageUsesActualSql: true,
         });
         if (typeof plan.pageLimit !== "number" || typeof plan.pageOffset !== "number") return tab.result;
         const executionOptions = plan.useAgentResultSession
           ? {
+              maxRows: agentExportMaxRows,
               fetchSize: plan.pageLimit,
               pageSize: plan.pageLimit,
               resultSessionId: sessionId,
               clientSessionId,
               timeoutSecs: queryTimeoutSecs,
             }
-          : { maxRows: plan.pageLimit, fetchSize: plan.pageLimit, timeoutSecs: queryTimeoutSecs };
-        const results = await api.executeMulti(tab.connectionId, tab.database, plan.sqlToExecute, tab.schema, undefined, executionOptions);
+          : { maxRows: plan.pageLimit, fetchSize: plan.pageLimit, clientSessionId, timeoutSecs: queryTimeoutSecs };
+        const results = await api.executeMulti(tab.connectionId, tab.database, plan.sqlToExecute, tab.schema, exportExecutionId, executionOptions);
         const result = results[0];
         if (!result) break;
         if (columns.length === 0) columns = result.columns;
@@ -2043,11 +2328,12 @@ export const useQueryStore = defineStore("query", () => {
         onProgress?.({ rowsExported: rows.length, totalRows });
         sessionId = result.session_id ?? undefined;
         const shouldFetchNextPage = plan.useAgentResultSession ? result.has_more === true : result.rows.length >= plan.pageLimit;
-        if (!shouldFetchNextPage) break;
+        if (!shouldFetchNextPage || rows.length >= exportRowLimit) break;
         offset += result.rows.length;
       }
     } finally {
       if (sessionId) void api.closeQuerySession(tab.connectionId, tab.database, sessionId, clientSessionId);
+      void closeClientSessionId(tab.connectionId, tab.database, clientSessionId, { tabId: tab.id });
     }
 
     return {
@@ -2060,6 +2346,46 @@ export const useQueryStore = defineStore("query", () => {
     };
   }
 
+  async function buildQueryResultExportRequest(id: string, options: BuildQueryResultExportRequestOptions) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab?.result || tab.mode !== "query") return undefined;
+
+    const sql = tab.resultSortedSql ?? tab.resultBaseSql ?? tab.lastExecutedSql ?? tab.sql;
+    if (!sql.trim()) return undefined;
+
+    const connStore = useConnectionStore();
+    await connStore.ensureConnected(tab.connectionId);
+    const conn = connStore.getConfig(tab.connectionId);
+    const settings = useSettingsStore().editorSettings;
+    const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
+    if (!effectiveDbType) return undefined;
+    const useAgentCursor = usesAgentCursorForQuery(conn?.db_type);
+    const queryBaseSql = tab.resultBaseSql ?? sql;
+    const rowLimit = settings.exportRowLimitEnabled ? settings.exportRowLimit : null;
+    const totalRows = typeof tab.resultTotalRowCount === "number" ? (rowLimit === null ? tab.resultTotalRowCount : Math.min(tab.resultTotalRowCount, rowLimit)) : null;
+    const clientSessionId = tabClientSessionId(tab, "export");
+
+    return {
+      exportId: options.exportId,
+      connectionId: tab.connectionId,
+      database: tab.database,
+      schema: tab.schema,
+      sql,
+      queryBaseSql,
+      databaseType: effectiveDbType,
+      useAgentCursor,
+      filePath: options.filePath,
+      format: options.format,
+      pageSize: settings.exportBatchSize,
+      rowLimit,
+      totalRows,
+      timeoutSecs: queryTimeoutSecsForConnection(conn),
+      keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
+      clientSessionId,
+      executionId: uuid(),
+    };
+  }
+
   return {
     tabs,
     activeTabId,
@@ -2069,6 +2395,7 @@ export const useQueryStore = defineStore("query", () => {
     closeTab,
     forceClosePendingTab,
     cancelClosePendingTab,
+    flushPendingPersist,
     saveAndClosePendingTab,
     isTabDirty,
     markTabClean,
@@ -2086,9 +2413,12 @@ export const useQueryStore = defineStore("query", () => {
     openObjectBrowser,
     openUserAdmin,
     openMqAdmin,
+    openNacosAdmin,
     openTableStructure,
     linkSavedSql,
+    linkExternalSqlPath,
     openSavedSql,
+    hydrateSavedSqlTabs,
     togglePinnedTab,
     reorderTab,
     updateDatabase,
@@ -2108,6 +2438,7 @@ export const useQueryStore = defineStore("query", () => {
     executeCurrentTab,
     executeCurrentSql,
     executeTabSql,
+    sortTabResultLocally,
     explainTabSql,
     cancelTabExecution,
     cancelTabExplain,
@@ -2115,6 +2446,7 @@ export const useQueryStore = defineStore("query", () => {
     exportResultArchive,
     importResultArchive,
     fetchTabResultForExport,
+    buildQueryResultExportRequest,
     notifyConnectionMayBeLost,
   };
 });

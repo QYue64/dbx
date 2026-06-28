@@ -20,12 +20,14 @@ export interface SavedOpenTab {
   schema?: string;
   sql: string;
   savedSqlId?: string;
+  externalSqlPath?: string;
   lastExecutedSql?: string;
   resultBaseSql?: string;
   resultSortedSql?: string;
   resultSortColumn?: string;
   resultSortColumnIndex?: number;
   resultSortDirection?: QueryTab["resultSortDirection"];
+  resultSortMode?: QueryTab["resultSortMode"];
   orderByInput?: string;
   resultPageLimit?: number;
   resultPageOffset?: number;
@@ -33,6 +35,8 @@ export interface SavedOpenTab {
   pinned?: boolean;
   mode?: QueryTab["mode"];
   mqTenant?: string;
+  nacosNamespace?: string;
+  nacosNamespaceName?: string;
   structureTableName?: string;
   objectBrowser?: QueryTab["objectBrowser"];
   objectSource?: QueryTab["objectSource"];
@@ -49,6 +53,11 @@ export interface RestoredOpenTabs {
   activeTabId: string | null;
 }
 
+function shouldPersistTabSql(tab: QueryTab) {
+  if (!tab.savedSqlId) return true;
+  return tab.originalSql !== undefined && tab.sql !== tab.originalSql;
+}
+
 export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
   return tabs.map((tab) => ({
     id: tab.id,
@@ -57,14 +66,16 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     connectionId: tab.connectionId,
     database: tab.database,
     schema: tab.schema,
-    sql: tab.sql,
+    sql: shouldPersistTabSql(tab) ? tab.sql : "",
     savedSqlId: tab.savedSqlId,
+    externalSqlPath: tab.externalSqlPath,
     ...(tab.lastExecutedSql !== undefined ? { lastExecutedSql: tab.lastExecutedSql } : {}),
     ...(tab.resultBaseSql !== undefined ? { resultBaseSql: tab.resultBaseSql } : {}),
     ...(tab.resultSortedSql !== undefined ? { resultSortedSql: tab.resultSortedSql } : {}),
     ...(tab.resultSortColumn !== undefined ? { resultSortColumn: tab.resultSortColumn } : {}),
     ...(tab.resultSortColumnIndex !== undefined ? { resultSortColumnIndex: tab.resultSortColumnIndex } : {}),
     ...(tab.resultSortDirection !== undefined ? { resultSortDirection: tab.resultSortDirection } : {}),
+    ...(tab.resultSortMode !== undefined ? { resultSortMode: tab.resultSortMode } : {}),
     ...(tab.orderByInput !== undefined ? { orderByInput: tab.orderByInput } : {}),
     ...(tab.resultPageLimit !== undefined ? { resultPageLimit: tab.resultPageLimit } : {}),
     ...(tab.resultPageOffset !== undefined ? { resultPageOffset: tab.resultPageOffset } : {}),
@@ -72,6 +83,8 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     pinned: tab.pinned,
     mode: tab.mode,
     ...(tab.mqTenant !== undefined ? { mqTenant: tab.mqTenant } : {}),
+    ...(tab.nacosNamespace !== undefined ? { nacosNamespace: tab.nacosNamespace } : {}),
+    ...(tab.nacosNamespaceName !== undefined ? { nacosNamespaceName: tab.nacosNamespaceName } : {}),
     ...(tab.structureTableName !== undefined ? { structureTableName: tab.structureTableName } : {}),
     objectBrowser: tab.objectBrowser,
     objectSource: tab.objectSource,
@@ -100,7 +113,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
 function isSavedOpenTab(value: unknown): value is SavedOpenTab {
   if (!value || typeof value !== "object") return false;
   const tab = value as Record<string, unknown>;
-  return typeof tab.id === "string" && typeof tab.title === "string" && typeof tab.connectionId === "string" && typeof tab.database === "string" && typeof tab.sql === "string";
+  return typeof tab.id === "string" && typeof tab.title === "string" && typeof tab.connectionId === "string" && typeof tab.database === "string" && (typeof tab.sql === "string" || typeof tab.savedSqlId === "string");
 }
 
 export function restoreOpenTabsState(rawTabs: string | null, rawActiveTabId: string | null, options: { queryOnly?: boolean } = {}): RestoredOpenTabs {
@@ -126,12 +139,14 @@ export function restoreOpenTabsState(rawTabs: string | null, rawActiveTabId: str
       return {
         ...tab,
         mode,
+        sql: typeof tab.sql === "string" ? tab.sql : "",
         isExecuting: false,
         isCancelling: false,
         queryExecutionStartedAt: undefined,
         editorViewport: undefined,
         editorSelection: undefined,
         isExplaining: false,
+        originalSql: mode === "query" && tab.externalSqlPath ? tab.sql : mode === "query" && tab.savedSqlId && tab.sql ? "" : undefined,
         resultEvicted: mode === "data" ? undefined : tab.resultEvicted,
         resultCacheKey: mode === "data" ? undefined : tab.resultCacheKey,
         resultCacheState: mode !== "data" && tab.resultCacheKey ? "disk" : undefined,

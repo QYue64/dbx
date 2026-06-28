@@ -2,7 +2,7 @@ import { access, readFile } from "node:fs/promises";
 import { bridgePortFilePath, dbPath, appDataDir } from "./paths.js";
 import { inspectConnectionStore } from "./connections.js";
 
-export const DIRECT_QUERY_TYPES = ["postgres", "redshift", "mysql", "doris", "starrocks", "manticoresearch", "sqlite", "rqlite", "gaussdb", "kwdb", "opengauss", "questdb"] as const;
+export const DIRECT_QUERY_TYPES = ["postgres", "redshift", "mysql", "doris", "starrocks", "manticoresearch", "sqlite", "rqlite", "kwdb", "questdb"] as const;
 
 export type DirectQueryType = (typeof DIRECT_QUERY_TYPES)[number];
 
@@ -22,6 +22,8 @@ export const BRIDGE_REQUIRED_TYPES = [
   "elasticsearch",
   "qdrant",
   "milvus",
+  "weaviate",
+  "chromadb",
   "etcd",
   "dameng",
   "kingbase",
@@ -29,6 +31,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "vastbase",
   "goldendb",
   "databend",
+  "gaussdb",
   "yashandb",
   "databricks",
   "saphana",
@@ -36,6 +39,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "vertica",
   "firebird",
   "exasol",
+  "opengauss",
   "oceanbase-oracle",
   "gbase",
   "tdengine",
@@ -43,6 +47,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "h2",
   "snowflake",
   "trino",
+  "prestosql",
   "hive",
   "db2",
   "informix",
@@ -56,6 +61,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "jdbc",
   "access",
   "influxdb",
+  "zookeeper",
 ] as const;
 
 export interface DbxDiagnostics {

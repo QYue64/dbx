@@ -23,6 +23,28 @@ fn extracts_unqualified_columns_from_single_table_select() {
 }
 
 #[test]
+fn extracts_mysql_quoted_table_references() {
+    let analysis = analyze_sql_references("SELECT * FROM `t_19991` LIMIT 100", Some("mysql")).unwrap();
+
+    assert_eq!(analysis.tables.len(), 1);
+    assert_eq!(analysis.tables[0].name, "t_19991");
+    assert_eq!(analysis.tables[0].schema, None);
+    assert_eq!(analysis.tables[0].span.start_line, 1);
+    assert_eq!(analysis.tables[0].span.start_column, 15);
+    assert_eq!(analysis.tables[0].span.end_line, 1);
+    assert_eq!(analysis.tables[0].span.end_column, 24);
+}
+
+#[test]
+fn extracts_mysql_single_quoted_table_references() {
+    let analysis = analyze_sql_references("SELECT * FROM 't_10001' LIMIT 100", Some("mysql")).unwrap();
+
+    assert_eq!(analysis.tables.len(), 1);
+    assert_eq!(analysis.tables[0].name, "t_10001");
+    assert_eq!(analysis.tables[0].schema, None);
+}
+
+#[test]
 fn extracts_unqualified_order_by_columns_for_sqlserver_queries() {
     let analysis =
         analyze_sql_references("SELECT * FROM Evt_GCM_Qop_Info ORDER BY PDReceiveDatePartInfo DESC", Some("sqlserver"))
@@ -42,5 +64,18 @@ fn duckdb_parser_gap_queries_do_not_raise_syntax_errors() {
         let analysis = analyze_sql_references(sql, Some("duckdb")).expect("duckdb parser gap query should analyze");
         assert!(analysis.tables.is_empty());
         assert!(analysis.columns.is_empty());
+    }
+}
+
+#[test]
+fn clickhouse_strictness_first_left_joins_do_not_raise_syntax_errors() {
+    for strictness in ["ANY", "ALL", "SEMI", "ANTI"] {
+        let sql = format!("SELECT a.id FROM events a {strictness} LEFT JOIN wallets b ON a.wallet_id = b.id");
+        let analysis = analyze_sql_references(&sql, Some("clickhouse"))
+            .unwrap_or_else(|error| panic!("ClickHouse {strictness} LEFT JOIN should analyze: {error}"));
+
+        let tables: Vec<_> =
+            analysis.tables.iter().map(|table| (table.name.as_str(), table.alias.as_deref())).collect();
+        assert_eq!(tables, vec![("events", Some("a")), ("wallets", Some("b"))]);
     }
 }

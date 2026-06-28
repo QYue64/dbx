@@ -3,7 +3,7 @@ import { ref, watch, shallowRef, computed, onMounted, onUnmounted, nextTick } fr
 import type { Ref } from "vue";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, CheckCircle2, CircleHelp, Cloud, Copy, Download, ExternalLink, Loader2, Moon, PackageSearch, Pencil, RefreshCw, RotateCcw, Settings, Sun, SunMoon, Terminal, Trash2, Upload, X } from "@lucide/vue";
+import { AlertTriangle, CheckCircle2, CircleHelp, Cloud, Copy, Download, ExternalLink, GripVertical, Loader2, Moon, PackageSearch, Pencil, Plus, RefreshCw, RotateCcw, Settings, Sun, SunMoon, Terminal, Trash2, Upload, X } from "@lucide/vue";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -16,7 +16,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
+import { HelpTooltip, Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import {
   useSettingsStore,
   AI_PROVIDER_PRESETS,
@@ -25,6 +25,7 @@ import {
   DEFAULT_EDITOR_SETTINGS,
   DEFAULT_DESKTOP_SETTINGS,
   DEFAULT_SIDEBAR_TABLE_PAGE_SIZE,
+  normalizeAiEnv,
   type AiProvider,
   type AiApiStyle,
   type AiAuthMethod,
@@ -33,11 +34,13 @@ import {
   type DesktopIconTheme,
   type InterfaceLayout,
   type DisconnectTabHandlingMode,
+  type UpdateDownloadSource,
   type CustomThemeColors,
   type CustomTheme,
   type EditorSettings,
 } from "@/stores/settingsStore";
 import { loadEditorTheme, editorFontTheme } from "@/lib/editorThemes";
+import { formatAiModelOption } from "@/lib/aiModelPresentation";
 import ThemeCustomizerDialog from "./ThemeCustomizerDialog.vue";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { useTheme } from "@/composables/useTheme";
@@ -63,7 +66,10 @@ import { eventToShortcut } from "@/lib/keyboardShortcuts";
 import { SHORTCUT_DEFINITIONS, findShortcutConflict, normalizeShortcutSettings, type ShortcutActionId } from "@/lib/shortcutRegistry";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebarTableNameDisplay";
 import { normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sqlFormatterConfig";
-import type { SqlSnippet } from "@/types/database";
+import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES } from "@/lib/tableColumnTemplates";
+import { buildMcpCodexConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpVsCodeConfig, type McpEnvEntry } from "@/lib/mcpConfigTemplates";
+import { combineDataTypeForDatabase, dataTypeLengthInputValue, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/tableStructureEditorState";
+import type { DatabaseType, SqlSnippet } from "@/types/database";
 import { uuid } from "@/lib/utils";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sqlCompletion";
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
@@ -73,6 +79,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { currentLocale, setLocale, type Locale } from "@/i18n";
 import { LOCALE_OPTIONS } from "@/lib/localeOptions";
+import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdavAutoUploadConfig";
 
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
@@ -86,12 +93,89 @@ let pendingSystemFonts: Promise<string[]> | null = null;
 const props = defineProps<{
   open: boolean;
   initialTab?: string;
+  initialSection?: string;
   appVersion?: string;
 }>();
 
 const emit = defineEmits<{
   "update:open": [value: boolean];
 }>();
+
+interface TableColumnTemplateOverrideRow {
+  id: string;
+  databaseType: DatabaseType;
+  dataType: string;
+}
+
+interface TableColumnTemplateGridRow {
+  id: string;
+  name: string;
+  defaultValue: string;
+  required: boolean;
+  comment: string;
+  overrides: TableColumnTemplateOverrideRow[];
+}
+
+interface AiEnvRow {
+  id: string;
+  key: string;
+  value: string;
+}
+
+function tableColumnTemplateRowsFromSettings(lines: readonly string[]): TableColumnTemplateGridRow[] {
+  return parseTableColumnTemplateFields([...lines]).map((field) => ({
+    id: uuid(),
+    name: field.name,
+    defaultValue: field.defaultValue ?? "",
+    required: !(field.isNullable ?? false),
+    comment: field.comment ?? "",
+    overrides: Object.entries(field.dataTypesByDatabase).map(([databaseType, dataType]) => ({
+      id: uuid(),
+      databaseType: databaseType as DatabaseType,
+      dataType: dataType === EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE ? "" : dataType,
+    })),
+  }));
+}
+
+function tableColumnTemplateRowsToSettings(rows: readonly TableColumnTemplateGridRow[]): string[] {
+  const seenNames = new Set<string>();
+  const settings: string[] = [];
+  for (const row of rows) {
+    const name = row.name.trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seenNames.has(key)) continue;
+    seenNames.add(key);
+
+    const parts = [name];
+
+    const seenDatabaseTypes = new Set<DatabaseType>();
+    for (const override of row.overrides) {
+      const dataType = override.dataType.trim();
+      if (seenDatabaseTypes.has(override.databaseType)) continue;
+      seenDatabaseTypes.add(override.databaseType);
+      parts.push(`${override.databaseType}:${dataType || EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE}`);
+    }
+    if (!row.required) parts.push("required:false");
+    const defaultValue = row.defaultValue.trim();
+    if (defaultValue) parts.push(`default:${defaultValue}`);
+    const comment = row.comment.trim();
+    if (comment) parts.push(`comment:${comment}`);
+    settings.push(parts.join(" | "));
+  }
+  return settings;
+}
+
+function createEmptyTableColumnTemplateRow(): TableColumnTemplateGridRow {
+  return {
+    id: uuid(),
+    name: "",
+    defaultValue: "",
+    required: true,
+    comment: "",
+    overrides: [],
+  };
+}
 
 // Local edit state
 const editFontFamily = ref(settingsStore.editorSettings.fontFamily);
@@ -102,6 +186,8 @@ const editCustomThemes = ref<CustomTheme[]>([...settingsStore.editorSettings.cus
 const editActiveCustomThemeId = ref(settingsStore.editorSettings.activeCustomThemeId);
 const showThemeCustomizer = ref(false);
 const editExecuteMode = ref(settingsStore.editorSettings.executeMode);
+const editShowExecutionTargetPicker = ref(settingsStore.editorSettings.showExecutionTargetPicker);
+const editAutoAliasTables = ref(settingsStore.editorSettings.autoAliasTables);
 const editWordWrap = ref(settingsStore.editorSettings.wordWrap);
 const editConfirmDangerousSqlExecution = ref(settingsStore.editorSettings.confirmDangerousSqlExecution);
 const editAppLayout = ref(settingsStore.editorSettings.appLayout);
@@ -118,7 +204,11 @@ const editShowColumnTypesInHeader = ref(settingsStore.editorSettings.showColumnT
 const editCompactColumnHeaderActions = ref(settingsStore.editorSettings.compactColumnHeaderActions);
 const editInfiniteScroll = ref(settingsStore.editorSettings.infiniteScroll);
 const editInfiniteScrollMaxRows = ref(settingsStore.editorSettings.infiniteScrollMaxRows);
-const editRedisScanPageSize = ref(settingsStore.editorSettings.redisScanPageSize);
+const editTableColumnTemplateRows = ref<TableColumnTemplateGridRow[]>(tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields));
+const editTableColumnTemplateDatabaseType = ref<DatabaseType>(TABLE_COLUMN_TEMPLATE_DATABASE_TYPES[0] ?? "mysql");
+const tableColumnTemplateSectionRef = ref<HTMLElement | null>(null);
+const draggedTableColumnTemplateRowId = ref<string | null>(null);
+let tableColumnTemplatePointerDragCleanup: (() => void) | null = null;
 const editShortcuts = ref(normalizeShortcutSettings(settingsStore.editorSettings.shortcuts));
 const editSqlFormatter = ref<SqlFormatterSettings>(normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter));
 const sqlFormatterConfigValid = ref(true);
@@ -134,8 +224,11 @@ const editSidebarHiddenTablePrefixes = ref(settingsStore.editorSettings.sidebarH
 const editSidebarHideTableComments = ref(settingsStore.editorSettings.sidebarHideTableComments);
 const editSidebarAllowHorizontalScroll = ref(settingsStore.editorSettings.sidebarAllowHorizontalScroll);
 const editExportBatchSize = ref(settingsStore.editorSettings.exportBatchSize);
+const editExportRowLimitEnabled = ref(settingsStore.editorSettings.exportRowLimitEnabled);
+const editExportRowLimit = ref(settingsStore.editorSettings.exportRowLimit);
+const editQueryExportKeysetOptimizationEnabled = ref(settingsStore.editorSettings.queryExportKeysetOptimizationEnabled);
+const editUpdateDownloadSource = ref<UpdateDownloadSource>(settingsStore.editorSettings.updateDownloadSource);
 const editToolbarItems = ref({ ...settingsStore.editorSettings.toolbarItems });
-const redisScanPageSizeOptions = [200, 1000, 5000, 10000];
 const systemFonts = ref<string[]>([]);
 const systemFontsLoading = ref(false);
 const systemFontsLoaded = ref(false);
@@ -152,6 +245,13 @@ const disconnectTabHandlingModeDescriptionKey = computed(() => {
 
   return "disconnectTabHandlingModeCloseTabsDescription";
 });
+const normalizedEditTableColumnTemplateFields = computed(() => tableColumnTemplateRowsToSettings(editTableColumnTemplateRows.value));
+const visibleTableColumnTemplateRows = computed(() =>
+  editTableColumnTemplateRows.value.filter((row) => {
+    if (row.overrides.length === 0) return true;
+    return row.overrides.some((override) => override.databaseType === editTableColumnTemplateDatabaseType.value);
+  }),
+);
 
 // --- Snippet state ---
 const editSnippets = ref<SqlSnippet[]>(settingsStore.editorSettings.snippets.map((s) => ({ ...s })));
@@ -359,6 +459,8 @@ function syncEditStateFromStores() {
   editCustomThemes.value = [...settingsStore.editorSettings.customThemes];
   editActiveCustomThemeId.value = settingsStore.editorSettings.activeCustomThemeId;
   editExecuteMode.value = settingsStore.editorSettings.executeMode;
+  editShowExecutionTargetPicker.value = settingsStore.editorSettings.showExecutionTargetPicker;
+  editAutoAliasTables.value = settingsStore.editorSettings.autoAliasTables;
   editWordWrap.value = settingsStore.editorSettings.wordWrap;
   editConfirmDangerousSqlExecution.value = settingsStore.editorSettings.confirmDangerousSqlExecution;
   editAppLayout.value = settingsStore.editorSettings.appLayout;
@@ -373,6 +475,7 @@ function syncEditStateFromStores() {
   editInfiniteScroll.value = settingsStore.editorSettings.infiniteScroll;
   editInfiniteScrollMaxRows.value = settingsStore.editorSettings.infiniteScrollMaxRows;
   editRedisScanPageSize.value = settingsStore.editorSettings.redisScanPageSize;
+  editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields);
   editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
   editSqlFormatter.value = normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter);
   sqlFormatterConfigValid.value = true;
@@ -386,6 +489,10 @@ function syncEditStateFromStores() {
   editSidebarHideTableComments.value = settingsStore.editorSettings.sidebarHideTableComments;
   editSidebarAllowHorizontalScroll.value = settingsStore.editorSettings.sidebarAllowHorizontalScroll;
   editExportBatchSize.value = settingsStore.editorSettings.exportBatchSize;
+  editExportRowLimitEnabled.value = settingsStore.editorSettings.exportRowLimitEnabled;
+  editExportRowLimit.value = settingsStore.editorSettings.exportRowLimit;
+  editQueryExportKeysetOptimizationEnabled.value = settingsStore.editorSettings.queryExportKeysetOptimizationEnabled;
+  editUpdateDownloadSource.value = settingsStore.editorSettings.updateDownloadSource;
   editToolbarItems.value = { ...settingsStore.editorSettings.toolbarItems };
   editSnippets.value = settingsStore.editorSettings.snippets.map((s) => ({ ...s }));
 }
@@ -422,6 +529,8 @@ function hasChanges(): boolean {
     JSON.stringify(editCustomThemes.value) !== JSON.stringify(settingsStore.editorSettings.customThemes) ||
     editActiveCustomThemeId.value !== settingsStore.editorSettings.activeCustomThemeId ||
     editExecuteMode.value !== settingsStore.editorSettings.executeMode ||
+    editShowExecutionTargetPicker.value !== settingsStore.editorSettings.showExecutionTargetPicker ||
+    editAutoAliasTables.value !== settingsStore.editorSettings.autoAliasTables ||
     editWordWrap.value !== settingsStore.editorSettings.wordWrap ||
     editConfirmDangerousSqlExecution.value !== settingsStore.editorSettings.confirmDangerousSqlExecution ||
     editAppLayout.value !== settingsStore.editorSettings.appLayout ||
@@ -435,7 +544,7 @@ function hasChanges(): boolean {
     editCompactColumnHeaderActions.value !== settingsStore.editorSettings.compactColumnHeaderActions ||
     editInfiniteScroll.value !== settingsStore.editorSettings.infiniteScroll ||
     editInfiniteScrollMaxRows.value !== settingsStore.editorSettings.infiniteScrollMaxRows ||
-    editRedisScanPageSize.value !== settingsStore.editorSettings.redisScanPageSize ||
+    JSON.stringify(normalizedEditTableColumnTemplateFields.value) !== JSON.stringify(settingsStore.editorSettings.tableColumnTemplateFields) ||
     JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts) ||
     JSON.stringify(editSqlFormatter.value) !== JSON.stringify(normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter)) ||
     editSidebarActivation.value !== settingsStore.editorSettings.sidebarActivation ||
@@ -447,6 +556,10 @@ function hasChanges(): boolean {
     editSidebarHideTableComments.value !== settingsStore.editorSettings.sidebarHideTableComments ||
     editSidebarAllowHorizontalScroll.value !== settingsStore.editorSettings.sidebarAllowHorizontalScroll ||
     editExportBatchSize.value !== settingsStore.editorSettings.exportBatchSize ||
+    editExportRowLimitEnabled.value !== settingsStore.editorSettings.exportRowLimitEnabled ||
+    editExportRowLimit.value !== settingsStore.editorSettings.exportRowLimit ||
+    editQueryExportKeysetOptimizationEnabled.value !== settingsStore.editorSettings.queryExportKeysetOptimizationEnabled ||
+    editUpdateDownloadSource.value !== settingsStore.editorSettings.updateDownloadSource ||
     JSON.stringify(editToolbarItems.value) !== JSON.stringify(settingsStore.editorSettings.toolbarItems) ||
     JSON.stringify(normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value)) !== JSON.stringify(settingsStore.editorSettings.sidebarHiddenTablePrefixes) ||
     JSON.stringify(editSnippets.value) !== JSON.stringify(settingsStore.editorSettings.snippets)
@@ -456,6 +569,7 @@ function hasChanges(): boolean {
 async function persistSettings() {
   if (hasApplyBlocker.value) return;
   const sidebarObjectDisplayChanged = editSidebarObjectDisplay.value !== settingsStore.editorSettings.sidebarObjectDisplay;
+  const sidebarTablePageSizeChanged = editSidebarTablePageSize.value !== (settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE);
   settingsStore.updateEditorSettings({
     fontFamily: editFontFamily.value,
     fontSize: editFontSize.value,
@@ -464,6 +578,8 @@ async function persistSettings() {
     customThemes: editCustomThemes.value,
     activeCustomThemeId: editActiveCustomThemeId.value,
     executeMode: editExecuteMode.value,
+    showExecutionTargetPicker: editShowExecutionTargetPicker.value,
+    autoAliasTables: editAutoAliasTables.value,
     wordWrap: editWordWrap.value,
     confirmDangerousSqlExecution: editConfirmDangerousSqlExecution.value,
     appLayout: editAppLayout.value,
@@ -472,7 +588,7 @@ async function persistSettings() {
     compactColumnHeaderActions: editCompactColumnHeaderActions.value,
     infiniteScroll: editInfiniteScroll.value,
     infiniteScrollMaxRows: editInfiniteScrollMaxRows.value,
-    redisScanPageSize: editRedisScanPageSize.value,
+    tableColumnTemplateFields: normalizedEditTableColumnTemplateFields.value,
     shortcuts: editShortcuts.value,
     sqlFormatter: normalizeSqlFormatterSettings(editSqlFormatter.value),
     sidebarActivation: editSidebarActivation.value,
@@ -485,6 +601,10 @@ async function persistSettings() {
     sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll.value,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value),
     exportBatchSize: editExportBatchSize.value,
+    exportRowLimitEnabled: editExportRowLimitEnabled.value,
+    exportRowLimit: editExportRowLimit.value,
+    queryExportKeysetOptimizationEnabled: editQueryExportKeysetOptimizationEnabled.value,
+    updateDownloadSource: editUpdateDownloadSource.value,
     toolbarItems: { ...editToolbarItems.value },
     snippets: editSnippets.value,
   });
@@ -499,6 +619,8 @@ async function persistSettings() {
   desktopCloseBehaviorResetPending.value = false;
   if (sidebarObjectDisplayChanged) {
     await connectionStore.refreshAllTree();
+  } else if (sidebarTablePageSizeChanged) {
+    await connectionStore.refreshSidebarObjectPagination();
   }
 }
 
@@ -516,6 +638,8 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;
     editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
     editExecuteMode.value = DEFAULT_EDITOR_SETTINGS.executeMode;
+    editShowExecutionTargetPicker.value = DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker;
+    editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
     editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
     editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
   } else if (tab === "formatter") {
@@ -550,13 +674,17 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
     editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
     editInfiniteScrollMaxRows.value = DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
+    editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
     editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
-  } else if (tab === "redis") {
-    editRedisScanPageSize.value = DEFAULT_EDITOR_SETTINGS.redisScanPageSize;
+    editExportRowLimitEnabled.value = DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled;
+    editExportRowLimit.value = DEFAULT_EDITOR_SETTINGS.exportRowLimit;
+    editQueryExportKeysetOptimizationEnabled.value = DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled;
   } else if (tab === "shortcuts") {
     editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
   } else if (tab === "snippets") {
     editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
+  } else if (tab === "about") {
+    editUpdateDownloadSource.value = DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
   }
 }
 
@@ -568,6 +696,8 @@ function resetAllDefaults() {
   editCustomThemes.value = [...DEFAULT_EDITOR_SETTINGS.customThemes];
   editActiveCustomThemeId.value = DEFAULT_EDITOR_SETTINGS.activeCustomThemeId;
   editExecuteMode.value = DEFAULT_EDITOR_SETTINGS.executeMode;
+  editShowExecutionTargetPicker.value = DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker;
+  editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
   editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
   editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
   editAppLayout.value = DEFAULT_EDITOR_SETTINGS.appLayout;
@@ -582,7 +712,7 @@ function resetAllDefaults() {
   editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
   editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
   editInfiniteScrollMaxRows.value = DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
-  editRedisScanPageSize.value = DEFAULT_EDITOR_SETTINGS.redisScanPageSize;
+  editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(DEFAULT_EDITOR_SETTINGS.tableColumnTemplateFields);
   editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
   editSqlFormatter.value = normalizeSqlFormatterSettings(DEFAULT_EDITOR_SETTINGS.sqlFormatter);
   sqlFormatterConfigValid.value = true;
@@ -596,8 +726,136 @@ function resetAllDefaults() {
   editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
   editSidebarHiddenTablePrefixes.value = DEFAULT_EDITOR_SETTINGS.sidebarHiddenTablePrefixes.join("\n");
   editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
+  editExportRowLimitEnabled.value = DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled;
+  editExportRowLimit.value = DEFAULT_EDITOR_SETTINGS.exportRowLimit;
+  editQueryExportKeysetOptimizationEnabled.value = DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled;
+  editUpdateDownloadSource.value = DEFAULT_EDITOR_SETTINGS.updateDownloadSource;
   editToolbarItems.value = { ...DEFAULT_EDITOR_SETTINGS.toolbarItems };
   editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
+}
+
+function addTableColumnTemplateRow() {
+  const row = createEmptyTableColumnTemplateRow();
+  row.overrides.push({
+    id: uuid(),
+    databaseType: editTableColumnTemplateDatabaseType.value,
+    dataType: "",
+  });
+  editTableColumnTemplateRows.value.push(row);
+}
+
+function removeTableColumnTemplateRow(id: string) {
+  const row = editTableColumnTemplateRows.value.find((item) => item.id === id);
+  if (!row) return;
+  if (row.overrides.some((override) => override.databaseType === editTableColumnTemplateDatabaseType.value)) {
+    row.overrides = row.overrides.filter((override) => override.databaseType !== editTableColumnTemplateDatabaseType.value);
+    if (row.overrides.length > 0) return;
+  }
+  editTableColumnTemplateRows.value = editTableColumnTemplateRows.value.filter((item) => item.id !== id);
+}
+
+function moveTableColumnTemplateRow(sourceId: string, targetId: string, placement: "before" | "after") {
+  if (!sourceId || sourceId === targetId) return;
+  const rows = [...editTableColumnTemplateRows.value];
+  const sourceIndex = rows.findIndex((row) => row.id === sourceId);
+  const targetIndex = rows.findIndex((row) => row.id === targetId);
+  if (sourceIndex === -1 || targetIndex === -1) return;
+  const [source] = rows.splice(sourceIndex, 1);
+  if (!source) return;
+  const nextTargetIndex = rows.findIndex((row) => row.id === targetId);
+  const insertIndex = placement === "after" ? nextTargetIndex + 1 : nextTargetIndex;
+  rows.splice(nextTargetIndex === -1 ? rows.length : insertIndex, 0, source);
+  editTableColumnTemplateRows.value = rows;
+}
+
+function cleanupTableColumnTemplatePointerDrag() {
+  tableColumnTemplatePointerDragCleanup?.();
+  tableColumnTemplatePointerDragCleanup = null;
+  draggedTableColumnTemplateRowId.value = null;
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+}
+
+function startTableColumnTemplateRowDrag(id: string, event: PointerEvent) {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  cleanupTableColumnTemplatePointerDrag();
+  draggedTableColumnTemplateRowId.value = id;
+  document.body.style.cursor = "grabbing";
+  document.body.style.userSelect = "none";
+
+  const onPointerMove = (moveEvent: PointerEvent) => {
+    const sourceId = draggedTableColumnTemplateRowId.value;
+    if (!sourceId) return;
+    const targetRow = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY)?.closest<HTMLElement>("[data-table-column-template-row-id]");
+    const targetId = targetRow?.dataset.tableColumnTemplateRowId;
+    if (!targetRow || !targetId || targetId === sourceId) return;
+    const rect = targetRow.getBoundingClientRect();
+    moveTableColumnTemplateRow(sourceId, targetId, moveEvent.clientY > rect.top + rect.height / 2 ? "after" : "before");
+  };
+  const onPointerUp = () => cleanupTableColumnTemplatePointerDrag();
+
+  window.addEventListener("pointermove", onPointerMove);
+  window.addEventListener("pointerup", onPointerUp, { once: true });
+  window.addEventListener("pointercancel", onPointerUp, { once: true });
+  tableColumnTemplatePointerDragCleanup = () => {
+    window.removeEventListener("pointermove", onPointerMove);
+    window.removeEventListener("pointerup", onPointerUp);
+    window.removeEventListener("pointercancel", onPointerUp);
+  };
+}
+
+function tableColumnTemplateTypeOptions(databaseType: DatabaseType): string[] {
+  return getDataTypeOptions(databaseType);
+}
+
+function tableColumnTemplateDataTypeForSelectedDatabase(row: TableColumnTemplateGridRow): string {
+  return row.overrides.find((override) => override.databaseType === editTableColumnTemplateDatabaseType.value)?.dataType ?? "";
+}
+
+function tableColumnTemplateBaseTypeForSelectedDatabase(row: TableColumnTemplateGridRow): string {
+  return splitDataType(tableColumnTemplateDataTypeForSelectedDatabase(row)).baseType;
+}
+
+function tableColumnTemplateLengthForSelectedDatabase(row: TableColumnTemplateGridRow): string {
+  return dataTypeLengthInputValue(editTableColumnTemplateDatabaseType.value, tableColumnTemplateDataTypeForSelectedDatabase(row));
+}
+
+function setTableColumnTemplateDataTypeForSelectedDatabase(row: TableColumnTemplateGridRow, value: string) {
+  const dataType = value.trim();
+  const databaseType = editTableColumnTemplateDatabaseType.value;
+  const existing = row.overrides.find((override) => override.databaseType === databaseType);
+  if (!dataType) {
+    row.overrides = row.overrides.filter((override) => override.databaseType !== databaseType);
+    return;
+  }
+  if (existing) {
+    existing.dataType = dataType;
+  } else {
+    row.overrides.push({ id: uuid(), databaseType, dataType });
+  }
+}
+
+function setTableColumnTemplateBaseTypeForSelectedDatabase(row: TableColumnTemplateGridRow, value: string) {
+  const baseType = value.trim();
+  if (!baseType) {
+    setTableColumnTemplateDataTypeForSelectedDatabase(row, "");
+    return;
+  }
+  const databaseType = editTableColumnTemplateDatabaseType.value;
+  setTableColumnTemplateDataTypeForSelectedDatabase(row, combineDataTypeForDatabase(databaseType, baseType, getDefaultLengthForType(databaseType, baseType)));
+}
+
+function setTableColumnTemplateLengthForSelectedDatabase(row: TableColumnTemplateGridRow, value: string) {
+  const databaseType = editTableColumnTemplateDatabaseType.value;
+  const baseType = tableColumnTemplateBaseTypeForSelectedDatabase(row);
+  if (!baseType || isDataTypeLengthDisabled(databaseType, baseType)) return;
+  setTableColumnTemplateDataTypeForSelectedDatabase(row, combineDataTypeForDatabase(databaseType, baseType, value));
+}
+
+function isTableColumnTemplateLengthDisabled(row: TableColumnTemplateGridRow): boolean {
+  const baseType = tableColumnTemplateBaseTypeForSelectedDatabase(row);
+  return !baseType || isDataTypeLengthDisabled(editTableColumnTemplateDatabaseType.value, baseType);
 }
 
 function onExecuteModeChange(v: any) {
@@ -657,9 +915,8 @@ function onLocaleChange(v: any) {
   if (typeof v === "string") void setLocale(v as Locale);
 }
 
-function onRedisScanPageSizeChange(v: any) {
-  const value = Number(v);
-  if (redisScanPageSizeOptions.includes(value)) editRedisScanPageSize.value = value;
+function onUpdateDownloadSourceChange(v: any) {
+  if (v === "official" || v === "cnb") editUpdateDownloadSource.value = v;
 }
 
 function setSidebarObjectDisplay(value: "grouped" | "simple") {
@@ -754,14 +1011,13 @@ function setSidebarActivation(value: "single" | "double") {
 const activeSettingsTab = ref("editor");
 const isWeb = !isTauriRuntime();
 const displayedAppVersion = computed(() => (props.appVersion ? `v${props.appVersion}` : ""));
-type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "redis" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
+type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
 const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[]>(() => [
   { value: "editor", label: t("settings.editorTab") },
   { value: "formatter", label: t("settings.sqlFormatterTab") },
   { value: "appearance", label: t("settings.appearanceTab") },
   { value: "navigation", label: t("settings.navigationTab") },
   { value: "data", label: t("settings.dataTab") },
-  { value: "redis", label: t("settings.redisTab") },
   { value: "shortcuts", label: t("settings.shortcutsTab") },
   { value: "snippets", label: t("settings.snippetsTab") },
   ...(isWeb ? [] : [{ value: "sync" as const, label: t("settings.syncTab") }]),
@@ -770,7 +1026,7 @@ const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[
   ...(isWeb ? [{ value: "security" as const, label: t("settings.securityTab") }] : []),
   { value: "about", label: t("settings.aboutTab") },
 ]);
-const settingsTabsWithApplyFooter = new Set<SettingsCategory>(["editor", "formatter", "appearance", "navigation", "data", "redis", "shortcuts", "snippets"]);
+const settingsTabsWithApplyFooter = new Set<SettingsCategory>(["editor", "formatter", "appearance", "navigation", "data", "shortcuts", "snippets"]);
 
 function hasSettingsApplyFooter(value: SettingsCategory): boolean {
   return settingsTabsWithApplyFooter.has(value);
@@ -812,19 +1068,22 @@ async function exportDebugLogs() {
 }
 
 // ---------- MCP Server ----------
+type McpConfigTab = "claude" | "cursor" | "trae" | "vscode" | "windsurf" | "codex" | "opencode";
+type McpCopyKind = "install" | `${McpConfigTab}-config`;
+
 const mcpStatus = ref<McpServerStatus | null>(null);
 const mcpStatusLoading = ref(false);
 const mcpStatusError = ref("");
-const mcpCopied = ref<"" | "install" | "claude-config" | "codex-config">("");
-const mcpConfigTab = ref<"claude" | "codex">("claude");
+const mcpCopied = ref<"" | McpCopyKind>("");
+const mcpConfigTab = ref<McpConfigTab>("claude");
 const mcpReadonlyMode = ref(false);
 const mcpAllowDangerous = ref(false);
 const mcpInstalling = ref(false);
 const mcpInstallMessage = ref("");
 const mcpInstallError = ref(false);
 
-const mcpEnvEntries = computed(() => {
-  const entries: Array<[string, string]> = [];
+const mcpEnvEntries = computed<McpEnvEntry[]>(() => {
+  const entries: McpEnvEntry[] = [];
   if (mcpReadonlyMode.value) {
     entries.push(["DBX_MCP_ALLOW_WRITES", "0"]);
   }
@@ -834,32 +1093,13 @@ const mcpEnvEntries = computed(() => {
   return entries;
 });
 
-const mcpClaudeRecommendedConfig = computed(() => {
-  const config: Record<string, unknown> = {
-    mcpServers: {
-      dbx: {
-        command: "dbx-mcp-server",
-      } as Record<string, unknown>,
-    },
-  };
-  if (mcpEnvEntries.value.length > 0) {
-    const env = Object.fromEntries(mcpEnvEntries.value);
-    ((config.mcpServers as Record<string, any>).dbx as Record<string, unknown>).env = env;
-  }
-  return JSON.stringify(config, null, 2);
-});
+const mcpJsonRecommendedConfig = computed(() => buildMcpJsonConfig(mcpEnvEntries.value));
 
-const mcpCodexRecommendedConfig = computed(() => {
-  const lines = ["[mcp_servers.dbx]", 'command = "dbx-mcp-server"'];
-  if (mcpEnvEntries.value.length > 0) {
-    lines.push("");
-    lines.push("[mcp_servers.dbx.env]");
-    for (const [key, value] of mcpEnvEntries.value) {
-      lines.push(`${key} = "${value}"`);
-    }
-  }
-  return lines.join("\n");
-});
+const mcpVsCodeRecommendedConfig = computed(() => buildMcpVsCodeConfig(mcpEnvEntries.value));
+
+const mcpCodexRecommendedConfig = computed(() => buildMcpCodexConfig(mcpEnvEntries.value));
+
+const mcpOpenCodeRecommendedConfig = computed(() => buildMcpOpenCodeConfig(mcpEnvEntries.value));
 
 const mcpStatusTone = computed<"ok" | "warning" | "muted">(() => {
   if (!mcpStatus.value) return "muted";
@@ -898,7 +1138,7 @@ async function refreshMcpStatus() {
   }
 }
 
-async function copyMcpText(kind: "install" | "claude-config" | "codex-config", value: string) {
+async function copyMcpText(kind: McpCopyKind, value: string) {
   mcpCopied.value = kind;
   try {
     await copyToClipboard(value);
@@ -941,15 +1181,14 @@ const webdavUsername = ref(localStorage.getItem("dbx-webdav-username") || "");
 const webdavPassword = ref("");
 const webdavRememberPassword = ref(localStorage.getItem("dbx-webdav-remember-password") === "true");
 const webdavHasSavedPassword = ref(false);
-const webdavRemotePath = ref(localStorage.getItem("dbx-webdav-remote-path") || "DBX/sync/snapshot.json");
+const webdavRemotePath = ref(localStorage.getItem("dbx-webdav-remote-path") || DEFAULT_WEB_DAV_REMOTE_PATH);
 const webdavSyncSecrets = ref(false);
 const webdavSecretsPassphrase = ref("");
 const webdavAutoUploadEnabled = ref(localStorage.getItem("dbx-webdav-auto-upload-enabled") === "true");
-const webdavAutoUploadIntervalMinutes = ref(Number(localStorage.getItem("dbx-webdav-auto-upload-interval-minutes") || "30"));
+const webdavAutoUploadIntervalMinutes = ref(Number(localStorage.getItem("dbx-webdav-auto-upload-interval-minutes") || String(DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES)));
 const webdavBusy = ref<"" | "test" | "upload" | "download">("");
 const webdavMessage = ref("");
 const webdavError = ref(false);
-let webdavAutoUploadTimer: ReturnType<typeof window.setInterval> | undefined;
 
 const webdavReady = computed(() => !!webdavEndpoint.value.trim() && !webdavBusy.value && (!webdavSyncSecrets.value || !!webdavSecretsPassphrase.value.trim()));
 
@@ -958,7 +1197,7 @@ function currentWebDavConfig(): WebDavConfig {
     endpoint: webdavEndpoint.value.trim(),
     username: webdavUsername.value.trim() || undefined,
     password: webdavPassword.value || undefined,
-    remotePath: webdavRemotePath.value.trim() || "DBX/sync/snapshot.json",
+    remotePath: webdavRemotePath.value.trim() || DEFAULT_WEB_DAV_REMOTE_PATH,
   };
 }
 
@@ -968,11 +1207,11 @@ function currentWebDavAccountConfig(): WebDavConfig {
 }
 
 function rememberWebDavFields() {
-  localStorage.setItem("dbx-webdav-endpoint", webdavEndpoint.value.trim());
-  localStorage.setItem("dbx-webdav-username", webdavUsername.value.trim());
-  localStorage.setItem("dbx-webdav-remote-path", webdavRemotePath.value.trim() || "DBX/sync/snapshot.json");
-  localStorage.setItem("dbx-webdav-auto-upload-enabled", String(webdavAutoUploadEnabled.value));
-  localStorage.setItem("dbx-webdav-auto-upload-interval-minutes", String(normalizedWebDavAutoUploadInterval()));
+  writeWebDavAutoUploadFields(currentWebDavConfig(), {
+    enabled: webdavAutoUploadEnabled.value,
+    intervalMinutes: webdavAutoUploadIntervalMinutes.value,
+  });
+  window.dispatchEvent(new Event("dbx:webdav-auto-upload-config-changed"));
 }
 
 function setWebDavResult(message: string, error = false) {
@@ -1037,43 +1276,6 @@ async function uploadWebDavSnapshot() {
   });
 }
 
-function normalizedWebDavAutoUploadInterval() {
-  const value = Number(webdavAutoUploadIntervalMinutes.value);
-  if (!Number.isFinite(value)) return 30;
-  return Math.max(1, Math.min(1440, Math.round(value)));
-}
-
-function scheduleWebDavAutoUpload() {
-  if (webdavAutoUploadTimer) {
-    window.clearInterval(webdavAutoUploadTimer);
-    webdavAutoUploadTimer = undefined;
-  }
-  if (!webdavAutoUploadEnabled.value) return;
-
-  const intervalMinutes = normalizedWebDavAutoUploadInterval();
-  webdavAutoUploadIntervalMinutes.value = intervalMinutes;
-  webdavAutoUploadTimer = window.setInterval(() => {
-    void runWebDavAutoUpload();
-  }, intervalMinutes * 60_000);
-}
-
-async function runWebDavAutoUpload() {
-  if (!webdavEndpoint.value.trim() || webdavBusy.value) return;
-  webdavBusy.value = "upload";
-  webdavMessage.value = "";
-  webdavError.value = false;
-  try {
-    rememberWebDavFields();
-    await applyWebDavPasswordPreference();
-    const summary = await webdavSyncUpload(currentWebDavConfig(), settingsStore.editorSettings, webdavSyncSecrets.value ? webdavSecretsPassphrase.value : undefined);
-    setWebDavResult(t("settings.syncAutoUploadSuccess", { bytes: summary.bytes, path: summary.remotePath }));
-  } catch (e: any) {
-    setWebDavResult(e?.message || String(e), true);
-  } finally {
-    webdavBusy.value = "";
-  }
-}
-
 async function downloadWebDavSnapshot() {
   if (!window.confirm(t("settings.syncDownloadConfirm"))) return;
   await runWebDavAction("download", async () => {
@@ -1106,6 +1308,13 @@ const passwordMessage = ref("");
 const passwordError = ref(false);
 const changingPassword = ref(false);
 
+async function scrollToInitialSettingsSection() {
+  await nextTick();
+  if (props.initialSection === "tableColumnTemplates") {
+    tableColumnTemplateSectionRef.value?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+}
+
 watch(
   () => props.open,
   async (open) => {
@@ -1127,9 +1336,17 @@ watch(
       syncAiEditState();
       if (!isWeb && activeSettingsTab.value === "mcp") void refreshMcpStatus();
       if (!isWeb && activeSettingsTab.value === "ai" && aiIsCodexCli.value) void ensureCodexMcpStatus();
+      await scrollToInitialSettingsSection();
     }
   },
   { immediate: true },
+);
+
+watch(
+  () => props.initialSection,
+  () => {
+    if (props.open) void scrollToInitialSettingsSection();
+  },
 );
 
 watch([webdavEndpoint, webdavUsername], () => {
@@ -1139,8 +1356,8 @@ watch(webdavRememberPassword, (val) => {
   localStorage.setItem("dbx-webdav-remember-password", String(val));
 });
 watch([webdavAutoUploadEnabled, webdavAutoUploadIntervalMinutes], () => {
+  webdavAutoUploadIntervalMinutes.value = normalizedWebDavAutoUploadInterval(webdavAutoUploadIntervalMinutes.value);
   rememberWebDavFields();
-  scheduleWebDavAutoUpload();
 });
 
 watch(activeSettingsTab, (tab) => {
@@ -1154,17 +1371,13 @@ watch(activeSettingsTab, (tab) => {
 
 onMounted(() => {
   void refreshWebDavPasswordStatus();
-  scheduleWebDavAutoUpload();
   checkLayoutDescTruncation();
   checkIconThemeDescTruncation();
   initTruncationObservers();
 });
 
 onUnmounted(() => {
-  if (webdavAutoUploadTimer) {
-    window.clearInterval(webdavAutoUploadTimer);
-    webdavAutoUploadTimer = undefined;
-  }
+  cleanupTableColumnTemplatePointerDrag();
   cleanupTruncationObservers();
 });
 
@@ -1219,6 +1432,7 @@ const aiEditEnableThinking = ref(settingsStore.aiConfig.enableThinking ?? true);
 const aiEditReasoningLevel = ref<AiReasoningLevel>(settingsStore.aiConfig.reasoningLevel || "default");
 const aiEditContextWindow = ref<number | undefined>(settingsStore.aiConfig.contextWindow);
 const aiEditCodexCliPath = ref(settingsStore.aiConfig.codexCliPath || "");
+const aiEditCodexCliEnvRows = ref<AiEnvRow[]>(aiEnvRowsFromConfig(settingsStore.aiConfig.codexCliEnv));
 
 const aiModelOptions = ref<AiModelInfo[]>([]);
 const aiModelLoading = ref(false);
@@ -1227,6 +1441,7 @@ const aiModelLoadedSignature = ref("");
 let aiModelRequestToken = 0;
 
 const aiCompletionsMode = computed(() => aiEditApiStyle.value === "completions");
+const aiAnthropicMessagesMode = computed(() => aiEditApiStyle.value === "anthropic-messages");
 const aiReasoningLevelOptions: Array<{ value: AiReasoningLevel; labelKey: string }> = [
   { value: "default", labelKey: "ai.reasoningLevelDefault" },
   { value: "minimal", labelKey: "ai.reasoningLevelMinimal" },
@@ -1245,7 +1460,7 @@ watch(aiIsCodexCli, (isCodex) => {
   if (isCodex) void ensureCodexMcpStatus();
 });
 const aiRequiresApiKey = computed(() => AI_PROVIDER_PRESETS[aiEditProvider.value].requiresApiKey);
-const aiSupportsAuthMethod = computed(() => aiEditProvider.value === "claude");
+const aiSupportsAuthMethod = computed(() => aiEditProvider.value === "claude" || (aiEditProvider.value === "custom" && aiAnthropicMessagesMode.value));
 const aiCredentialLabel = computed(() => (aiSupportsAuthMethod.value && aiEditAuthMethod.value === "bearer" ? "Auth Token" : "API Key"));
 const aiCredentialPlaceholder = computed(() => {
   if (!aiRequiresApiKey.value) return "Optional";
@@ -1253,18 +1468,25 @@ const aiCredentialPlaceholder = computed(() => {
   return "";
 });
 const aiEndpointPlaceholder = computed(() => {
+  if (aiEditProvider.value === "custom" && aiAnthropicMessagesMode.value) {
+    return "https://api.example.com/v1/messages";
+  }
   if (aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "custom") {
     return "https://api.example.com/v1";
   }
   return "https://api.openai.com/v1";
 });
 const aiEndpointHint = computed(() => {
+  if (aiEditProvider.value === "custom" && aiAnthropicMessagesMode.value) {
+    return t("ai.anthropicMessagesHint");
+  }
   if (aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "custom") {
     return "大多数 OpenAI 兼容 API 需要 /v1 路径前缀";
   }
   return "";
 });
 const aiSupportsApiStyle = computed(() => !aiIsCodexCli.value && (aiEditProvider.value === "openai" || aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "custom"));
+const aiSupportsAnthropicApiStyle = computed(() => aiEditProvider.value === "custom");
 const aiCodexMcpNeedsInstall = computed(() => aiIsCodexCli.value && (!mcpStatus.value || !mcpStatus.value.installed));
 const aiCodexMcpCanInstall = computed(() => {
   const status = mcpStatus.value;
@@ -1283,6 +1505,52 @@ const aiModelEmptyText = computed(() => {
   if (!aiModelListSupported.value) return t("ai.modelListUnsupported");
   return t("ai.noModels");
 });
+const aiCodexEnvError = computed(() => codexEnvValidationError());
+const aiCodexPathError = computed(() => {
+  const path = aiEditCodexCliPath.value.trim();
+  const firstToken = path.split(/\s+/)[0] || "";
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(firstToken) ? t("ai.codexCliPathEnvError") : "";
+});
+const aiCodexValidationError = computed(() => (aiIsCodexCli.value ? aiCodexPathError.value || aiCodexEnvError.value : ""));
+
+function aiEnvRowsFromConfig(env: unknown): AiEnvRow[] {
+  return Object.entries(normalizeAiEnv(env)).map(([key, value]) => ({ id: uuid(), key, value }));
+}
+
+function codexEnvFromRows(): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const row of aiEditCodexCliEnvRows.value) {
+    const key = row.key.trim();
+    if (!key || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || key.toUpperCase().startsWith("DBX_MCP_")) continue;
+    result[key] = row.value;
+  }
+  return result;
+}
+
+function codexEnvSignature(): string {
+  return JSON.stringify(Object.entries(codexEnvFromRows()).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function savedCodexEnvSignature(): string {
+  return JSON.stringify(Object.entries(normalizeAiEnv(settingsStore.aiConfig.codexCliEnv)).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function codexEnvValidationError(): string {
+  for (const row of aiEditCodexCliEnvRows.value) {
+    const key = row.key.trim();
+    if (key && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return t("ai.codexCliEnvInvalidName", { name: key });
+    if (key.toUpperCase().startsWith("DBX_MCP_")) return t("ai.codexCliEnvReservedName", { name: key });
+  }
+  return "";
+}
+
+function addCodexEnvRow() {
+  aiEditCodexCliEnvRows.value.push({ id: uuid(), key: "", value: "" });
+}
+
+function removeCodexEnvRow(id: string) {
+  aiEditCodexCliEnvRows.value = aiEditCodexCliEnvRows.value.filter((row) => row.id !== id);
+}
 
 function clearAiModelOptions() {
   aiModelRequestToken += 1;
@@ -1301,6 +1569,7 @@ function aiModelConfigSignature() {
     proxyEnabled: aiEditProxyEnabled.value,
     proxyUrl: aiEditProxyUrl.value.trim(),
     codexCliPath: aiEditCodexCliPath.value.trim(),
+    codexCliEnv: codexEnvSignature(),
   });
 }
 
@@ -1318,6 +1587,7 @@ function currentAiEditConfig() {
     reasoningLevel: aiEditReasoningLevel.value,
     contextWindow: aiEditContextWindow.value || undefined,
     codexCliPath: aiEditCodexCliPath.value.trim() || undefined,
+    codexCliEnv: aiIsCodexCli.value ? codexEnvFromRows() : {},
   };
 }
 
@@ -1335,6 +1605,14 @@ function normalizeAiModelOptions(models: AiModelInfo[]): AiModelInfo[] {
 
 function displayAiModelName(modelId: string): string {
   return aiModelOptions.value.find((model) => model.id === modelId)?.displayName || modelId;
+}
+
+function aiModelOptionPresentation(modelId: string, label = displayAiModelName(modelId)) {
+  return formatAiModelOption(label, modelId);
+}
+
+function aiModelOptionSecondary(modelId: string, label = displayAiModelName(modelId)) {
+  return aiModelOptionPresentation(modelId, label).secondary;
 }
 
 async function aiRefreshModels() {
@@ -1395,6 +1673,7 @@ function syncAiEditState() {
   aiEditReasoningLevel.value = settingsStore.aiConfig.reasoningLevel || "default";
   aiEditContextWindow.value = settingsStore.aiConfig.contextWindow;
   aiEditCodexCliPath.value = settingsStore.aiConfig.codexCliPath || "";
+  aiEditCodexCliEnvRows.value = aiEnvRowsFromConfig(settingsStore.aiConfig.codexCliEnv);
   aiTestResult.value = "";
   aiTestError.value = "";
   aiTestLatency.value = null;
@@ -1412,12 +1691,20 @@ function aiSelectProvider(provider: AiProvider) {
   aiEditReasoningLevel.value = "default";
   if (!AI_PROVIDER_PRESETS[provider].requiresApiKey) aiEditApiKey.value = "";
   aiEditCodexCliPath.value = "";
+  aiEditCodexCliEnvRows.value = [];
   aiTestResult.value = "";
   aiTestError.value = "";
   aiTestLatency.value = null;
   aiTestErrorCopied.value = false;
   clearAiModelOptions();
   if (provider === "codex-cli") void ensureCodexMcpStatus();
+}
+
+function aiSelectApiStyle(style: AiApiStyle) {
+  aiEditApiStyle.value = style;
+  if (aiEditProvider.value === "custom") {
+    aiEditAuthMethod.value = style === "anthropic-messages" ? "api-key" : "bearer";
+  }
 }
 
 function aiHasChanges(): boolean {
@@ -1433,16 +1720,27 @@ function aiHasChanges(): boolean {
     aiEditEnableThinking.value !== (settingsStore.aiConfig.enableThinking ?? true) ||
     aiEditReasoningLevel.value !== (settingsStore.aiConfig.reasoningLevel || "default") ||
     aiEditContextWindow.value !== settingsStore.aiConfig.contextWindow ||
-    aiEditCodexCliPath.value !== (settingsStore.aiConfig.codexCliPath || "")
+    aiEditCodexCliPath.value !== (settingsStore.aiConfig.codexCliPath || "") ||
+    codexEnvSignature() !== savedCodexEnvSignature()
   );
 }
 
 function aiApplySettings() {
+  if (aiCodexValidationError.value) {
+    aiTestResult.value = "error";
+    aiTestError.value = aiCodexValidationError.value;
+    return;
+  }
   settingsStore.updateAiConfig(currentAiEditConfig());
 }
 
 async function aiTestConn() {
   if ((aiRequiresApiKey.value && !aiEditApiKey.value.trim()) || (!aiIsCodexCli.value && !aiEditEndpoint.value.trim()) || (!aiIsCodexCli.value && !aiEditModel.value.trim())) return;
+  if (aiCodexValidationError.value) {
+    aiTestResult.value = "error";
+    aiTestError.value = aiCodexValidationError.value;
+    return;
+  }
   aiTesting.value = true;
   aiTestResult.value = "";
   aiTestError.value = "";
@@ -1679,12 +1977,28 @@ watch(
                   </Select>
                 </div>
 
-                <div class="flex items-center justify-between gap-4 self-end rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="editor-show-execution-target-picker">{{ t("settings.showExecutionTargetPicker") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.showExecutionTargetPickerDescription") }}</p>
+                  </div>
+                  <Switch id="editor-show-execution-target-picker" v-model="editShowExecutionTargetPicker" class="mt-0.5" />
+                </div>
+
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-word-wrap">{{ t("settings.wordWrap") }}</Label>
                     <p class="text-xs text-muted-foreground">{{ t("settings.wordWrapDescription") }}</p>
                   </div>
                   <Switch id="editor-word-wrap" v-model="editWordWrap" class="mt-0.5" />
+                </div>
+
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="editor-auto-alias-tables">{{ t("settings.autoAliasTables") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.autoAliasTablesDescription") }}</p>
+                  </div>
+                  <Switch id="editor-auto-alias-tables" v-model="editAutoAliasTables" class="mt-0.5" />
                 </div>
               </div>
 
@@ -1728,7 +2042,7 @@ watch(
                           readonly
                           :aria-invalid="shortcutConflicts.includes(definition.id)"
                           :placeholder="t('settings.shortcutPressShortcut')"
-                          class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-full border border-transparent bg-background px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
+                          class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-[6px] border border-transparent bg-background px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
                           :class="editingShortcutId === definition.id ? 'max-w-44 cursor-text border-border/80 bg-background text-left text-foreground shadow-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35' : ''"
                           @keydown="(event: KeyboardEvent) => onShortcutKeydown(definition.id, event)"
                         />
@@ -1835,11 +2149,11 @@ watch(
                     }
                   "
                 >
-                  <SelectTrigger class="w-40">
+                  <SelectTrigger class="min-w-36">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem v-for="scale in uiScaleOptions" :key="scale" :value="String(scale)"> {{ Math.round(scale * 100) }}% </SelectItem>
+                    <SelectItem v-for="scale in uiScaleOptions" :key="scale" :value="String(scale)" class="pl-2.5"> {{ Math.round(scale * 100) }}% </SelectItem>
                   </SelectContent>
                 </Select>
                 <p class="text-xs text-muted-foreground">{{ t("settings.uiScaleDescription") }}</p>
@@ -2049,16 +2363,9 @@ watch(
               <div class="space-y-2">
                 <div class="flex items-center gap-2">
                   <Label>{{ t("settings.toolbarTitle") }}</Label>
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger as-child>
-                        <CircleHelp class="h-3.5 w-3.5 text-muted-foreground cursor-help" />
-                      </TooltipTrigger>
-                      <TooltipContent class="max-w-64">
-                        <p>{{ t("settings.toolbarHiddenHint") }}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
+                  <HelpTooltip :label="t('settings.toolbarTitle')" content-class="max-w-64">
+                    <p>{{ t("settings.toolbarHiddenHint") }}</p>
+                  </HelpTooltip>
                 </div>
                 <div class="grid grid-cols-3 gap-2 mt-2">
                   <div
@@ -2110,14 +2417,9 @@ watch(
               <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="reuse-data-tab">{{ t("settings.reuseDataTab") }}</Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.reuseDataTabDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.reuseDataTab')">
+                    {{ t("settings.reuseDataTabDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Switch id="reuse-data-tab" v-model="editReuseDataTab" />
               </div>
@@ -2163,28 +2465,18 @@ watch(
               <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="auto-select-active-sidebar-node">{{ t("settings.autoSelectActiveSidebarNode") }}</Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.autoSelectActiveSidebarNodeDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.autoSelectActiveSidebarNode')">
+                    {{ t("settings.autoSelectActiveSidebarNodeDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Switch id="auto-select-active-sidebar-node" v-model="editAutoSelectActiveSidebarNode" />
               </div>
               <div class="space-y-2 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="disconnect-tab-handling-mode">{{ t("settings.disconnectTabHandlingMode") }}</Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.disconnectTabHandlingModeDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.disconnectTabHandlingMode')">
+                    {{ t("settings.disconnectTabHandlingModeDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Select :model-value="editDisconnectTabHandlingMode" @update:model-value="onDisconnectTabHandlingModeChange">
                   <SelectTrigger id="disconnect-tab-handling-mode" class="w-full">
@@ -2207,14 +2499,9 @@ watch(
               <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="sidebar-hide-table-comments">{{ t("settings.sidebarHideTableComments") }}</Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.sidebarHideTableCommentsDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.sidebarHideTableComments')">
+                    {{ t("settings.sidebarHideTableCommentsDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Switch id="sidebar-hide-table-comments" v-model="editSidebarHideTableComments" />
               </div>
@@ -2223,14 +2510,9 @@ watch(
                   <Label for="sidebar-allow-horizontal-scroll">
                     {{ t("settings.sidebarAllowHorizontalScroll") }}
                   </Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.sidebarAllowHorizontalScrollDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.sidebarAllowHorizontalScroll')">
+                    {{ t("settings.sidebarAllowHorizontalScrollDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Switch id="sidebar-allow-horizontal-scroll" v-model="editSidebarAllowHorizontalScroll" />
               </div>
@@ -2289,23 +2571,121 @@ watch(
                     <span class="text-xs text-muted-foreground">{{ t("settings.exportBatchSizeDescription") }}</span>
                   </div>
                 </div>
+                <div class="flex items-start justify-between gap-3">
+                  <div class="space-y-0.5">
+                    <Label for="export-row-limit-enabled">{{ t("settings.exportRowLimitEnabled") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.exportRowLimitEnabledDescription") }}</p>
+                  </div>
+                  <Switch id="export-row-limit-enabled" v-model="editExportRowLimitEnabled" class="mt-0.5" />
+                </div>
+                <div class="space-y-2">
+                  <Label for="export-row-limit">{{ t("settings.exportRowLimit") }}</Label>
+                  <div class="flex items-center gap-3">
+                    <Input id="export-row-limit" type="number" min="100" max="2147483647" step="100" v-model.number="editExportRowLimit" :disabled="!editExportRowLimitEnabled" class="h-9 w-32 [&::-webkit-inner-spin-button]:appearance-none" />
+                    <span class="text-xs text-muted-foreground">
+                      {{ editExportRowLimitEnabled ? t("settings.exportRowLimitDescription") : t("settings.exportRowLimitUnlimited") }}
+                    </span>
+                  </div>
+                </div>
+                <div class="flex items-start justify-between gap-3">
+                  <div class="space-y-0.5">
+                    <Label for="query-export-keyset-enabled">{{ t("settings.queryExportKeysetOptimizationEnabled") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.queryExportKeysetOptimizationEnabledDescription") }}</p>
+                  </div>
+                  <Switch id="query-export-keyset-enabled" v-model="editQueryExportKeysetOptimizationEnabled" class="mt-0.5" />
+                </div>
               </div>
-            </section>
 
-            <section v-else-if="activeSettingsTab === 'redis'" class="flex flex-col gap-5 py-2">
-              <div class="space-y-2">
-                <Label>{{ t("settings.redisScanPageSize") }}</Label>
-                <Select :model-value="String(editRedisScanPageSize)" @update:model-value="onRedisScanPageSizeChange">
-                  <SelectTrigger>
-                    <SelectValue :placeholder="t('settings.redisScanPageSize')" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem v-for="size in redisScanPageSizeOptions" :key="size" :value="String(size)">
-                      {{ t("settings.redisScanPageSizeOption", { count: size }) }}
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
-                <p class="text-xs text-muted-foreground">{{ t("settings.redisScanPageSizeDescription") }}</p>
+              <Separator />
+
+              <div class="space-y-3">
+                <div class="text-sm font-medium text-muted-foreground">{{ t("settings.tableStructureSection") }}</div>
+                <div ref="tableColumnTemplateSectionRef" class="space-y-2 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="flex items-start justify-between gap-3">
+                    <div class="space-y-1">
+                      <Label>{{ t("settings.tableColumnTemplateFields") }}</Label>
+                      <p class="text-xs text-muted-foreground">{{ t("settings.tableColumnTemplateFieldsDescription") }}</p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                      <Select v-model="editTableColumnTemplateDatabaseType">
+                        <SelectTrigger class="h-8 w-44 px-2 text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent class="max-h-72">
+                          <SelectItem v-for="dbType in TABLE_COLUMN_TEMPLATE_DATABASE_TYPES" :key="dbType" :value="dbType">
+                            {{ dbType }}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Button type="button" size="sm" variant="outline" @click="addTableColumnTemplateRow">
+                        {{ t("settings.tableColumnTemplateAdd") }}
+                      </Button>
+                    </div>
+                  </div>
+                  <div class="overflow-x-auto rounded-md border bg-background">
+                    <table class="w-full min-w-[900px] border-separate border-spacing-0 text-xs">
+                      <thead class="bg-muted/50 text-muted-foreground">
+                        <tr>
+                          <th class="w-8 border-b px-2 py-1.5" />
+                          <th class="border-b px-2 py-1.5 text-left font-medium">{{ t("settings.tableColumnTemplateColumn") }}</th>
+                          <th class="border-b px-2 py-1.5 text-left font-medium">{{ t("settings.tableColumnTemplateType") }}</th>
+                          <th class="border-b px-2 py-1.5 text-left font-medium">{{ t("settings.tableColumnTemplateLength") }}</th>
+                          <th class="border-b px-2 py-1.5 text-left font-medium">{{ t("settings.tableColumnTemplateDefault") }}</th>
+                          <th class="border-b px-2 py-1.5 text-left font-medium">{{ t("settings.tableColumnTemplateRequired") }}</th>
+                          <th class="border-b px-2 py-1.5 text-left font-medium">{{ t("settings.tableColumnTemplateComment") }}</th>
+                          <th class="w-10 border-b px-2 py-1.5" />
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="row in visibleTableColumnTemplateRows" :key="row.id" :data-table-column-template-row-id="row.id" :class="draggedTableColumnTemplateRowId === row.id ? 'opacity-60' : ''">
+                          <td class="border-b px-2 py-1.5 align-middle">
+                            <button
+                              type="button"
+                              class="flex h-7 w-6 cursor-grab touch-none items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing"
+                              :aria-label="t('settings.tableColumnTemplateDragHandle')"
+                              @pointerdown="startTableColumnTemplateRowDrag(row.id, $event)"
+                            >
+                              <GripVertical class="h-3.5 w-3.5" />
+                            </button>
+                          </td>
+                          <td class="border-b px-2 py-1.5">
+                            <Input v-model="row.name" class="h-7 px-2 text-xs" />
+                          </td>
+                          <td class="border-b px-2 py-1.5">
+                            <SearchableSelect
+                              :model-value="tableColumnTemplateBaseTypeForSelectedDatabase(row)"
+                              :options="tableColumnTemplateTypeOptions(editTableColumnTemplateDatabaseType)"
+                              :placeholder="t('settings.tableColumnTemplateNoPresetType')"
+                              :search-placeholder="t('structureEditor.typePlaceholder')"
+                              :empty-text="t('structureEditor.noMatchingType')"
+                              :loading-text="t('common.loading')"
+                              :allow-custom="true"
+                              :trigger-class="['h-7 w-full px-2 font-mono text-xs']"
+                              @update:model-value="setTableColumnTemplateBaseTypeForSelectedDatabase(row, $event)"
+                            />
+                          </td>
+                          <td class="border-b px-2 py-1.5">
+                            <Input :model-value="tableColumnTemplateLengthForSelectedDatabase(row)" class="h-7 w-28 px-2 font-mono text-xs" :disabled="isTableColumnTemplateLengthDisabled(row)" @update:model-value="setTableColumnTemplateLengthForSelectedDatabase(row, String($event))" />
+                          </td>
+                          <td class="border-b px-2 py-1.5">
+                            <Input v-model="row.defaultValue" class="h-7 px-2 font-mono text-xs" />
+                          </td>
+                          <td class="border-b px-2 py-1.5">
+                            <Switch v-model="row.required" />
+                          </td>
+                          <td class="border-b px-2 py-1.5">
+                            <Input v-model="row.comment" class="h-7 px-2 text-xs" />
+                          </td>
+                          <td class="border-b px-2 py-1.5 text-right">
+                            <Button type="button" variant="ghost" size="icon" class="h-7 w-7" @click="removeTableColumnTemplateRow(row.id)">
+                              <X class="h-3.5 w-3.5" />
+                            </Button>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               </div>
             </section>
 
@@ -2331,7 +2711,7 @@ watch(
                         readonly
                         :aria-invalid="shortcutConflicts.includes(definition.id)"
                         :placeholder="t('settings.shortcutPressShortcut')"
-                        class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-full border border-transparent bg-muted px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
+                        class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-[6px] border border-transparent bg-muted px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
                         :class="editingShortcutId === definition.id ? 'max-w-44 cursor-text border-border/80 bg-background text-left text-foreground shadow-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35' : ''"
                         @keydown="(event: KeyboardEvent) => onShortcutKeydown(definition.id, event)"
                       />
@@ -2469,21 +2849,18 @@ watch(
                       <X class="size-3.5" />
                     </button>
                   </div>
-                  <label class="flex items-center gap-2 text-xs text-muted-foreground">
-                    <input v-model="webdavRememberPassword" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
-                    <span>
-                      {{ t("settings.syncRememberWebDavPassword") }}
-                      <span v-if="webdavHasSavedPassword">{{ t("settings.syncSavedPassword") }}</span>
-                    </span>
-                    <Tooltip>
-                      <TooltipTrigger as-child>
-                        <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                      </TooltipTrigger>
-                      <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                        {{ t("settings.syncRememberWebDavPasswordDescription") }}
-                      </TooltipContent>
-                    </Tooltip>
-                  </label>
+                  <div class="flex items-center gap-2 text-xs text-muted-foreground">
+                    <label class="flex items-center gap-2">
+                      <input v-model="webdavRememberPassword" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
+                      <span>
+                        {{ t("settings.syncRememberWebDavPassword") }}
+                        <span v-if="webdavHasSavedPassword">{{ t("settings.syncSavedPassword") }}</span>
+                      </span>
+                    </label>
+                    <HelpTooltip :label="t('settings.syncRememberWebDavPassword')">
+                      {{ t("settings.syncRememberWebDavPasswordDescription") }}
+                    </HelpTooltip>
+                  </div>
                 </div>
                 <div class="space-y-2 md:col-span-2">
                   <Label for="webdav-remote-path">{{ t("settings.syncRemotePath") }}</Label>
@@ -2613,6 +2990,28 @@ watch(
                   <div class="col-span-2 space-y-1.5">
                     <Input v-model="aiEditCodexCliPath" autocomplete="off" class="h-8 text-xs" placeholder="codex" />
                     <p class="text-[11px] text-muted-foreground">{{ t("ai.codexCliPathHint") }}</p>
+                    <p v-if="aiCodexPathError" class="text-[11px] text-destructive">{{ aiCodexPathError }}</p>
+                  </div>
+                </div>
+
+                <div v-if="aiIsCodexCli" class="grid grid-cols-3 items-start gap-3">
+                  <Label class="pt-2 text-right text-xs">{{ t("ai.codexCliEnv") }}</Label>
+                  <div class="col-span-2 space-y-2">
+                    <div class="space-y-1.5">
+                      <div v-for="row in aiEditCodexCliEnvRows" :key="row.id" class="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.3fr)_2rem] gap-2">
+                        <Input v-model="row.key" autocomplete="off" class="h-8 font-mono text-xs" :placeholder="t('ai.codexCliEnvKeyPlaceholder')" />
+                        <Input v-model="row.value" autocomplete="off" class="h-8 font-mono text-xs" :placeholder="t('ai.codexCliEnvValuePlaceholder')" />
+                        <Button type="button" variant="ghost" size="icon" class="h-8 w-8" :title="t('common.remove')" :aria-label="t('common.remove')" @click="removeCodexEnvRow(row.id)">
+                          <X class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                    <Button type="button" variant="outline" size="sm" class="h-7 px-2 text-xs" @click="addCodexEnvRow">
+                      <Plus class="mr-1 h-3.5 w-3.5" />
+                      {{ t("ai.codexCliEnvAdd") }}
+                    </Button>
+                    <p v-if="aiCodexEnvError" class="text-[11px] text-destructive">{{ aiCodexEnvError }}</p>
+                    <p v-else class="text-[11px] text-muted-foreground">{{ t("ai.codexCliEnvHint") }}</p>
                   </div>
                 </div>
 
@@ -2632,6 +3031,7 @@ watch(
                         :display-name="displayAiModelName"
                         trigger-class="h-8 min-w-[104px] max-w-[150px] shrink-0 border border-border bg-background px-2 text-xs shadow-none hover:bg-muted/50"
                         content-class="w-72"
+                        item-class="h-auto min-h-8 py-1.5"
                         @update:model-value="aiSelectModel"
                         @update:open="onAiModelListOpen"
                       >
@@ -2639,9 +3039,9 @@ watch(
                           <span class="truncate">{{ loading ? t("ai.loadingModels") : t("ai.browseModels") }}</span>
                         </template>
                         <template #option-label="{ option, label }">
-                          <span class="flex min-w-0 flex-col">
-                            <span class="truncate">{{ label }}</span>
-                            <span v-if="label !== option" class="truncate text-[11px] text-muted-foreground">{{ option }}</span>
+                          <span class="flex min-w-0 flex-col leading-tight">
+                            <span class="truncate">{{ aiModelOptionPresentation(option, label).primary }}</span>
+                            <span v-if="aiModelOptionSecondary(option, label)" class="mt-0.5 truncate text-[11px] text-muted-foreground">{{ aiModelOptionSecondary(option, label) }}</span>
                           </span>
                         </template>
                       </SearchableSelect>
@@ -2677,8 +3077,9 @@ watch(
                 <div v-if="aiSupportsApiStyle" class="grid grid-cols-3 items-center gap-3">
                   <Label class="text-right text-xs">API</Label>
                   <div class="col-span-2 flex gap-2">
-                    <Button size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'completions' }" @click="aiEditApiStyle = 'completions'">/chat/completions</Button>
-                    <Button size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'responses' }" @click="aiEditApiStyle = 'responses'">/responses</Button>
+                    <Button size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'completions' }" @click="aiSelectApiStyle('completions')">/chat/completions</Button>
+                    <Button size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'responses' }" @click="aiSelectApiStyle('responses')">/responses</Button>
+                    <Button v-if="aiSupportsAnthropicApiStyle" size="sm" variant="outline" class="h-8 flex-1 text-xs" :class="{ 'border-blue-300 border-2 ring-2 ring-blue-300/50': aiEditApiStyle === 'anthropic-messages' }" @click="aiSelectApiStyle('anthropic-messages')">/messages</Button>
                   </div>
                 </div>
 
@@ -2730,14 +3131,9 @@ watch(
                     <div class="flex items-center gap-2">
                       <PackageSearch class="h-4 w-4 text-muted-foreground" />
                       <Label class="text-base">{{ t("settings.mcpTitle") }}</Label>
-                      <Tooltip>
-                        <TooltipTrigger as-child>
-                          <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                        </TooltipTrigger>
-                        <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                          {{ t("settings.mcpDescription") }}
-                        </TooltipContent>
-                      </Tooltip>
+                      <HelpTooltip :label="t('settings.mcpTitle')">
+                        {{ t("settings.mcpDescription") }}
+                      </HelpTooltip>
                     </div>
                   </div>
                   <Badge variant="outline" class="shrink-0 rounded-md" :class="mcpStatusTone === 'ok' ? 'border-green-500/40 text-green-600 dark:text-green-400' : mcpStatusTone === 'warning' ? 'border-amber-500/40 text-amber-600 dark:text-amber-400' : 'text-muted-foreground'">
@@ -2830,18 +3226,83 @@ watch(
               <div class="space-y-2">
                 <Label>{{ t("settings.mcpConfig") }}</Label>
                 <Tabs v-model="mcpConfigTab" class="space-y-3">
-                  <TabsList>
+                  <TabsList class="max-w-full overflow-x-auto">
                     <TabsTrigger value="claude">Claude Code</TabsTrigger>
+                    <TabsTrigger value="cursor">Cursor</TabsTrigger>
+                    <TabsTrigger value="trae">TRAE</TabsTrigger>
+                    <TabsTrigger value="vscode">VS Code</TabsTrigger>
+                    <TabsTrigger value="windsurf">Windsurf</TabsTrigger>
                     <TabsTrigger value="codex">Codex</TabsTrigger>
+                    <TabsTrigger value="opencode">OpenCode</TabsTrigger>
                   </TabsList>
 
                   <TabsContent value="claude" class="m-0">
                     <div class="relative rounded-md border bg-background p-3">
-                      <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpClaudeRecommendedConfig }}</code></pre>
-                      <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('claude-config', mcpClaudeRecommendedConfig)">
+                      <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                      <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('claude-config', mcpJsonRecommendedConfig)">
                         <CheckCircle2 v-if="mcpCopied === 'claude-config'" class="h-3.5 w-3.5 text-green-500" />
                         <Copy v-else class="h-3.5 w-3.5" />
                       </Button>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="cursor" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpCursorConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('cursor-config', mcpJsonRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'cursor-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="trae" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpTraeConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('trae-config', mcpJsonRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'trae-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="vscode" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpVsCodeConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpVsCodeRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('vscode-config', mcpVsCodeRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'vscode-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="windsurf" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpWindsurfConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('windsurf-config', mcpJsonRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'windsurf-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
                     </div>
                   </TabsContent>
 
@@ -2854,6 +3315,21 @@ watch(
                         <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpCodexRecommendedConfig }}</code></pre>
                         <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('codex-config', mcpCodexRecommendedConfig)">
                           <CheckCircle2 v-if="mcpCopied === 'codex-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Copy v-else class="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="opencode" class="m-0">
+                    <div class="space-y-2">
+                      <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                        {{ t("settings.mcpOpenCodeConfigPath") }}
+                      </div>
+                      <div class="relative rounded-md border bg-background p-3">
+                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpOpenCodeRecommendedConfig }}</code></pre>
+                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('opencode-config', mcpOpenCodeRecommendedConfig)">
+                          <CheckCircle2 v-if="mcpCopied === 'opencode-config'" class="h-3.5 w-3.5 text-green-500" />
                           <Copy v-else class="h-3.5 w-3.5" />
                         </Button>
                       </div>
@@ -2898,6 +3374,24 @@ watch(
                 </div>
               </div>
 
+              <div class="rounded-lg border p-4">
+                <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div class="min-w-0 space-y-1">
+                    <Label>{{ t("settings.updateDownloadSource") }}</Label>
+                    <p class="text-sm text-muted-foreground">{{ t("settings.updateDownloadSourceDescription") }}</p>
+                  </div>
+                  <Select :model-value="editUpdateDownloadSource" @update:model-value="onUpdateDownloadSourceChange">
+                    <SelectTrigger class="h-9 w-full sm:w-[180px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="official">{{ t("settings.updateDownloadSourceOfficial") }}</SelectItem>
+                      <SelectItem value="cnb">{{ t("settings.updateDownloadSourceCnb") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+
               <div class="grid gap-3 sm:grid-cols-2">
                 <button type="button" class="rounded-lg border p-4 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" @click="openExternalUrl('https://github.com/QYue64/dbx')">
                   <div class="text-xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -2932,7 +3426,7 @@ watch(
 
           <DialogFooter v-else-if="activeSettingsTab === 'ai'" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
             <div class="flex flex-1 items-center gap-2">
-              <Button size="sm" variant="outline" :disabled="aiTesting || (aiRequiresApiKey && !aiEditApiKey?.trim()) || (!aiIsCodexCli && !aiEditEndpoint?.trim()) || (!aiIsCodexCli && !aiEditModel?.trim())" @click="aiTestConn">
+              <Button size="sm" variant="outline" :disabled="aiTesting || !!aiCodexValidationError || (aiRequiresApiKey && !aiEditApiKey?.trim()) || (!aiIsCodexCli && !aiEditEndpoint?.trim()) || (!aiIsCodexCli && !aiEditModel?.trim())" @click="aiTestConn">
                 <Loader2 v-if="aiTesting" class="h-3 w-3 animate-spin mr-1" />
                 {{ t("connection.test") }}
               </Button>
@@ -2957,7 +3451,7 @@ watch(
               </span>
             </div>
             <Button variant="outline" @click="emit('update:open', false)">{{ t("common.close") }}</Button>
-            <Button :disabled="!aiHasChanges()" @click="aiApplySettings">{{ t("settings.apply") }}</Button>
+            <Button :disabled="!aiHasChanges() || !!aiCodexValidationError" @click="aiApplySettings">{{ t("settings.apply") }}</Button>
           </DialogFooter>
 
           <DialogFooter v-else-if="activeSettingsTab === 'sync'" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
@@ -3016,6 +3510,12 @@ watch(
             <div class="flex-1" />
             <Button variant="outline" @click="emit('update:open', false)">
               {{ t("common.close") }}
+            </Button>
+            <Button :disabled="!hasChanges() || hasApplyBlocker" @click="applySettings">
+              {{ t("settings.apply") }}
+            </Button>
+            <Button :disabled="!hasChanges() || hasApplyBlocker" @click="applySettingsAndClose">
+              {{ t("settings.applyAndClose") }}
             </Button>
           </DialogFooter>
         </div>

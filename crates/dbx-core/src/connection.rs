@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
@@ -11,8 +11,7 @@ use mysql_async::Row as MysqlRow;
 use crate::agent_connection::{
     agent_connect_params, h2_file_path_from_jdbc_url, is_h2_file_connection, mongo_legacy_error_with_auth_hint,
     mongo_uses_legacy_driver, oracle_alternate_connect_config_labels, oracle_alternate_connect_configs,
-    oracle_auth_fallback_profiles, oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
-    should_retry_oracle_with_10g_driver,
+    oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver, trino_like_jdbc_connection_string,
 };
 use crate::agent_manager::{JavaRuntimeMode, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
@@ -30,9 +29,10 @@ use crate::storage::Storage;
 
 pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
     "JDBC plugin is not installed. Install the optional JDBC plugin to use this connection.";
+pub const PRESTOSQL_JDBC_DRIVER_CLASS: &str = "io.prestosql.jdbc.PrestoDriver";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
-const POOL_CLOSE_TIMEOUT_SECS: u64 = 5;
+const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
 
 #[cfg(feature = "duckdb-bundled")]
 mod duckdb_types {
@@ -79,11 +79,54 @@ pub enum PoolKind {
     /// Message queue admin connection (not a data query pool; serves as a
     /// marker that this connection_id is a valid MQ admin connection).
     MessageQueue,
+    /// Nacos admin connection marker.
+    Nacos,
+}
+
+macro_rules! agent_connection_pool_database_type {
+    () => {
+        DatabaseType::Dameng
+            | DatabaseType::Kingbase
+            | DatabaseType::Highgo
+            | DatabaseType::Vastbase
+            | DatabaseType::Goldendb
+            | DatabaseType::Databend
+            | DatabaseType::Yashandb
+            | DatabaseType::Databricks
+            | DatabaseType::SapHana
+            | DatabaseType::Teradata
+            | DatabaseType::Vertica
+            | DatabaseType::Firebird
+            | DatabaseType::Exasol
+            | DatabaseType::OceanbaseOracle
+            | DatabaseType::Gbase
+            | DatabaseType::Oracle
+            | DatabaseType::H2
+            | DatabaseType::Snowflake
+            | DatabaseType::Trino
+            | DatabaseType::Hive
+            | DatabaseType::Db2
+            | DatabaseType::Informix
+            | DatabaseType::Neo4j
+            | DatabaseType::Cassandra
+            | DatabaseType::Bigquery
+            | DatabaseType::Kylin
+            | DatabaseType::Sundb
+            | DatabaseType::Tdengine
+            | DatabaseType::Xugu
+            | DatabaseType::Iotdb
+            | DatabaseType::Etcd
+            | DatabaseType::ZooKeeper
+            | DatabaseType::Iris
+            | DatabaseType::Access
+    };
 }
 
 pub struct AppState {
-    pub connections: RwLock<HashMap<String, PoolKind>>,
-    keepalive_tasks: RwLock<HashMap<String, JoinHandle<()>>>,
+    pub connections: Arc<RwLock<HashMap<String, PoolKind>>>,
+    keepalive_tasks: Arc<RwLock<HashMap<String, JoinHandle<()>>>>,
+    pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
+    connection_attempts: RwLock<HashMap<String, u64>>,
     pub configs: RwLock<HashMap<String, ConnectionConfig>>,
     pub running_queries: RunningQueries,
     pub tunnels: TunnelManager,
@@ -91,8 +134,46 @@ pub struct AppState {
     pub storage: Storage,
     pub plugins: PluginRegistry,
     pub agent_manager: crate::agent_manager::AgentManager,
+    pub nacos_registry: crate::nacos::NacosAdminRegistry,
+    /// PostgreSQL TLS cancel context, keyed by pool_key.
+    /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
+    postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
+}
+
+#[derive(Clone, Copy)]
+struct PoolActivity {
+    last_used_at: Instant,
+}
+
+impl PoolActivity {
+    fn now() -> Self {
+        Self { last_used_at: Instant::now() }
+    }
+}
+
+pub struct PoolActivityTouch {
+    pool_key: String,
+    connections: Arc<RwLock<HashMap<String, PoolKind>>>,
+    pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
+}
+
+impl Drop for PoolActivityTouch {
+    fn drop(&mut self) {
+        let pool_key = self.pool_key.clone();
+        let connections = self.connections.clone();
+        let pool_activity = self.pool_activity.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            if !connections.read().await.contains_key(&pool_key) {
+                return;
+            }
+            pool_activity.write().await.insert(pool_key, PoolActivity::now());
+        });
+    }
 }
 
 pub fn metadata_connection_config(config: &ConnectionConfig) -> ConnectionConfig {
@@ -116,6 +197,16 @@ pub fn database_connection_config(config: &ConnectionConfig, database: Option<&s
     db_config
 }
 
+pub fn prestosql_jdbc_config_for_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> ConnectionConfig {
+    let mut jdbc_config = config.clone();
+    jdbc_config.connection_string =
+        Some(trino_like_jdbc_connection_string(config, host, port, config.effective_database().unwrap_or("")));
+    if jdbc_config.jdbc_driver_class.as_deref().is_none_or(|value| value.trim().is_empty()) {
+        jdbc_config.jdbc_driver_class = Some(PRESTOSQL_JDBC_DRIVER_CLASS.to_string());
+    }
+    jdbc_config
+}
+
 pub async fn connect_mysql_metadata_pool(
     config: &ConnectionConfig,
     db_config: &ConnectionConfig,
@@ -125,6 +216,7 @@ pub async fn connect_mysql_metadata_pool(
     max_connections: usize,
 ) -> Result<(db::mysql::MySqlPool, MysqlMode), String> {
     let url = connection_url_for_endpoint(db_config, host, port);
+    let idle_timeout_secs = Some(db_config.idle_timeout_secs);
     if db_config.needs_bare_mysql() {
         return match db::mysql::connect_bare_with_pool_limit(&url, connect_timeout, max_connections).await {
             Ok(pool) => Ok((pool, MysqlMode::Bare)),
@@ -144,11 +236,12 @@ pub async fn connect_mysql_metadata_pool(
         };
     }
 
-    match db::mysql::connect_with_ca_cert_and_pool_limit(
+    match db::mysql::connect_with_ca_cert_pool_limit_and_idle(
         &url,
         Some(&db_config.ca_cert_path),
         connect_timeout,
         max_connections,
+        idle_timeout_secs,
     )
     .await
     {
@@ -162,11 +255,12 @@ pub async fn connect_mysql_metadata_pool(
                 log::info!(
                     "MySQL metadata connection without a default database failed ({err}); retrying with configured default database."
                 );
-                let pool = db::mysql::connect_with_ca_cert_and_pool_limit(
+                let pool = db::mysql::connect_with_ca_cert_pool_limit_and_idle(
                     &fallback_url,
                     Some(&config.ca_cert_path),
                     connect_timeout,
                     max_connections,
+                    idle_timeout_secs,
                 )
                 .await?;
                 let mode = detect_ob_oracle_mode(config, &pool).await;
@@ -261,8 +355,10 @@ impl AppState {
         app_version: impl Into<String>,
     ) -> Self {
         Self {
-            connections: RwLock::new(HashMap::new()),
-            keepalive_tasks: RwLock::new(HashMap::new()),
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            keepalive_tasks: Arc::new(RwLock::new(HashMap::new())),
+            pool_activity: Arc::new(RwLock::new(HashMap::new())),
+            connection_attempts: RwLock::new(HashMap::new()),
             configs: RwLock::new(HashMap::new()),
             running_queries: RunningQueries::default(),
             tunnels: TunnelManager::new(),
@@ -273,6 +369,8 @@ impl AppState {
                 agent_dir,
                 app_version,
             ),
+            nacos_registry: crate::nacos::NacosAdminRegistry::new(),
+            postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(feature = "mq-admin")]
             mq_registry: crate::mq::MqAdminRegistry::new(),
         }
@@ -311,7 +409,7 @@ impl AppState {
         Ok(PoolKind::ExternalDriver { driver_id: driver_id.to_string(), config: Arc::new(config.clone()), session })
     }
 
-    fn external_driver_runtime_env(&self, driver_id: &str) -> Result<PluginRuntimeEnv, String> {
+    pub fn external_driver_runtime_env(&self, driver_id: &str) -> Result<PluginRuntimeEnv, String> {
         if driver_id != "jdbc" {
             return Ok(PluginRuntimeEnv::default());
         }
@@ -326,36 +424,146 @@ impl AppState {
 
     pub async fn insert_connection_pool(&self, pool_key: String, pool: PoolKind, config: &ConnectionConfig) {
         self.stop_keepalive_task(&pool_key).await;
+        self.pool_activity.write().await.insert(pool_key.clone(), PoolActivity::now());
         self.start_keepalive_task(&pool_key, &pool, config).await;
+        let previous_key = pool_key.clone();
         let previous = self.connections.write().await.insert(pool_key, pool);
         if let Some(pool) = previous {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(previous_key, pool).await;
         }
+    }
+
+    pub async fn begin_connection_attempt(&self, connection_id: &str) -> u64 {
+        let mut attempts = self.connection_attempts.write().await;
+        let next = attempts.get(connection_id).copied().unwrap_or(0).wrapping_add(1);
+        attempts.insert(connection_id.to_string(), next);
+        next
+    }
+
+    pub async fn supersede_connection_attempt(&self, connection_id: &str) {
+        self.begin_connection_attempt(connection_id).await;
+    }
+
+    async fn connection_attempt_is_current(&self, connection_id: &str, attempt: u64) -> bool {
+        self.connection_attempts.read().await.get(connection_id).copied() == Some(attempt)
+    }
+
+    async fn ensure_current_connection_attempt(&self, connection_id: &str, attempt: Option<u64>) -> Result<(), String> {
+        let Some(attempt) = attempt else {
+            return Ok(());
+        };
+        if self.connection_attempt_is_current(connection_id, attempt).await {
+            Ok(())
+        } else {
+            Err("Connection attempt was superseded by a newer attempt".to_string())
+        }
+    }
+
+    pub async fn insert_connection_pool_for_attempt(
+        &self,
+        connection_id: &str,
+        attempt: u64,
+        pool_key: String,
+        pool: PoolKind,
+        config: &ConnectionConfig,
+    ) -> Result<(), String> {
+        if let Err(err) = self.ensure_current_connection_attempt(connection_id, Some(attempt)).await {
+            close_pool_kind_with_timeout(pool_key, pool).await;
+            return Err(err);
+        }
+        self.insert_connection_pool(pool_key, pool, config).await;
+        Ok(())
     }
 
     async fn start_keepalive_task(&self, pool_key: &str, pool: &PoolKind, config: &ConnectionConfig) {
         let interval_secs = config.keepalive_interval_secs;
-        if interval_secs == 0 {
+        let idle_timeout_secs = config.idle_timeout_secs;
+        let idle_cleanup_enabled = is_session_scoped_pool_key(pool_key) && idle_timeout_secs > 0;
+        let mut target = keepalive_target_from_pool(pool, config);
+        if interval_secs == 0 && !idle_cleanup_enabled {
             return;
         }
-        let Some(mut target) = keepalive_target_from_pool(pool, config) else {
+        if interval_secs > 0 && target.is_none() {
             log::debug!(
                 "Connection keepalive requested for '{pool_key}', but this database driver does not keep a pingable client handle."
             );
-            return;
+            if !idle_cleanup_enabled {
+                return;
+            }
         };
 
         let key = pool_key.to_string();
-        let interval = Duration::from_secs(interval_secs.max(1));
+        let interval = if interval_secs > 0 {
+            Duration::from_secs(interval_secs.max(1))
+        } else {
+            Duration::from_secs(idle_timeout_secs.min(60).max(1))
+        };
         let timeout = Duration::from_secs(config.effective_connect_timeout_secs().max(1));
+        let connections = self.connections.clone();
+        let keepalive_tasks = self.keepalive_tasks.clone();
+        let pool_activity = self.pool_activity.clone();
+        let cancel_contexts = self.postgres_cancel_contexts.clone();
+        let running_queries = self.running_queries.clone();
+        let idle_timeout = Duration::from_secs(idle_timeout_secs.max(1));
         let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let result = tokio::time::timeout(timeout, ping_keepalive_target(&mut target, timeout)).await;
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => log::warn!("Connection keepalive failed for '{key}': {err}"),
-                    Err(_) => log::warn!("Connection keepalive timed out for '{key}' after {}s", timeout.as_secs()),
+
+                if running_queries.is_pool_active(&key) {
+                    continue;
+                }
+
+                if idle_cleanup_enabled {
+                    let idle_for = {
+                        let activity = pool_activity.read().await;
+                        activity.get(&key).map(|activity| activity.last_used_at.elapsed())
+                    };
+                    if idle_for.is_some_and(|elapsed| elapsed >= idle_timeout) {
+                        log::info!(
+                            "Closing idle session-scoped connection pool '{key}' after {}s",
+                            idle_timeout.as_secs()
+                        );
+                        keepalive_tasks.write().await.remove(&key);
+                        pool_activity.write().await.remove(&key);
+                        cancel_contexts.write().await.remove(&key);
+                        let removed = connections.write().await.remove(&key);
+                        if let Some(pool) = removed {
+                            close_pool_kind_with_timeout(key, pool).await;
+                        }
+                        break;
+                    }
+                }
+
+                if let Some(target) = target.as_mut() {
+                    let result = tokio::time::timeout(timeout, ping_keepalive_target(target, timeout)).await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            log::warn!("Connection keepalive failed for '{key}': {err}; invalidating pool");
+                            keepalive_tasks.write().await.remove(&key);
+                            pool_activity.write().await.remove(&key);
+                            cancel_contexts.write().await.remove(&key);
+                            let removed = connections.write().await.remove(&key);
+                            if let Some(pool) = removed {
+                                close_pool_kind_with_timeout(key, pool).await;
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            log::warn!(
+                                "Connection keepalive timed out for '{key}' after {}s; invalidating pool",
+                                timeout.as_secs()
+                            );
+                            keepalive_tasks.write().await.remove(&key);
+                            pool_activity.write().await.remove(&key);
+                            cancel_contexts.write().await.remove(&key);
+                            let removed = connections.write().await.remove(&key);
+                            if let Some(pool) = removed {
+                                close_pool_kind_with_timeout(key, pool).await;
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -381,8 +589,34 @@ impl AppState {
         }
     }
 
+    pub async fn touch_pool_activity(&self, pool_key: &str) {
+        self.pool_activity.write().await.insert(pool_key.to_string(), PoolActivity::now());
+    }
+
+    /// Get the PostgreSQL TLS cancel context (used to reconstruct the TLS connector when cancelling a query).
+    pub async fn get_postgres_cancel_context(&self, pool_key: &str) -> Option<db::postgres::PostgresCancelContext> {
+        self.postgres_cancel_contexts.read().await.get(pool_key).cloned()
+    }
+
+    pub fn pool_activity_touch(&self, pool_key: &str) -> PoolActivityTouch {
+        PoolActivityTouch {
+            pool_key: pool_key.to_string(),
+            connections: self.connections.clone(),
+            pool_activity: self.pool_activity.clone(),
+        }
+    }
+
     pub async fn get_or_create_pool(&self, connection_id: &str, database: Option<&str>) -> Result<String, String> {
         self.get_or_create_pool_for_session(connection_id, database, None).await
+    }
+
+    pub async fn get_or_create_pool_for_connection_attempt(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        attempt: u64,
+    ) -> Result<String, String> {
+        self.get_or_create_pool_for_session_inner(connection_id, database, None, Some(attempt)).await
     }
 
     pub async fn get_or_create_pool_for_session(
@@ -390,6 +624,16 @@ impl AppState {
         connection_id: &str,
         database: Option<&str>,
         client_session_id: Option<&str>,
+    ) -> Result<String, String> {
+        self.get_or_create_pool_for_session_inner(connection_id, database, client_session_id, None).await
+    }
+
+    async fn get_or_create_pool_for_session_inner(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: Option<&str>,
+        connection_attempt: Option<u64>,
     ) -> Result<String, String> {
         let db_type = {
             let configs = self.configs.read().await;
@@ -403,6 +647,7 @@ impl AppState {
         if conns.contains_key(&pool_key) {
             drop(conns);
             if !self.remove_stale_connection_pool(&pool_key).await {
+                self.touch_pool_activity(&pool_key).await;
                 return Ok(pool_key);
             }
         } else {
@@ -421,7 +666,7 @@ impl AppState {
         let url = connection_url_for_endpoint(&db_config, &host, port);
         let connect_timeout = std::time::Duration::from_secs(db_config.effective_connect_timeout_secs());
         let idle_timeout = std::time::Duration::from_secs(db_config.idle_timeout_secs);
-        let mysql_pool_max_connections = if normalize_client_session_id(client_session_id).is_some() { 1 } else { 3 };
+        let mysql_pool_max_connections = mysql_pool_max_connections_for_session(client_session_id);
         let pool = match db_config.db_type {
             DatabaseType::Mysql => {
                 let (pool, mode) = connect_mysql_metadata_pool(
@@ -449,7 +694,14 @@ impl AppState {
             | DatabaseType::Gaussdb
             | DatabaseType::Kwdb
             | DatabaseType::Questdb
-            | DatabaseType::OpenGauss => PoolKind::Postgres(db::postgres::connect(&url, connect_timeout).await?),
+            | DatabaseType::OpenGauss => {
+                let pg_pool = db::postgres::connect(&url, connect_timeout).await?;
+                // Build TLS cancel context for reconstructing TLS connection during cancel
+                if let Some(ctx) = db::postgres::build_postgres_cancel_context(&url) {
+                    self.postgres_cancel_contexts.write().await.insert(pool_key.clone(), ctx);
+                }
+                PoolKind::Postgres(pg_pool)
+            }
             DatabaseType::Sqlite => {
                 let extensions = db::sqlite::sqlite_extension_specs_from_url_params(db_config.url_params.as_deref())
                     .into_iter()
@@ -459,11 +711,7 @@ impl AppState {
                     })
                     .collect();
                 PoolKind::Sqlite(
-                    db::sqlite::connect_path_create_if_missing_with_extensions(
-                        &expand_tilde(&db_config.host),
-                        extensions,
-                    )
-                    .await?,
+                    db::sqlite::connect_path_with_extensions(&expand_tilde(&db_config.host), extensions).await?,
                 )
             }
             DatabaseType::Rqlite => {
@@ -540,6 +788,7 @@ impl AppState {
                                 if self.connections.read().await.contains_key(&pool_key) {
                                     return Ok(pool_key);
                                 }
+                                self.ensure_current_connection_attempt(connection_id, connection_attempt).await?;
                                 self.insert_connection_pool(pool_key.clone(), PoolKind::MongoDb(client), &db_config)
                                     .await;
                                 return Ok(pool_key);
@@ -602,10 +851,12 @@ impl AppState {
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Elasticsearch(client)
             }
-            DatabaseType::Qdrant | DatabaseType::Milvus => {
+            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate | DatabaseType::ChromaDb => {
                 let kind = match db_config.db_type {
                     DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                     DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                    DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
+                    DatabaseType::ChromaDb => db::vector_driver::VectorDbKind::ChromaDb,
                     _ => unreachable!(),
                 };
                 let client = db::vector_driver::VectorClient::new(
@@ -626,45 +877,20 @@ impl AppState {
                     &url,
                     username,
                     password,
+                    db_config.url_params.clone(),
                     Some(&db_config.ca_cert_path),
                     connect_timeout,
                 )?;
                 db::influxdb_driver::test_connection(&client, connect_timeout).await?;
                 PoolKind::InfluxDb(client)
             }
-            DatabaseType::Dameng
-            | DatabaseType::Kingbase
-            | DatabaseType::Highgo
-            | DatabaseType::Vastbase
-            | DatabaseType::Goldendb
-            | DatabaseType::Databend
-            | DatabaseType::Yashandb
-            | DatabaseType::Databricks
-            | DatabaseType::SapHana
-            | DatabaseType::Teradata
-            | DatabaseType::Vertica
-            | DatabaseType::Firebird
-            | DatabaseType::Exasol
-            | DatabaseType::OceanbaseOracle
-            | DatabaseType::Gbase
-            | DatabaseType::Oracle
-            | DatabaseType::H2
-            | DatabaseType::Snowflake
-            | DatabaseType::Trino
-            | DatabaseType::Hive
-            | DatabaseType::Db2
-            | DatabaseType::Informix
-            | DatabaseType::Neo4j
-            | DatabaseType::Cassandra
-            | DatabaseType::Bigquery
-            | DatabaseType::Kylin
-            | DatabaseType::Sundb
-            | DatabaseType::Tdengine
-            | DatabaseType::Xugu
-            | DatabaseType::Iotdb
-            | DatabaseType::Etcd
-            | DatabaseType::Iris
-            | DatabaseType::Access => {
+            DatabaseType::Nacos => {
+                let admin_config = self.nacos_admin_config_for_connection(connection_id, &config).await?;
+                let adapter = self.nacos_registry.build_transient_config(admin_config).await?;
+                adapter.test_connection().await?;
+                PoolKind::Nacos
+            }
+            agent_connection_pool_database_type!() => {
                 let connect_params =
                     agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or(""));
                 let mut client =
@@ -672,7 +898,7 @@ impl AppState {
                 let connect_result = client
                     .call_method_with_timeout::<serde_json::Value>(
                         AgentMethod::Connect,
-                        connect_params.clone(),
+                        connect_params,
                         Some(agent_connect_timeout(&db_config)),
                     )
                     .await;
@@ -720,50 +946,15 @@ impl AppState {
                                 fallback_errors.join("\n")
                             ));
                         }
-                    } else if should_retry_oracle_with_10g_driver(&db_config, &err) {
-                        log::warn!(
-                            "Oracle connect failed with profile {:?}: {}. Retrying with legacy Oracle profiles.",
-                            db_config.driver_profile,
-                            err
-                        );
-                        let mut fallback_errors = Vec::new();
-                        let mut connected_client = None;
-                        for profile in oracle_auth_fallback_profiles(&db_config, &err) {
-                            match self.agent_manager.spawn(&db_config.db_type, Some(profile)).await {
-                                Ok(mut fallback_client) => {
-                                    match fallback_client
-                                        .call_method_with_timeout::<serde_json::Value>(
-                                            AgentMethod::Connect,
-                                            connect_params.clone(),
-                                            Some(agent_connect_timeout(&db_config)),
-                                        )
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            connected_client = Some(fallback_client);
-                                            break;
-                                        }
-                                        Err(fallback_err) => {
-                                            fallback_errors.push(format!("{profile}: {fallback_err}"));
-                                        }
-                                    }
-                                }
-                                Err(fallback_err) => {
-                                    fallback_errors.push(format!("{profile}: {fallback_err}"));
-                                }
-                            }
-                        }
-                        client = connected_client.ok_or_else(|| {
-                            format!(
-                                "{err}\n\nFallback with legacy Oracle drivers failed: {}",
-                                fallback_errors.join("\n")
-                            )
-                        })?;
                     } else {
                         return Err(oracle_error_with_driver_hint(&db_config, &err));
                     }
                 }
                 PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
+            }
+            DatabaseType::PrestoSql => {
+                let jdbc_config = prestosql_jdbc_config_for_endpoint(&db_config, &host, port);
+                self.external_driver_pool("jdbc", &jdbc_config).await?
             }
             DatabaseType::Jdbc => {
                 let mut jdbc_config = db_config.clone();
@@ -793,6 +984,10 @@ impl AppState {
             }
         };
 
+        if let Err(err) = self.ensure_current_connection_attempt(connection_id, connection_attempt).await {
+            close_pool_kind_with_timeout(pool_key.clone(), pool).await;
+            return Err(err);
+        }
         self.insert_connection_pool(pool_key.clone(), pool, &db_config).await;
         Ok(pool_key)
     }
@@ -893,7 +1088,25 @@ impl AppState {
         Ok(mqc.with_connect_override(&host, port))
     }
 
+    pub async fn nacos_admin_config_for_connection(
+        &self,
+        connection_id: &str,
+        config: &ConnectionConfig,
+    ) -> Result<crate::nacos::config::NacosAdminConfig, String> {
+        let nacos_config = crate::nacos::config::NacosAdminConfig::from_connection(config)?;
+        if !config.has_effective_transport_layers() {
+            return Ok(nacos_config);
+        }
+
+        let (host, port) = self.connection_host_port(connection_id, config).await?;
+        nacos_config.with_server_endpoint(&host, port)
+    }
+
     async fn remove_stale_connection_pool(&self, pool_key: &str) -> bool {
+        if self.running_queries.is_pool_active(pool_key) {
+            return false;
+        }
+
         let stale = {
             let connections = self.connections.read().await;
             let Some(pool) = connections.get(pool_key) else {
@@ -1053,8 +1266,15 @@ impl AppState {
                     let client = client.clone();
                     drop(connections);
                     let mut agent = client.lock().await;
-                    match agent.test_connection(serde_json::json!({})).await {
+                    let timeout = crate::db::connection_timeout();
+                    match agent.validate_connection(Some(timeout)).await {
                         Ok(_) => false,
+                        Err(err) if is_agent_validate_connection_unsupported(&err) => {
+                            log::debug!(
+                                "Agent connection pool '{pool_key}' does not support validate_connection; keeping pool"
+                            );
+                            false
+                        }
                         Err(err) => {
                             log::warn!("Agent connection pool '{pool_key}' is stale: {err}");
                             true
@@ -1065,7 +1285,8 @@ impl AppState {
                 | PoolKind::DuckDb(_)
                 | PoolKind::ExternalTabular(_)
                 | PoolKind::ExternalDriver { .. }
-                | PoolKind::MessageQueue => false,
+                | PoolKind::MessageQueue
+                | PoolKind::Nacos => false,
             }
         };
 
@@ -1074,9 +1295,11 @@ impl AppState {
         }
 
         self.stop_keepalive_task(pool_key).await;
+        self.pool_activity.write().await.remove(pool_key);
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -1104,9 +1327,11 @@ impl AppState {
             self.reset_connection_transport(connection_id).await;
         } else {
             self.stop_keepalive_task(&pool_key).await;
+            self.pool_activity.write().await.remove(&pool_key);
+            self.postgres_cancel_contexts.write().await.remove(&pool_key);
             let removed = self.connections.write().await.remove(&pool_key);
             if let Some(pool) = removed {
-                close_pool_kind(pool).await;
+                close_pool_kind_with_timeout(pool_key.clone(), pool).await;
             }
         }
         self.get_or_create_pool_for_session(connection_id, database, client_session_id).await
@@ -1132,9 +1357,11 @@ impl AppState {
             return Ok(false);
         }
         self.stop_keepalive_task(&pool_key).await;
+        self.pool_activity.write().await.remove(&pool_key);
+        self.postgres_cancel_contexts.write().await.remove(&pool_key);
         let removed = self.connections.write().await.remove(&pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key, pool).await;
             Ok(true)
         } else {
             Ok(false)
@@ -1143,9 +1370,11 @@ impl AppState {
 
     pub async fn remove_pool_by_key(&self, pool_key: &str) -> bool {
         self.stop_keepalive_task(pool_key).await;
+        self.pool_activity.write().await.remove(pool_key);
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
         let removed = self.connections.write().await.remove(pool_key);
         if let Some(pool) = removed {
-            close_pool_kind(pool).await;
+            close_pool_kind_with_timeout(pool_key.to_string(), pool).await;
             true
         } else {
             false
@@ -1171,17 +1400,25 @@ impl AppState {
             .cloned()
             .collect();
         self.stop_keepalive_tasks(&keys_to_remove).await;
+        {
+            let mut activity = self.pool_activity.write().await;
+            let mut cancel_contexts = self.postgres_cancel_contexts.write().await;
+            for key in &keys_to_remove {
+                activity.remove(key);
+                cancel_contexts.remove(key);
+            }
+        }
         let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
             if let Some(pool) = conns.remove(&key) {
-                removed.push(pool);
+                removed.push((key, pool));
             }
         }
         drop(conns);
         let closed = !removed.is_empty();
-        for pool in removed {
-            close_pool_kind(pool).await;
+        for (key, pool) in removed {
+            close_pool_kind_with_timeout(key, pool).await;
         }
         Ok(closed)
     }
@@ -1279,6 +1516,32 @@ impl AppState {
         .await;
         self.tunnels.stop_tunnel(connection_id).await;
         self.proxy_tunnels.stop_tunnel(connection_id).await;
+    }
+
+    /// Health-check the base connection pool for a given connection_id.
+    /// Returns `Ok(())` if the pool exists and is healthy, `Err` otherwise.
+    /// If the pool is unhealthy it is removed from the map so subsequent
+    /// `get_or_create_pool` calls will transparently recreate it.
+    pub async fn check_connection_health(&self, connection_id: &str) -> Result<(), String> {
+        let db_type = {
+            let configs = self.configs.read().await;
+            configs.get(connection_id).map(|c| c.db_type)
+        };
+        let pool_key = base_pool_key_for(db_type, connection_id, None, false);
+
+        // Check if pool exists first
+        {
+            let connections = self.connections.read().await;
+            if !connections.contains_key(&pool_key) {
+                return Err("No active connection pool found".to_string());
+            }
+        }
+
+        // `remove_stale_connection_pool` returns true if the pool was stale (and removed)
+        if self.remove_stale_connection_pool(&pool_key).await {
+            return Err("Connection pool is unhealthy".to_string());
+        }
+        Ok(())
     }
 
     pub async fn refresh_connections(&self) {
@@ -1408,7 +1671,8 @@ impl AppState {
                 | PoolKind::DuckDb(_)
                 | PoolKind::ExternalTabular(_)
                 | PoolKind::ExternalDriver { .. }
-                | PoolKind::MessageQueue => true,
+                | PoolKind::MessageQueue
+                | PoolKind::Nacos => true,
                 PoolKind::Redis(_) => unreachable!("Redis handled separately"),
             };
             if !healthy {
@@ -1435,12 +1699,21 @@ impl AppState {
         // Remove dead pools
         if !dead_keys.is_empty() {
             self.stop_keepalive_tasks(&dead_keys).await;
-            let mut conns = self.connections.write().await;
-            for key in &dead_keys {
-                if let Some(pool) = conns.remove(key) {
-                    close_pool_kind(pool).await;
+            {
+                let mut activity = self.pool_activity.write().await;
+                for key in &dead_keys {
+                    activity.remove(key);
                 }
             }
+            let mut conns = self.connections.write().await;
+            let mut removed = Vec::with_capacity(dead_keys.len());
+            for key in &dead_keys {
+                if let Some(pool) = conns.remove(key) {
+                    removed.push((key.clone(), pool));
+                }
+            }
+            drop(conns);
+            close_removed_pools(removed).await;
         }
 
         // Re-establish SSH tunnels that have died
@@ -1480,6 +1753,14 @@ impl AppState {
             .cloned()
             .collect();
         self.stop_keepalive_tasks(&keys_to_remove).await;
+        {
+            let mut activity = self.pool_activity.write().await;
+            let mut cancel_contexts = self.postgres_cancel_contexts.write().await;
+            for key in &keys_to_remove {
+                activity.remove(key);
+                cancel_contexts.remove(key);
+            }
+        }
         let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
@@ -1508,6 +1789,12 @@ impl AppState {
             })
             .collect();
         self.stop_keepalive_tasks(&keys_to_remove).await;
+        {
+            let mut activity = self.pool_activity.write().await;
+            for key in &keys_to_remove {
+                activity.remove(key);
+            }
+        }
         let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
@@ -1535,6 +1822,7 @@ enum KeepaliveTarget {
     Elasticsearch(db::elasticsearch_driver::EsClient),
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
+    Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
 }
 
 fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Option<KeepaliveTarget> {
@@ -1552,6 +1840,7 @@ fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Opt
         PoolKind::Elasticsearch(client) => Some(KeepaliveTarget::Elasticsearch(client.clone())),
         PoolKind::VectorDb(client) => Some(KeepaliveTarget::VectorDb(client.clone())),
         PoolKind::InfluxDb(client) => Some(KeepaliveTarget::InfluxDb(client.clone())),
+        PoolKind::Agent(client) => Some(KeepaliveTarget::Agent(client.clone())),
         _ => None,
     }
 }
@@ -1573,13 +1862,33 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
         }
         KeepaliveTarget::ClickHouse(client) => db::clickhouse_driver::test_connection(client, timeout).await,
         KeepaliveTarget::SqlServer(client) => {
-            let mut client = client.lock().await;
+            let Ok(mut client) = client.try_lock() else {
+                return Ok(());
+            };
             db::sqlserver::test_connection(&mut client).await
         }
         KeepaliveTarget::Elasticsearch(client) => db::elasticsearch_driver::test_connection(client, timeout).await,
         KeepaliveTarget::VectorDb(client) => db::vector_driver::test_connection(client, timeout).await,
         KeepaliveTarget::InfluxDb(client) => db::influxdb_driver::test_connection(client, timeout).await,
+        KeepaliveTarget::Agent(client) => {
+            let Ok(mut client) = client.try_lock() else {
+                return Ok(());
+            };
+            match client.validate_connection(Some(timeout)).await {
+                Ok(_) => Ok(()),
+                Err(err) if is_agent_validate_connection_unsupported(&err) => Ok(()),
+                Err(err) => {
+                    client.kill();
+                    Err(err)
+                }
+            }
+        }
     }
+}
+
+fn is_agent_validate_connection_unsupported(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("validate_connection") && (lower.contains("unknown method") || lower.contains("method not found"))
 }
 
 fn connection_remote_endpoint(config: &ConnectionConfig) -> (String, u16) {
@@ -1599,6 +1908,8 @@ fn connection_remote_endpoint(config: &ConnectionConfig) -> (String, u16) {
             .unwrap_or_else(|| (config.host.clone(), config.port))
     } else if config.db_type == DatabaseType::MessageQueue {
         parse_mq_admin_host_port(config).unwrap_or_else(|| (config.host.clone(), config.port))
+    } else if config.db_type == DatabaseType::Nacos {
+        parse_nacos_server_host_port(config).unwrap_or_else(|| (config.host.clone(), config.port))
     } else {
         (config.host.clone(), config.port)
     }
@@ -1621,8 +1932,33 @@ fn parse_mq_admin_host_port(config: &ConnectionConfig) -> Option<(String, u16)> 
     Some((host, port))
 }
 
+fn parse_nacos_server_host_port(config: &ConnectionConfig) -> Option<(String, u16)> {
+    let value = config
+        .external_config
+        .as_ref()?
+        .get("serverAddr")
+        .or_else(|| config.external_config.as_ref()?.get("server_addr"))?
+        .as_str()?
+        .trim();
+    if value.is_empty() {
+        return None;
+    }
+    let url = reqwest::Url::parse(value).ok()?;
+    let host = url.host_str()?.to_string();
+    let port = url.port_or_known_default()?;
+    Some((host, port))
+}
+
 fn normalize_client_session_id(client_session_id: Option<&str>) -> Option<String> {
     client_session_id.map(str::trim).filter(|session| !session.is_empty()).map(|session| session.replace(':', "_"))
+}
+
+fn mysql_pool_max_connections_for_session(client_session_id: Option<&str>) -> usize {
+    if normalize_client_session_id(client_session_id).is_some() {
+        1
+    } else {
+        10
+    }
 }
 
 fn redis_cluster_transport_prefix(connection_id: &str) -> String {
@@ -1642,6 +1978,10 @@ fn session_scoped_pool_key(base_pool_key: String, client_session_id: Option<&str
     normalize_client_session_id(client_session_id)
         .map(|session| format!("{base_pool_key}:session:{session}"))
         .unwrap_or(base_pool_key)
+}
+
+fn is_session_scoped_pool_key(pool_key: &str) -> bool {
+    pool_key.contains(":session:")
 }
 
 pub(crate) fn config_for_pool_key<'a>(
@@ -1691,6 +2031,7 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
             PoolKind::ExternalDriver { driver_id: driver_id.clone(), config: config.clone(), session: session.clone() }
         }
         PoolKind::MessageQueue => PoolKind::MessageQueue,
+        PoolKind::Nacos => PoolKind::Nacos,
         PoolKind::Redis(_) => panic!("clone_pool_kind not supported for Redis — handled separately"),
     }
 }
@@ -1740,6 +2081,7 @@ pub async fn close_pool_kind(pool: PoolKind) {
             session.shutdown().await;
         }
         PoolKind::MessageQueue => {}
+        PoolKind::Nacos => {}
     }
 }
 
@@ -1789,7 +2131,14 @@ fn base_pool_key_for(
     let is_single_connection_pool = db_type.as_ref().is_some_and(|db_type| {
         let is_single = database_capabilities::is_single_connection_pool(db_type)
             || (include_elasticsearch_single_pool
-                && matches!(db_type, DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus));
+                && matches!(
+                    db_type,
+                    DatabaseType::Elasticsearch
+                        | DatabaseType::Qdrant
+                        | DatabaseType::Milvus
+                        | DatabaseType::Weaviate
+                        | DatabaseType::ChromaDb
+                ));
         is_single && (!database_capabilities::is_agent_type(db_type) || shares_database_pool_with_connection(db_type))
     });
 
@@ -1805,6 +2154,11 @@ fn base_pool_key_for(
 
 fn shares_database_pool_with_connection(db_type: &DatabaseType) -> bool {
     matches!(db_type, DatabaseType::Oracle)
+}
+
+#[cfg(test)]
+fn uses_agent_connection_pool(db_type: &DatabaseType) -> bool {
+    matches!(*db_type, agent_connection_pool_database_type!())
 }
 
 #[cfg(test)]
@@ -1998,12 +2352,13 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
 mod tests {
     use super::{
         agent_connect_timeout, connection_remote_endpoint, connection_url_for_endpoint, database_connection_config,
-        metadata_connection_config, mysql_metadata_fallback_url, redacted_connection_url_for_endpoint,
-        uses_bare_mysql_pool, uses_tcp_probe, validate_h2_database_path, AppState, PoolKind,
+        metadata_connection_config, mysql_metadata_fallback_url, prestosql_jdbc_config_for_endpoint,
+        redacted_connection_url_for_endpoint, uses_bare_mysql_pool, uses_tcp_probe, validate_h2_database_path,
+        AppState, PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
-        oracle_alternate_connect_config, should_retry_mongo_with_legacy_driver, should_retry_oracle_with_10g_driver,
+        oracle_alternate_connect_config, should_retry_mongo_with_legacy_driver,
     };
     use crate::agent_manager::{AgentState, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY};
     use crate::database_capabilities;
@@ -2030,6 +2385,7 @@ mod tests {
             password: "secret".to_string(),
             database: database.map(str::to_string),
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),
@@ -2052,6 +2408,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -2086,6 +2443,32 @@ mod tests {
     }
 
     #[test]
+    fn prestosql_jdbc_config_sets_presto_url_and_driver_class() {
+        let mut config = mysql_config(Some("hive/default"));
+        config.db_type = DatabaseType::PrestoSql;
+        config.host = "presto.example.com".to_string();
+        config.port = 9090;
+
+        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "127.0.0.1", 19090);
+
+        assert_eq!(jdbc_config.connection_string.as_deref(), Some("jdbc:presto://127.0.0.1:19090/hive/default"));
+        assert_eq!(jdbc_config.jdbc_driver_class.as_deref(), Some(PRESTOSQL_JDBC_DRIVER_CLASS));
+    }
+
+    #[test]
+    fn prestosql_jdbc_config_preserves_custom_driver_class_and_paths() {
+        let mut config = mysql_config(Some("hive"));
+        config.db_type = DatabaseType::PrestoSql;
+        config.jdbc_driver_class = Some("custom.PrestoDriver".to_string());
+        config.jdbc_driver_paths = vec!["D:\\software\\jar\\presto-jdbc-350.jar".to_string()];
+
+        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "presto.example.com", 9090);
+
+        assert_eq!(jdbc_config.jdbc_driver_class.as_deref(), Some("custom.PrestoDriver"));
+        assert_eq!(jdbc_config.jdbc_driver_paths, vec!["D:\\software\\jar\\presto-jdbc-350.jar"]);
+    }
+
+    #[test]
     fn agent_connect_params_include_url_params() {
         let mut config = mysql_config(Some("testdb"));
         config.username = "informix".to_string();
@@ -2109,6 +2492,7 @@ mod tests {
         assert!(uses_bare_mysql_pool(&DatabaseType::ManticoreSearch));
         assert!(!uses_bare_mysql_pool(&DatabaseType::Databend));
         assert!(database_capabilities::is_agent_type(&DatabaseType::Databend));
+        assert!(super::uses_agent_connection_pool(&DatabaseType::ZooKeeper));
     }
 
     #[test]
@@ -2269,33 +2653,6 @@ mod tests {
     }
 
     #[test]
-    fn oracle_retry_guard_only_triggers_for_non_10g_listener_errors() {
-        let mut config = mysql_config(Some("ORCL"));
-        config.db_type = DatabaseType::Oracle;
-        config.driver_profile = Some("oracle".to_string());
-
-        assert!(!should_retry_oracle_with_10g_driver(
-            &config,
-            "Agent RPC error (-1): ORA-28040: No matching authentication protocol"
-        ));
-        assert!(!should_retry_oracle_with_10g_driver(&config, "Agent RPC error (-1): ORA-12541: TNS:no listener"));
-        assert!(!should_retry_oracle_with_10g_driver(&config, "host xxx port 1521 中没有监听程序"));
-
-        config.driver_profile = Some("oracle-10g".to_string());
-        assert!(!should_retry_oracle_with_10g_driver(&config, "Agent RPC error (-1): ORA-12541: TNS:no listener"));
-        assert!(!should_retry_oracle_with_10g_driver(
-            &config,
-            "Agent RPC error (-1): ORA-28040: No matching authentication protocol"
-        ));
-
-        config.driver_profile = Some("oracle".to_string());
-        assert!(!should_retry_oracle_with_10g_driver(
-            &config,
-            "Agent RPC error (-1): ORA-01017: invalid username/password"
-        ));
-    }
-
-    #[test]
     fn oracle_listener_errors_can_retry_with_alternate_connect_descriptor() {
         let mut config = mysql_config(Some("ORCL"));
         config.db_type = DatabaseType::Oracle;
@@ -2323,15 +2680,12 @@ mod tests {
     }
 
     #[test]
-    fn oracle_alternate_descriptor_retry_skips_non_listener_errors_and_10g_profiles() {
+    fn oracle_alternate_descriptor_retry_skips_non_listener_errors() {
         let mut config = mysql_config(Some("ORCL"));
         config.db_type = DatabaseType::Oracle;
         config.driver_profile = Some("oracle".to_string());
 
         assert!(oracle_alternate_connect_config(&config, "ORA-01017: invalid username/password").is_none());
-
-        config.driver_profile = Some("oracle-10g".to_string());
-        assert!(oracle_alternate_connect_config(&config, "ORA-12514: listener does not know service").is_none());
     }
 
     #[test]
@@ -2397,6 +2751,48 @@ mod tests {
         );
 
         assert_eq!(state.agent_manager.base_dir(), &agent_dir);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn stale_connection_attempt_cannot_replace_newer_pool() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.name = "SQLite".to_string();
+        config.db_type = DatabaseType::Sqlite;
+        config.host = dir.join("current.db").to_string_lossy().to_string();
+        let old_attempt = state.begin_connection_attempt("conn").await;
+        let new_attempt = state.begin_connection_attempt("conn").await;
+        let current_pool =
+            db::sqlite::connect_path_create_if_missing(&dir.join("current.db").to_string_lossy()).await.unwrap();
+        let stale_pool =
+            db::sqlite::connect_path_create_if_missing(&dir.join("stale.db").to_string_lossy()).await.unwrap();
+
+        state
+            .insert_connection_pool_for_attempt(
+                "conn",
+                new_attempt,
+                "conn".to_string(),
+                PoolKind::Sqlite(current_pool),
+                &config,
+            )
+            .await
+            .unwrap();
+
+        let result = state
+            .insert_connection_pool_for_attempt(
+                "conn",
+                old_attempt,
+                "conn".to_string(),
+                PoolKind::Sqlite(stale_pool),
+                &config,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let conns = state.connections.read().await;
+        assert!(matches!(conns.get("conn"), Some(PoolKind::Sqlite(_))));
+        assert_eq!(conns.len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2711,7 +3107,37 @@ mod tests {
     }
 
     #[test]
-    fn mysql_direct_connections_skip_tcp_probe() {
+    fn session_scoped_pool_keys_are_sanitized_and_detected() {
+        let key = super::session_scoped_pool_key_for(
+            Some(DatabaseType::Mysql),
+            "mysql-conn:analytics".to_string(),
+            Some("tab-1:count"),
+        );
+
+        assert_eq!(key, "mysql-conn:analytics:session:tab-1_count");
+        assert!(super::is_session_scoped_pool_key(&key));
+        assert!(!super::is_session_scoped_pool_key("mysql-conn:analytics"));
+        assert_eq!(
+            super::session_scoped_pool_key_for(Some(DatabaseType::DuckDb), "duckdb-conn".to_string(), Some("tab-1")),
+            "duckdb-conn"
+        );
+    }
+
+    #[test]
+    fn mysql_pool_size_keeps_session_pools_single_connection() {
+        assert_eq!(super::mysql_pool_max_connections_for_session(None), 10);
+        assert_eq!(super::mysql_pool_max_connections_for_session(Some("")), 10);
+        assert_eq!(super::mysql_pool_max_connections_for_session(Some("tab-1")), 1);
+    }
+
+    #[test]
+    fn prestosql_uses_external_driver_pool_not_agent_pool() {
+        assert!(!super::uses_agent_connection_pool(&DatabaseType::PrestoSql));
+        assert!(super::uses_agent_connection_pool(&DatabaseType::Trino));
+    }
+
+    #[test]
+    fn mysql_hostname_connections_skip_tcp_probe() {
         let mut config = mysql_config(Some("app"));
         config.host = "mysql.example.com".to_string();
 
@@ -2829,6 +3255,48 @@ mod tests {
         assert!(conns.contains_key("other"));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pool_activity_touch_updates_existing_pool_only() {
+        let (state, dir) = test_app_state().await;
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        let pool_key = "conn:session:tab-1";
+
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Sqlite(pool));
+        state.pool_activity.write().await.insert(
+            pool_key.to_string(),
+            super::PoolActivity { last_used_at: std::time::Instant::now() - std::time::Duration::from_secs(10) },
+        );
+
+        {
+            let _touch = state.pool_activity_touch(pool_key);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let elapsed = state.pool_activity.read().await.get(pool_key).unwrap().last_used_at.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(10));
+
+        {
+            let _touch = state.pool_activity_touch(pool_key);
+            state.connections.write().await.remove(pool_key);
+            state.pool_activity.write().await.remove(pool_key);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!state.pool_activity.read().await.contains_key(pool_key));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_validate_connection_unknown_method_is_not_stale() {
+        assert!(super::is_agent_validate_connection_unsupported(
+            "Agent RPC error (-1): Unknown method: validate_connection"
+        ));
+        assert!(super::is_agent_validate_connection_unsupported(
+            "Agent RPC error (-32601): Method not found: validate_connection"
+        ));
+        assert!(!super::is_agent_validate_connection_unsupported("Agent RPC error (-1): Connection timed out"));
+        assert!(!super::is_agent_validate_connection_unsupported("Agent RPC error (-1): Unknown method: kv_put"));
     }
 
     #[cfg(feature = "duckdb-bundled")]
@@ -2954,6 +3422,62 @@ mod tests {
         assert_eq!(connect_override.host, "127.0.0.1");
         assert_ne!(connect_override.port, 8443);
         state.proxy_tunnels.stop_tunnel("proxied-mq:transport:0").await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn nacos_admin_config_allows_domain_server_addr_without_transport_override() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "aliyun-nacos".to_string();
+        config.db_type = DatabaseType::Nacos;
+        config.host = "example.com".to_string();
+        config.port = 8848;
+        config.external_config = Some(serde_json::json!({
+            "serverAddr": "https://nacos.aliyuncs.com:8848",
+            "namespace": "public",
+            "contextPath": "/nacos",
+            "auth": { "kind": "none" }
+        }));
+
+        let nacos_config = state.nacos_admin_config_for_connection("aliyun-nacos", &config).await.unwrap();
+
+        assert_eq!(nacos_config.server_addr, "https://nacos.aliyuncs.com:8848");
+        assert!(nacos_config.connect_override.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn nacos_admin_config_rewrites_server_addr_to_forwarded_endpoint() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "proxied-nacos".to_string();
+        config.db_type = DatabaseType::Nacos;
+        config.host = "192.168.2.51".to_string();
+        config.port = 10840;
+        config.external_config = Some(serde_json::json!({
+            "serverAddr": "http://192.168.2.51:10840",
+            "namespace": "public",
+            "contextPath": "",
+            "auth": { "kind": "none" }
+        }));
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 65000,
+            username: String::new(),
+            password: String::new(),
+        })];
+
+        let nacos_config = state.nacos_admin_config_for_connection("proxied-nacos", &config).await.unwrap();
+
+        assert!(nacos_config.server_addr.starts_with("http://127.0.0.1:"));
+        assert_ne!(nacos_config.server_addr, "http://192.168.2.51:10840");
+        assert!(nacos_config.connect_override.is_none());
+        state.proxy_tunnels.stop_tunnel("proxied-nacos:transport:0").await;
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -41,11 +41,23 @@ pub(crate) fn value_to_csv_text(value: &Value) -> String {
     }
 }
 
-fn value_to_query_result_csv_text(value: &Value) -> String {
+pub(crate) fn value_to_query_result_csv_text(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         other => value_to_csv_text(other),
     }
+}
+
+/// Format query-result rows as CSV text without a header row, using the
+/// query-result NULL semantics (NULL → "NULL"). Used by the streaming
+/// query-result export for batches after the first.
+pub fn format_query_result_csv_rows(rows: &[Vec<Value>]) -> String {
+    rows.iter()
+        .map(|row| {
+            row.iter().map(|cell| escape_csv(&value_to_query_result_csv_text(cell))).collect::<Vec<_>>().join(",")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_csv_with_value_formatter(
@@ -108,6 +120,7 @@ pub async fn export_table_data_csv_core(state: &AppState, options: TableCsvExpor
             database_type: Some(database_type),
             schema: options.schema.clone(),
             table_name: options.table_name.clone(),
+            table_type: None,
             primary_keys: Vec::new(),
             columns: options.columns.clone(),
             fallback_order_columns: Vec::new(),

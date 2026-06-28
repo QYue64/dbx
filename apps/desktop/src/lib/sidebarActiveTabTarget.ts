@@ -25,9 +25,18 @@ export type ActiveTabSidebarTarget =
       connectionId: string;
     }
   | {
+      type: "zookeeper-root";
+      connectionId: string;
+    }
+  | {
       type: "mq-tenant";
       connectionId: string;
       tenant: string;
+    }
+  | {
+      type: "nacos-namespace";
+      connectionId: string;
+      namespace: string;
     }
   | {
       type: "query-context";
@@ -80,8 +89,16 @@ export function activeTabSidebarTarget(tab: QueryTab | undefined | null): Active
     return { type: "etcd-root", connectionId: tab.connectionId };
   }
 
+  if (tab.mode === "zookeeper") {
+    return { type: "zookeeper-root", connectionId: tab.connectionId };
+  }
+
   if (tab.mode === "mq" && tab.mqTenant) {
     return { type: "mq-tenant", connectionId: tab.connectionId, tenant: tab.mqTenant };
+  }
+
+  if (tab.mode === "nacos") {
+    return { type: "nacos-namespace", connectionId: tab.connectionId, namespace: tab.nacosNamespace || "" };
   }
 
   if (tab.savedSqlId) {
@@ -129,8 +146,16 @@ export function matchesTarget(node: TreeNode, target: ActiveTabSidebarTarget): b
     return node.type === "etcd-root" && node.connectionId === target.connectionId;
   }
 
+  if (target.type === "zookeeper-root") {
+    return node.type === "zookeeper-root" && node.connectionId === target.connectionId;
+  }
+
   if (target.type === "mq-tenant") {
     return node.type === "mq-tenant" && node.connectionId === target.connectionId && (node.mqTenant || node.label) === target.tenant;
+  }
+
+  if (target.type === "nacos-namespace") {
+    return node.type === "nacos-namespace" && node.connectionId === target.connectionId && (node.nacosNamespace || "") === target.namespace;
   }
 
   if (target.type === "saved-sql-file") {
@@ -155,16 +180,16 @@ export function shouldScrollActiveSidebarSelection(options: { activeTabId: strin
   return options.activeTabId !== options.previousActiveTabId || (options.autoSelectEnabled && options.previousAutoSelectEnabled === false);
 }
 
-export function scrollTopForSidebarNode(options: { index: number; currentScrollTop: number; viewportHeight: number; rowHeight?: number }): number {
+export function scrollTopForSidebarNode(options: { index: number; currentScrollTop: number; viewportHeight: number; rowHeight?: number; topOcclusionHeight?: number }): number {
   const rowHeight = options.rowHeight ?? SIDEBAR_TREE_ROW_HEIGHT;
   if (options.index < 0 || options.viewportHeight <= 0) return options.currentScrollTop;
 
   const rowTop = options.index * rowHeight;
   const rowBottom = rowTop + rowHeight;
-  const viewportTop = options.currentScrollTop;
+  const viewportTop = options.currentScrollTop + (options.topOcclusionHeight ?? 0);
   const viewportBottom = options.currentScrollTop + options.viewportHeight;
 
-  if (rowTop < viewportTop) return rowTop;
+  if (rowTop < viewportTop) return Math.max(0, rowTop - (options.topOcclusionHeight ?? 0));
   if (rowBottom > viewportBottom) return Math.max(0, rowBottom - options.viewportHeight);
   return options.currentScrollTop;
 }

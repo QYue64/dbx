@@ -6,7 +6,11 @@ use tokio::sync::RwLock;
 
 use crate::models::connection::DatabaseType;
 use crate::sql_dialect::{qualified_table_name, quote_table_identifier};
-use crate::transfer::{format_ch_array_sql_literal, format_pg_array_sql_literal};
+use crate::transfer::{
+    format_ch_array_sql_literal, format_pg_array_sql_literal, is_identity_column_extra, quote_identifier,
+    selected_columns_include_identity_extras, wrap_dameng_identity_insert_sql,
+    wrap_dameng_identity_insert_sql_for_table,
+};
 
 static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
@@ -55,6 +59,21 @@ pub const DATABASE_EXPORT_ROW_LIMIT: usize = 10_000;
 pub const DATABASE_EXPORT_PAGE_SIZE: usize = 500;
 pub const DATABASE_EXPORT_INSERT_BATCH_SIZE: usize = 100;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostgresExportSequence {
+    name: String,
+    data_type: String,
+    start_value: String,
+    min_value: String,
+    max_value: String,
+    increment: String,
+    cycle: bool,
+    cache_value: String,
+    last_value: Option<String>,
+    owner_table: Option<String>,
+    owner_column: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportedTableSql {
@@ -73,6 +92,8 @@ pub struct ExportedTableSql {
     pub columns: Vec<String>,
     #[serde(default)]
     pub column_types: Vec<Option<String>>,
+    #[serde(default)]
+    pub column_extras: Vec<Option<String>>,
     #[serde(default)]
     pub rows: Vec<Vec<Value>>,
     #[serde(default)]
@@ -94,6 +115,8 @@ pub struct BuildExportInsertStatementsOptions {
     pub columns: Vec<String>,
     #[serde(default)]
     pub column_types: Vec<Option<String>>,
+    #[serde(default)]
+    pub column_extras: Vec<Option<String>>,
     #[serde(default)]
     pub rows: Vec<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,6 +262,10 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
         .collect::<Vec<_>>()
         .join(", ");
     let mut statements = Vec::new();
+    let needs_dameng_identity_insert = options.database_type == Some(DatabaseType::Dameng)
+        && insert_columns.iter().any(|(index, _)| {
+            is_identity_column_extra(options.column_extras.get(*index).and_then(|value| value.as_deref()))
+        });
 
     for rows in options.rows.chunks(batch_size) {
         let values = rows
@@ -260,7 +287,12 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
             })
             .collect::<Vec<_>>()
             .join(", ");
-        statements.push(format!("INSERT INTO {table} ({columns}) VALUES {values};"));
+        let insert_sql = format!("INSERT INTO {table} ({columns}) VALUES {values};");
+        if needs_dameng_identity_insert {
+            statements.push(wrap_dameng_identity_insert_sql_for_table(&insert_sql, &table));
+        } else {
+            statements.push(insert_sql);
+        }
     }
 
     Ok(statements)
@@ -314,6 +346,7 @@ pub fn build_database_sql_export(options: BuildDatabaseSqlExportOptions) -> Resu
             qualified_table_name: table.qualified_table_name,
             columns: table.columns,
             column_types: table.column_types,
+            column_extras: table.column_extras,
             rows: table.rows,
             batch_size: Some(insert_batch_size),
         })?;
@@ -352,6 +385,156 @@ fn normalize_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>) ->
         std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bROW_FORMAT\s*=\s*(COMPACT|REDUNDANT)\b").unwrap());
 
     LEGACY_MYSQL_ROW_FORMAT_RE.replace_all(ddl, "ROW_FORMAT=DYNAMIC").into_owned()
+}
+
+fn postgres_sequence_qualified_name(schema: &str, sequence_name: &str) -> String {
+    let db_type = DatabaseType::Postgres;
+    if schema.trim().is_empty() {
+        quote_identifier(sequence_name, &db_type)
+    } else {
+        format!("{}.{}", quote_identifier(schema, &db_type), quote_identifier(sequence_name, &db_type))
+    }
+}
+
+fn postgres_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn generate_postgres_sequence_create_ddl(sequence: &PostgresExportSequence, schema: &str) -> String {
+    let qualified_name = postgres_sequence_qualified_name(schema, &sequence.name);
+    let cycle = if sequence.cycle { "CYCLE" } else { "NO CYCLE" };
+    format!(
+        "CREATE SEQUENCE IF NOT EXISTS {qualified_name}\n  AS {data_type}\n  START WITH {start_value}\n  INCREMENT BY {increment}\n  MINVALUE {min_value}\n  MAXVALUE {max_value}\n  CACHE {cache_value}\n  {cycle}",
+        data_type = sequence.data_type,
+        start_value = sequence.start_value,
+        increment = sequence.increment,
+        min_value = sequence.min_value,
+        max_value = sequence.max_value,
+        cache_value = sequence.cache_value,
+    )
+}
+
+fn generate_postgres_sequence_owner_ddl(sequence: &PostgresExportSequence, schema: &str) -> Option<String> {
+    let owner_table = sequence.owner_table.as_deref()?;
+    let owner_column = sequence.owner_column.as_deref()?;
+    Some(format!(
+        "ALTER SEQUENCE {} OWNED BY {}.{}",
+        postgres_sequence_qualified_name(schema, &sequence.name),
+        crate::transfer::qualified_table(owner_table, schema, &DatabaseType::Postgres),
+        quote_identifier(owner_column, &DatabaseType::Postgres)
+    ))
+}
+
+fn generate_postgres_sequence_setval_sql(sequence: &PostgresExportSequence, schema: &str) -> Option<String> {
+    let last_value = sequence.last_value.as_deref()?.trim();
+    if last_value.is_empty() {
+        return None;
+    }
+
+    let sequence_literal = postgres_string_literal(&postgres_sequence_qualified_name(schema, &sequence.name));
+    match (sequence.owner_table.as_deref(), sequence.owner_column.as_deref()) {
+        (Some(owner_table), Some(owner_column)) => {
+            let owner_table = crate::transfer::qualified_table(owner_table, schema, &DatabaseType::Postgres);
+            let owner_column = quote_identifier(owner_column, &DatabaseType::Postgres);
+            Some(format!(
+                "SELECT setval({sequence_literal}, GREATEST(COALESCE(MAX({owner_column}), {last_value}), {last_value}), true) FROM {owner_table}"
+            ))
+        }
+        _ => Some(format!("SELECT setval({sequence_literal}, {last_value}, true)")),
+    }
+}
+
+async fn list_postgres_export_sequences(
+    state: &crate::connection::AppState,
+    pool_key: &str,
+    schema: &str,
+    selected_tables: &[String],
+    include_objects: bool,
+) -> Result<Vec<PostgresExportSequence>, String> {
+    let pool = {
+        let connections = state.connections.read().await;
+        match connections.get(pool_key) {
+            Some(crate::connection::PoolKind::Postgres(pool)) => pool.clone(),
+            _ => return Ok(Vec::new()),
+        }
+    };
+    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let rows = client
+        .query(
+            "SELECT c.relname, \
+              COALESCE(format_type(s.seqtypid, NULL), 'bigint'), \
+              COALESCE(s.seqstart::text, '1'), \
+              COALESCE(s.seqmin::text, '1'), \
+              COALESCE(s.seqmax::text, '9223372036854775807'), \
+              COALESCE(s.seqincrement::text, '1'), \
+              COALESCE(s.seqcycle, false), \
+              COALESCE(s.seqcache::text, '1'), \
+              t.relname, \
+              a.attname \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_sequence s ON s.seqrelid = c.oid \
+             LEFT JOIN pg_depend d ON d.classid = 'pg_class'::regclass \
+               AND d.objid = c.oid \
+               AND d.refclassid = 'pg_class'::regclass \
+               AND d.deptype IN ('a', 'i') \
+             LEFT JOIN pg_class t ON t.oid = d.refobjid \
+             LEFT JOIN pg_namespace tn ON tn.oid = t.relnamespace AND tn.nspname = n.nspname \
+             LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid \
+             WHERE c.relkind = 'S' AND n.nspname = $1 \
+             ORDER BY c.relname",
+            &[&schema],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let selected: HashSet<&str> = selected_tables.iter().map(String::as_str).collect();
+    let mut sequences = rows
+        .iter()
+        .map(|row| PostgresExportSequence {
+            name: row.get::<_, String>(0),
+            data_type: row.get::<_, String>(1),
+            start_value: row.get::<_, String>(2),
+            min_value: row.get::<_, String>(3),
+            max_value: row.get::<_, String>(4),
+            increment: row.get::<_, String>(5),
+            cycle: row.get::<_, bool>(6),
+            cache_value: row.get::<_, String>(7),
+            last_value: None,
+            owner_table: row.get::<_, Option<String>>(8),
+            owner_column: row.get::<_, Option<String>>(9),
+        })
+        .filter(|sequence| {
+            selected.is_empty()
+                || sequence.owner_table.as_deref().map(|owner_table| selected.contains(owner_table)).unwrap_or(false)
+        })
+        .filter(|sequence| sequence.owner_table.is_some() || (include_objects && selected.is_empty()))
+        .collect::<Vec<_>>();
+
+    if sequences.is_empty() {
+        return Ok(sequences);
+    }
+
+    if let Ok(rows) = client
+        .query(
+            "SELECT c.relname, pg_sequence_last_value(c.oid)::text \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'S' AND n.nspname = $1",
+            &[&schema],
+        )
+        .await
+    {
+        for row in rows {
+            let name: String = row.get(0);
+            let last_value: Option<String> = row.get(1);
+            if let Some(sequence) = sequences.iter_mut().find(|sequence| sequence.name == name) {
+                sequence.last_value = last_value;
+            }
+        }
+    }
+
+    Ok(sequences)
 }
 
 pub async fn is_export_cancelled(export_id: &str) -> bool {
@@ -413,8 +596,28 @@ pub async fn export_database_sql_core(
     }
 
     // 7. Separate tables and views
-    let mut tables: Vec<_> = all_tables.iter().filter(|t| t.table_type != "VIEW").collect();
-    let views: Vec<_> = all_tables.iter().filter(|t| t.table_type == "VIEW").collect();
+    let mut tables: Vec<_> = all_tables.iter().filter(|t| !t.table_type.contains("VIEW")).collect();
+    let views: Vec<_> = all_tables.iter().filter(|t| t.table_type.contains("VIEW")).collect();
+    let postgres_sequences = if request.include_structure && matches!(db_type, DatabaseType::Postgres) {
+        match list_postgres_export_sequences(
+            state,
+            &pool_key,
+            &request.schema,
+            &request.selected_tables,
+            request.include_objects,
+        )
+        .await
+        {
+            Ok(sequences) => sequences,
+            Err(e) => {
+                writeln!(file, "-- ERROR exporting sequences: {e}")
+                    .map_err(|e| format!("Failed to write file: {e}"))?;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     // Sort tables by foreign key dependency so referenced (parent) tables are
     // exported before referencing (child) tables.
@@ -435,7 +638,7 @@ pub async fn export_database_sql_core(
     }
 
     // 8. Calculate total objects
-    let mut total_objects = tables.len() + views.len();
+    let mut total_objects = tables.len() + views.len() + postgres_sequences.len();
 
     // We'll add procedures/functions count later if include_objects
     let mut procedures: Vec<String> = Vec::new();
@@ -461,6 +664,27 @@ pub async fn export_database_sql_core(
 
     // Export tables
     let batch_size = if request.batch_size == 0 { 1000 } else { request.batch_size };
+
+    for sequence in postgres_sequences.iter().filter(|sequence| sequence.owner_table.is_none()) {
+        if is_export_cancelled(&request.export_id).await {
+            return Err("Export cancelled".to_string());
+        }
+
+        on_progress(ExportProgress {
+            export_id: request.export_id.clone(),
+            current_object: sequence.name.clone(),
+            object_index,
+            total_objects,
+            rows_exported: 0,
+            total_rows: None,
+            status: ExportStatus::Running,
+            error: None,
+        });
+
+        writeln!(file, "{};\n", generate_postgres_sequence_create_ddl(sequence, &request.schema))
+            .map_err(|e| format!("Failed to write file: {e}"))?;
+        object_index += 1;
+    }
 
     for table_info in &tables {
         // Check cancellation
@@ -497,6 +721,25 @@ pub async fn export_database_sql_core(
             if request.drop_table_if_exists {
                 writeln!(file, "{}\n", drop_table_if_exists_sql(table_name, &request.schema, &db_type))
                     .map_err(|e| format!("Failed to write file: {e}"))?;
+            }
+            for sequence in postgres_sequences
+                .iter()
+                .filter(|sequence| sequence.owner_table.as_deref() == Some(table_name.as_str()))
+            {
+                on_progress(ExportProgress {
+                    export_id: request.export_id.clone(),
+                    current_object: sequence.name.clone(),
+                    object_index,
+                    total_objects,
+                    rows_exported: 0,
+                    total_rows: None,
+                    status: ExportStatus::Running,
+                    error: None,
+                });
+
+                writeln!(file, "{};\n", generate_postgres_sequence_create_ddl(sequence, &request.schema))
+                    .map_err(|e| format!("Failed to write file: {e}"))?;
+                object_index += 1;
             }
             match crate::schema::get_table_ddl_core(
                 state,
@@ -541,6 +784,7 @@ pub async fn export_database_sql_core(
             };
             let col_names = columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
             let col_types = columns.iter().map(|c| Some(c.data_type.clone())).collect::<Vec<_>>();
+            let col_extras = columns.iter().map(|c| c.extra.clone()).collect::<Vec<_>>();
 
             if !col_names.is_empty() {
                 // Get row count
@@ -597,7 +841,7 @@ pub async fn export_database_sql_core(
                         break;
                     }
 
-                    let insert_sql = crate::transfer::generate_insert_typed(
+                    let mut insert_sql = crate::transfer::generate_insert_typed(
                         &col_names,
                         &col_types,
                         &result.rows,
@@ -605,9 +849,18 @@ pub async fn export_database_sql_core(
                         &request.schema,
                         &db_type,
                     );
+                    if db_type == DatabaseType::Dameng
+                        && selected_columns_include_identity_extras(&col_names, &col_extras)
+                    {
+                        insert_sql = wrap_dameng_identity_insert_sql(&insert_sql, table_name, &request.schema);
+                    }
 
                     if !insert_sql.is_empty() {
-                        writeln!(file, "{};\n", insert_sql).map_err(|e| format!("Failed to write file: {e}"))?;
+                        if insert_sql.trim_end().ends_with(';') {
+                            writeln!(file, "{}\n", insert_sql).map_err(|e| format!("Failed to write file: {e}"))?;
+                        } else {
+                            writeln!(file, "{};\n", insert_sql).map_err(|e| format!("Failed to write file: {e}"))?;
+                        }
                     }
 
                     rows_exported += row_count as u64;
@@ -632,6 +885,19 @@ pub async fn export_database_sql_core(
         }
 
         object_index += 1;
+    }
+
+    if request.include_structure && !postgres_sequences.is_empty() {
+        for sequence in &postgres_sequences {
+            if let Some(sql) = generate_postgres_sequence_owner_ddl(sequence, &request.schema) {
+                writeln!(file, "{};\n", sql).map_err(|e| format!("Failed to write file: {e}"))?;
+            }
+        }
+        for sequence in &postgres_sequences {
+            if let Some(sql) = generate_postgres_sequence_setval_sql(sequence, &request.schema) {
+                writeln!(file, "{};\n", sql).map_err(|e| format!("Failed to write file: {e}"))?;
+            }
+        }
     }
 
     // Export views (if include_objects)
@@ -800,8 +1066,9 @@ fn drop_table_if_exists_sql(table_name: &str, schema: &str, db_type: &DatabaseTy
 mod tests {
     use super::{
         build_database_sql_export, build_export_insert_statements, drop_table_if_exists_sql,
-        filter_selected_table_infos, format_export_sql_literal, normalize_export_table_ddl,
-        BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, ExportedTableSql,
+        filter_selected_table_infos, format_export_sql_literal, generate_postgres_sequence_create_ddl,
+        generate_postgres_sequence_owner_ddl, generate_postgres_sequence_setval_sql, normalize_export_table_ddl,
+        BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, ExportedTableSql, PostgresExportSequence,
         DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
     };
     use crate::models::connection::DatabaseType;
@@ -867,6 +1134,7 @@ mod tests {
             qualified_table_name: None,
             columns: vec!["id".to_string(), "name".to_string()],
             column_types: Vec::new(),
+            column_extras: Vec::new(),
             rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("O'Hara")], vec![json!(3), json!("Linus")]],
             batch_size: Some(2),
         })
@@ -890,6 +1158,7 @@ mod tests {
             qualified_table_name: None,
             columns: vec!["enabled".to_string(), "mask".to_string(), "label".to_string()],
             column_types: vec![Some("bit(1)".to_string()), Some("BIT(4)".to_string()), Some("varchar(20)".to_string())],
+            column_extras: Vec::new(),
             rows: vec![vec![json!("1"), json!("1010"), json!("1010")], vec![json!(false), json!(3), json!("off")]],
             batch_size: Some(10),
         })
@@ -910,12 +1179,36 @@ mod tests {
             qualified_table_name: None,
             columns: vec!["id".to_string(), "title".to_string(), "search_vector".to_string()],
             column_types: vec![Some("integer".to_string()), Some("text".to_string()), Some("tsvector".to_string())],
+            column_extras: Vec::new(),
             rows: vec![vec![json!(1), json!("Hello"), json!("'hello':1A")]],
             batch_size: Some(10),
         })
         .unwrap();
 
         assert_eq!(statements, vec!["INSERT INTO \"public\".\"articles\" (\"id\", \"title\") VALUES (1, 'Hello');"]);
+    }
+
+    #[test]
+    fn dameng_identity_export_inserts_enable_identity_insert() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Dameng),
+            schema: Some("SYSDBA".to_string()),
+            table_name: Some("USERS".to_string()),
+            qualified_table_name: None,
+            columns: vec!["ID".to_string(), "NAME".to_string()],
+            column_types: vec![Some("INT".to_string()), Some("VARCHAR(20)".to_string())],
+            column_extras: vec![Some("identity".to_string()), None],
+            rows: vec![vec![json!(1), json!("Ada")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "SET IDENTITY_INSERT \"SYSDBA\".\"USERS\" ON;\nINSERT INTO \"SYSDBA\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');\nSET IDENTITY_INSERT \"SYSDBA\".\"USERS\" OFF;"
+            ]
+        );
     }
 
     #[test]
@@ -932,6 +1225,7 @@ mod tests {
                 ddl: Some("CREATE TABLE `users` (`id` int);".to_string()),
                 columns: vec!["id".to_string()],
                 column_types: Vec::new(),
+                column_extras: Vec::new(),
                 rows: vec![vec![json!(1)]],
                 truncated: true,
             }],
@@ -991,5 +1285,57 @@ mod tests {
 
         assert_eq!(normalize_export_table_ddl(mysql_ddl, Some(DatabaseType::Mysql)), mysql_ddl);
         assert_eq!(normalize_export_table_ddl(postgres_ddl, Some(DatabaseType::Postgres)), postgres_ddl);
+    }
+
+    fn postgres_sequence(name: &str) -> PostgresExportSequence {
+        PostgresExportSequence {
+            name: name.to_string(),
+            data_type: "integer".to_string(),
+            start_value: "1".to_string(),
+            min_value: "1".to_string(),
+            max_value: "2147483647".to_string(),
+            increment: "1".to_string(),
+            cycle: false,
+            cache_value: "1".to_string(),
+            last_value: Some("42".to_string()),
+            owner_table: Some("permissions".to_string()),
+            owner_column: Some("id".to_string()),
+        }
+    }
+
+    #[test]
+    fn postgres_sequence_create_ddl_is_importable_before_table_ddl() {
+        let ddl = generate_postgres_sequence_create_ddl(&postgres_sequence("permissions_id_seq"), "public");
+
+        assert_eq!(
+            ddl,
+            [
+                "CREATE SEQUENCE IF NOT EXISTS \"public\".\"permissions_id_seq\"",
+                "  AS integer",
+                "  START WITH 1",
+                "  INCREMENT BY 1",
+                "  MINVALUE 1",
+                "  MAXVALUE 2147483647",
+                "  CACHE 1",
+                "  NO CYCLE",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn postgres_sequence_owner_and_setval_sql_are_qualified() {
+        let sequence = postgres_sequence("permissions_id_seq");
+
+        assert_eq!(
+            generate_postgres_sequence_owner_ddl(&sequence, "public").as_deref(),
+            Some("ALTER SEQUENCE \"public\".\"permissions_id_seq\" OWNED BY \"public\".\"permissions\".\"id\"")
+        );
+        assert_eq!(
+            generate_postgres_sequence_setval_sql(&sequence, "public").as_deref(),
+            Some(
+                "SELECT setval('\"public\".\"permissions_id_seq\"', GREATEST(COALESCE(MAX(\"id\"), 42), 42), true) FROM \"public\".\"permissions\""
+            )
+        );
     }
 }

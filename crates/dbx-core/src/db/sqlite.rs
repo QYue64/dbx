@@ -1,14 +1,22 @@
 use percent_encoding::percent_decode_str;
-use rusqlite::types::ValueRef;
+use rusqlite::functions::{Context, FunctionFlags};
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, LoadExtensionGuard, OpenFlags};
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use super::file_validator::validate_file_path;
 use crate::sql::starts_with_executable_sql_keyword;
-use crate::types::{ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, QueryResult, TableInfo, TriggerInfo};
+use crate::types::{
+    ColumnInfo, CompletionAssistantCandidate, CompletionAssistantCandidateKind, CompletionAssistantMatchMode,
+    CompletionAssistantObjectKind, CompletionAssistantRequest, CompletionAssistantResponse, DatabaseInfo,
+    ForeignKeyInfo, IndexInfo, QueryResult, TableInfo, TriggerInfo,
+};
+
+const SQLITE_DATABASE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 #[derive(Clone)]
 pub struct SqliteHandle {
@@ -77,6 +85,9 @@ fn open_sqlite_handle(
     if !is_memory && create_if_missing {
         ensure_parent_dir(path)?;
     }
+    if !is_memory && !is_network_path(path) {
+        validate_existing_sqlite_file(path)?;
+    }
 
     let conn = if is_memory {
         Connection::open_in_memory().map_err(|e| format!("SQLite connection failed: {e}"))?
@@ -96,8 +107,202 @@ fn open_sqlite_handle(
 
     conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(|e| e.to_string())?;
     load_sqlite_extensions(&conn, &extensions)?;
+    register_sqlite_compat_functions(&conn)?;
 
     Ok(SqliteHandle { conn: Arc::new(Mutex::new(conn)) })
+}
+
+fn register_sqlite_compat_functions(conn: &Connection) -> Result<(), String> {
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_INNOCUOUS;
+
+    if !sqlite_function_available(conn, "SELECT if(1, 2, 3)") {
+        conn.create_scalar_function("if", -1, flags, sqlite_if)
+            .map_err(|e| format!("SQLite compatibility function registration failed (if): {e}"))?;
+    }
+    if !sqlite_function_available(conn, "SELECT unistr('')") {
+        conn.create_scalar_function("unistr", 1, flags, sqlite_unistr)
+            .map_err(|e| format!("SQLite compatibility function registration failed (unistr): {e}"))?;
+    }
+
+    Ok(())
+}
+
+fn sqlite_function_available(conn: &Connection, sql: &str) -> bool {
+    conn.query_row(sql, [], |_| Ok(())).is_ok()
+}
+
+fn sqlite_if(ctx: &Context<'_>) -> rusqlite::Result<Value> {
+    if ctx.len() < 2 {
+        return Err(sqlite_function_error("if() requires at least two arguments"));
+    }
+
+    let mut i = 0;
+    while i + 1 < ctx.len() {
+        if sqlite_truthy(ctx.get_raw(i)) {
+            return Ok(sqlite_value_ref_to_owned(ctx.get_raw(i + 1)));
+        }
+        i += 2;
+    }
+
+    if ctx.len() % 2 == 1 {
+        Ok(sqlite_value_ref_to_owned(ctx.get_raw(ctx.len() - 1)))
+    } else {
+        Ok(Value::Null)
+    }
+}
+
+fn sqlite_unistr(ctx: &Context<'_>) -> rusqlite::Result<Value> {
+    let input = match ctx.get_raw(0) {
+        ValueRef::Null => return Ok(Value::Null),
+        ValueRef::Integer(value) => value.to_string(),
+        ValueRef::Real(value) => value.to_string(),
+        ValueRef::Text(value) | ValueRef::Blob(value) => String::from_utf8_lossy(value).into_owned(),
+    };
+
+    sqlite_unistr_text(&input).map(Value::Text)
+}
+
+fn sqlite_truthy(value: ValueRef<'_>) -> bool {
+    match value {
+        ValueRef::Null => false,
+        ValueRef::Integer(value) => value != 0,
+        ValueRef::Real(value) => value != 0.0,
+        ValueRef::Text(value) | ValueRef::Blob(value) => sqlite_text_numeric_truthy(&String::from_utf8_lossy(value)),
+    }
+}
+
+fn sqlite_text_numeric_truthy(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    for end in (1..=trimmed.len()).rev() {
+        if trimmed.is_char_boundary(end) {
+            if let Ok(value) = trimmed[..end].parse::<f64>() {
+                return value != 0.0;
+            }
+        }
+    }
+    false
+}
+
+fn sqlite_value_ref_to_owned(value: ValueRef<'_>) -> Value {
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(value) => Value::Integer(value),
+        ValueRef::Real(value) => Value::Real(value),
+        ValueRef::Text(value) => Value::Text(String::from_utf8_lossy(value).into_owned()),
+        ValueRef::Blob(value) => Value::Blob(value.to_vec()),
+    }
+}
+
+fn sqlite_unistr_text(input: &str) -> rusqlite::Result<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut result = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        if i + 1 >= chars.len() {
+            result.push('\\');
+            i += 1;
+            continue;
+        }
+
+        match chars[i + 1] {
+            '\\' => {
+                result.push('\\');
+                i += 2;
+            }
+            '+' => {
+                if let Some(ch) = sqlite_unistr_codepoint(&chars, i + 2, 6)? {
+                    result.push(ch);
+                    i += 8;
+                } else {
+                    result.push('\\');
+                    i += 1;
+                }
+            }
+            'u' => {
+                if let Some(ch) = sqlite_unistr_codepoint(&chars, i + 2, 4)? {
+                    result.push(ch);
+                    i += 6;
+                } else {
+                    result.push('\\');
+                    i += 1;
+                }
+            }
+            'U' => {
+                if let Some(ch) = sqlite_unistr_codepoint(&chars, i + 2, 8)? {
+                    result.push(ch);
+                    i += 10;
+                } else {
+                    result.push('\\');
+                    i += 1;
+                }
+            }
+            _ => {
+                if let Some(ch) = sqlite_unistr_codepoint(&chars, i + 1, 4)? {
+                    result.push(ch);
+                    i += 5;
+                } else {
+                    result.push('\\');
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn sqlite_unistr_codepoint(chars: &[char], start: usize, digits: usize) -> rusqlite::Result<Option<char>> {
+    if start + digits > chars.len() {
+        return Ok(None);
+    }
+
+    let mut value = 0_u32;
+    for ch in &chars[start..start + digits] {
+        let Some(digit) = ch.to_digit(16) else {
+            return Ok(None);
+        };
+        value = (value << 4) | digit;
+    }
+
+    std::char::from_u32(value)
+        .map(Some)
+        .ok_or_else(|| sqlite_function_error(format!("invalid Unicode codepoint: {value:#X}")))
+}
+
+fn sqlite_function_error(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::UserFunctionError(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())))
+}
+
+pub fn path_has_sqlite_header(path: &Path) -> Result<bool, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("failed to open file: {e}"))?;
+    let mut header = [0_u8; 16];
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(&header == SQLITE_DATABASE_HEADER),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(format!("failed to read file header: {e}")),
+    }
+}
+
+fn validate_existing_sqlite_file(path: &str) -> Result<(), String> {
+    let path = Path::new(path);
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = path.metadata().map_err(|e| format!("failed to inspect SQLite database file: {e}"))?;
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+    if path_has_sqlite_header(path)? {
+        return Ok(());
+    }
+    Err("Selected file is not a valid SQLite database file.".to_string())
 }
 
 fn load_sqlite_extensions(conn: &Connection, extensions: &[SqliteExtensionSpec]) -> Result<(), String> {
@@ -186,6 +391,48 @@ mod tests {
         assert_eq!(result.rows[0][0], serde_json::json!("Ada"));
     }
 
+    #[tokio::test]
+    async fn create_if_missing_rejects_existing_non_sqlite_file() {
+        let path = std::env::temp_dir().join(format!("dbx-not-sqlite-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nnot sqlite").unwrap();
+
+        let err = match connect_path_create_if_missing(path.to_str().unwrap()).await {
+            Ok(_) => panic!("non-SQLite file should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("not a valid SQLite database"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn create_if_missing_allows_empty_custom_suffix_file() {
+        let path = std::env::temp_dir().join(format!("dbx-empty-sqlite-{}.conf", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"").unwrap();
+
+        let pool = connect_path_create_if_missing(path.to_str().unwrap()).await.expect("empty file can become SQLite");
+        execute_query(&pool, "CREATE TABLE t (id INTEGER);").await.expect("write sqlite schema");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn create_if_missing_allows_sqlite_database_with_custom_suffix() {
+        let path = std::env::temp_dir().join(format!("dbx-custom-sqlite-{}.conf", uuid::Uuid::new_v4()));
+        {
+            let pool = connect_path_create_if_missing(path.to_str().unwrap()).await.expect("create sqlite");
+            execute_query(&pool, "CREATE TABLE t (id INTEGER);").await.expect("write sqlite schema");
+        }
+
+        let reopened = connect_path_create_if_missing(path.to_str().unwrap()).await.expect("reopen sqlite");
+        let result = execute_query(&reopened, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 't';")
+            .await
+            .expect("query sqlite schema");
+        assert_eq!(result.rows[0][0], serde_json::json!("t"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn sqlite_extension_specs_parse_repeated_and_multiline_url_params() {
         let params = "cache=shared&sqlite_extension=%2Fopt%2Fregexp.dylib&sqlite_extensions=%2Fopt%2Ftext.dylib%7Csqlite3_text_init%0A%2Fopt%2Fcrypto.dylib";
@@ -253,6 +500,14 @@ mod tests {
         assert_eq!(normalize_sqlite_sql("SELECT if  (1, 'a', 'b')"), "SELECT IIF  (1, 'a', 'b')");
     }
 
+    #[test]
+    fn sqlite_unistr_decodes_documented_escapes() {
+        assert_eq!(
+            sqlite_unistr_text(r"a\0041\u0042\+000043\U00000044\\z").expect("decode unistr escapes"),
+            r"aABCD\z"
+        );
+    }
+
     #[tokio::test]
     async fn view_with_if_function_works_after_normalization() {
         let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
@@ -270,6 +525,23 @@ mod tests {
         assert_eq!(result.rows.len(), 3);
         assert_eq!(result.rows[0][1], serde_json::json!("small"));
         assert_eq!(result.rows[1][1], serde_json::json!("big"));
+    }
+
+    #[tokio::test]
+    async fn view_with_stored_if_and_unistr_functions_can_be_described_and_queried() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        pool.with_connection(|conn| {
+            conn.execute_batch("CREATE VIEW a AS SELECT if(1, unistr('hello'), 'world') AS a;")
+                .map_err(|e| e.to_string())
+        })
+        .expect("create view with original SQLite 3.50 functions");
+
+        let columns = get_columns(&pool, "", "a").await.expect("describe view");
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "a");
+
+        let result = execute_query(&pool, "SELECT * FROM a").await.expect("query view");
+        assert_eq!(result.rows[0][0], serde_json::json!("hello"));
     }
 
     #[tokio::test]
@@ -494,6 +766,68 @@ mod tests {
         let id = cols.iter().find(|c| c.name == "id").expect("id col");
         assert!(id.extra.is_none());
     }
+
+    #[tokio::test]
+    async fn completion_assistant_searches_sqlite_tables_and_columns_with_limit() {
+        let pool = connect_path(":memory:").await.expect("connect in-memory SQLite");
+        execute_query(
+            &pool,
+            "CREATE TABLE account(id INTEGER PRIMARY KEY, display_name TEXT); CREATE VIEW account_view AS SELECT id FROM account; CREATE TABLE audit_log(id INTEGER);",
+        )
+        .await
+        .expect("setup schema");
+
+        let tables = completion_assistant_search(
+            &pool,
+            &CompletionAssistantRequest {
+                connection_id: "c1".to_string(),
+                database: "main".to_string(),
+                schema: Some("main".to_string()),
+                object_kinds: vec![CompletionAssistantObjectKind::Table, CompletionAssistantObjectKind::View],
+                mask: "account".to_string(),
+                case_sensitive: false,
+                global_search: false,
+                max_results: Some(1),
+                search_in_comments: false,
+                search_in_definitions: false,
+                parent_schema: Some("main".to_string()),
+                parent_name: None,
+                match_mode: Some(CompletionAssistantMatchMode::Prefix),
+            },
+        )
+        .await
+        .expect("table completion");
+
+        assert_eq!(tables.candidates.len(), 1);
+        assert!(tables.incomplete);
+        assert!(!tables.fallback_used);
+        assert_eq!(tables.candidates[0].name, "account");
+
+        let columns = completion_assistant_search(
+            &pool,
+            &CompletionAssistantRequest {
+                connection_id: "c1".to_string(),
+                database: "main".to_string(),
+                schema: Some("main".to_string()),
+                object_kinds: vec![CompletionAssistantObjectKind::Column],
+                mask: "name".to_string(),
+                case_sensitive: false,
+                global_search: false,
+                max_results: Some(10),
+                search_in_comments: false,
+                search_in_definitions: false,
+                parent_schema: Some("main".to_string()),
+                parent_name: Some("account".to_string()),
+                match_mode: Some(CompletionAssistantMatchMode::Contains),
+            },
+        )
+        .await
+        .expect("column completion");
+
+        assert_eq!(columns.candidates.len(), 1);
+        assert_eq!(columns.candidates[0].name, "display_name");
+        assert_eq!(columns.candidates[0].data_type.as_deref(), Some("TEXT"));
+    }
 }
 
 pub async fn list_databases(_pool: &SqliteHandle) -> Result<Vec<DatabaseInfo>, String> {
@@ -565,6 +899,240 @@ pub async fn get_columns(pool: &SqliteHandle, _schema: &str, table: &str) -> Res
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+pub async fn completion_assistant_search(
+    pool: &SqliteHandle,
+    request: &CompletionAssistantRequest,
+) -> Result<CompletionAssistantResponse, String> {
+    let pool = pool.clone();
+    let request = request.clone();
+    tokio::task::spawn_blocking(move || pool.with_connection(|conn| sqlite_completion_assistant_search(conn, &request)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn sqlite_completion_assistant_search(
+    conn: &mut Connection,
+    request: &CompletionAssistantRequest,
+) -> Result<CompletionAssistantResponse, String> {
+    let limit = request.max_results.unwrap_or(100).clamp(1, 1000);
+    let kinds = completion_object_kinds(request);
+    let mut candidates = Vec::new();
+
+    if kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::Schema)) {
+        for schema in sqlite_completion_schemas(conn, request, limit - candidates.len())? {
+            candidates.push(schema);
+            if candidates.len() >= limit {
+                return Ok(CompletionAssistantResponse { candidates, incomplete: true, fallback_used: false });
+            }
+        }
+    }
+
+    if kinds.iter().any(CompletionAssistantObjectKind::is_table_like) {
+        for table in sqlite_completion_tables(conn, request, &kinds, limit - candidates.len())? {
+            candidates.push(table);
+            if candidates.len() >= limit {
+                return Ok(CompletionAssistantResponse { candidates, incomplete: true, fallback_used: false });
+            }
+        }
+    }
+
+    if kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::Column)) {
+        for column in sqlite_completion_columns(conn, request, limit - candidates.len())? {
+            candidates.push(column);
+            if candidates.len() >= limit {
+                return Ok(CompletionAssistantResponse { candidates, incomplete: true, fallback_used: false });
+            }
+        }
+    }
+
+    Ok(CompletionAssistantResponse { candidates, incomplete: false, fallback_used: false })
+}
+
+fn completion_object_kinds(request: &CompletionAssistantRequest) -> Vec<CompletionAssistantObjectKind> {
+    if request.object_kinds.is_empty() {
+        vec![CompletionAssistantObjectKind::Table, CompletionAssistantObjectKind::View]
+    } else {
+        request.object_kinds.clone()
+    }
+}
+
+fn sqlite_completion_schemas(
+    conn: &mut Connection,
+    request: &CompletionAssistantRequest,
+    limit: usize,
+) -> Result<Vec<CompletionAssistantCandidate>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("PRAGMA database_list").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1)).map_err(|e| e.to_string())?;
+    let mut schemas = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    schemas.sort_by_key(|schema| schema.to_lowercase());
+    Ok(schemas
+        .into_iter()
+        .filter(|schema| sqlite_completion_name_matches(schema, request))
+        .take(limit)
+        .map(|schema| CompletionAssistantCandidate {
+            name: schema.clone(),
+            kind: CompletionAssistantCandidateKind::Schema,
+            database: Some(request.database.clone()),
+            schema: Some(schema),
+            parent_schema: None,
+            parent_name: None,
+            comment: None,
+            data_type: None,
+        })
+        .collect())
+}
+
+fn sqlite_completion_tables(
+    conn: &mut Connection,
+    request: &CompletionAssistantRequest,
+    kinds: &[CompletionAssistantObjectKind],
+    limit: usize,
+) -> Result<Vec<CompletionAssistantCandidate>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let schema = sqlite_completion_schema(request);
+    let mut type_filters = Vec::new();
+    if kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::Table)) {
+        type_filters.push("table");
+    }
+    if kinds.iter().any(|kind| matches!(kind, CompletionAssistantObjectKind::View)) {
+        type_filters.push("view");
+    }
+    if type_filters.is_empty() {
+        type_filters.extend(["table", "view"]);
+    }
+    let placeholders = std::iter::repeat("?").take(type_filters.len()).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT name, type FROM {}.sqlite_master WHERE type IN ({}) AND name NOT LIKE 'sqlite_%' AND {} ORDER BY name LIMIT ?",
+        sqlite_quote_ident(&schema),
+        placeholders,
+        sqlite_completion_filter_sql("name", request)
+    );
+    let pattern = sqlite_completion_like_pattern(request);
+    let mut params: Vec<&dyn rusqlite::ToSql> =
+        type_filters.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+    params.push(&pattern);
+    params.push(&limit);
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            let object_type = row.get::<_, String>(1)?;
+            Ok(CompletionAssistantCandidate {
+                name: row.get(0)?,
+                kind: if object_type.eq_ignore_ascii_case("view") {
+                    CompletionAssistantCandidateKind::View
+                } else {
+                    CompletionAssistantCandidateKind::Table
+                },
+                database: Some(request.database.clone()),
+                schema: Some(schema.clone()),
+                parent_schema: None,
+                parent_name: None,
+                comment: None,
+                data_type: None,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+fn sqlite_completion_columns(
+    conn: &mut Connection,
+    request: &CompletionAssistantRequest,
+    limit: usize,
+) -> Result<Vec<CompletionAssistantCandidate>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let Some(table) = request.parent_name.as_deref().filter(|table| !table.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let schema = sqlite_completion_schema(request);
+    let sql = format!("PRAGMA {}.table_info({})", sqlite_quote_ident(&schema), sqlite_quote_string(table));
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>("name")?, row.get::<_, String>("type")?)))
+        .map_err(|e| e.to_string())?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (name, data_type) = row.map_err(|e| e.to_string())?;
+        if !sqlite_completion_name_matches(&name, request) {
+            continue;
+        }
+        candidates.push(CompletionAssistantCandidate {
+            name,
+            kind: CompletionAssistantCandidateKind::Column,
+            database: Some(request.database.clone()),
+            schema: Some(schema.clone()),
+            parent_schema: Some(schema.clone()),
+            parent_name: Some(table.to_string()),
+            comment: None,
+            data_type: Some(data_type),
+        });
+        if candidates.len() >= limit {
+            break;
+        }
+    }
+    Ok(candidates)
+}
+
+fn sqlite_completion_schema(request: &CompletionAssistantRequest) -> String {
+    request
+        .parent_schema
+        .as_deref()
+        .or(request.schema.as_deref())
+        .filter(|schema| !schema.trim().is_empty())
+        .unwrap_or("main")
+        .to_string()
+}
+
+fn sqlite_completion_name_matches(name: &str, request: &CompletionAssistantRequest) -> bool {
+    let mask = request.mask.trim().trim_matches('%');
+    if mask.is_empty() {
+        return true;
+    }
+    let (name, mask) = if request.case_sensitive {
+        (name.to_string(), mask.to_string())
+    } else {
+        (name.to_lowercase(), mask.to_lowercase())
+    };
+    match request.match_mode.as_ref().unwrap_or(&CompletionAssistantMatchMode::Prefix) {
+        CompletionAssistantMatchMode::Prefix => name.starts_with(&mask),
+        CompletionAssistantMatchMode::Contains => name.contains(&mask),
+    }
+}
+
+fn sqlite_completion_filter_sql(column: &str, request: &CompletionAssistantRequest) -> String {
+    if request.case_sensitive {
+        format!("{column} GLOB ?")
+    } else {
+        format!("LOWER({column}) LIKE LOWER(?) ESCAPE '\\'")
+    }
+}
+
+fn sqlite_completion_like_pattern(request: &CompletionAssistantRequest) -> String {
+    let mask = request.mask.trim().trim_matches('%');
+    let escaped = mask.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    match request.match_mode.as_ref().unwrap_or(&CompletionAssistantMatchMode::Prefix) {
+        CompletionAssistantMatchMode::Prefix if request.case_sensitive => format!("{}*", mask.replace('[', "[[]")),
+        CompletionAssistantMatchMode::Contains if request.case_sensitive => format!("*{}*", mask.replace('[', "[[]")),
+        CompletionAssistantMatchMode::Prefix => format!("{escaped}%"),
+        CompletionAssistantMatchMode::Contains => format!("%{escaped}%"),
+    }
+}
+
+fn sqlite_quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn sqlite_quote_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Read `sqlite_master.sql` for `table` and return the lowercase column names that
