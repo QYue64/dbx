@@ -4,6 +4,7 @@ const LATEST_JSON_PATH: &str =
     "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/latest/download/latest.json";
 const GITHUB_RELEASE_API_PREFIX: &str = "https://gh-proxy.org/https://api.github.com/repos/QYue64/dbx/releases/tags/v";
 const RELEASE_URL_PREFIX: &str = "https://github.com/QYue64/dbx/releases/tag/v";
+const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str = "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/download/v";
 
 #[derive(Debug, Deserialize)]
 pub struct TauriRelease {
@@ -256,6 +257,15 @@ pub fn normalize_version(version: &str) -> String {
     version.trim().trim_start_matches('v').to_string()
 }
 
+pub fn portable_asset_filename(version: &str) -> String {
+    format!("DBX_{}_x64-portable.zip", normalize_version(version))
+}
+
+pub fn portable_asset_download_url(version: &str) -> String {
+    let version = normalize_version(version);
+    format!("{GITHUB_RELEASE_DOWNLOAD_PREFIX}{version}/{}", portable_asset_filename(&version))
+}
+
 pub fn parse_version(version: &str) -> Vec<u64> {
     normalize_version(version).split(['.', '-', '+']).map(|part| part.parse::<u64>().unwrap_or(0)).collect()
 }
@@ -282,8 +292,9 @@ pub fn is_newer_version(latest: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_update_info, is_newer_version, normalize_version, system_proxy_url_from_scutil_output,
-        system_proxy_url_from_windows_registry_output, GithubReleaseMetadata, TauriRelease,
+        build_update_info, is_newer_version, normalize_version, portable_asset_download_url, portable_asset_filename,
+        system_proxy_url_from_scutil_output, system_proxy_url_from_windows_registry_output, GithubReleaseMetadata,
+        TauriRelease,
     };
 
     #[test]
@@ -379,6 +390,15 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         assert_eq!(
             jdbc.url,
             "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/latest/download/dbx-jdbc-plugin-latest.zip"
+        );
+    }
+
+    #[test]
+    fn builds_portable_zip_download_url() {
+        assert_eq!(portable_asset_filename("v0.5.41"), "DBX_0.5.41_x64-portable.zip");
+        assert_eq!(
+            portable_asset_download_url("0.5.41"),
+            "https://gh-proxy.org/https://github.com/QYue64/dbx/releases/download/v0.5.41/DBX_0.5.41_x64-portable.zip"
         );
     }
 

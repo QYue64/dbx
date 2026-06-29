@@ -1794,6 +1794,10 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
   return get("/api/update/check");
 }
 
+export async function downloadPortableUpdateZip(_version: string): Promise<string> {
+  throw new Error("Portable ZIP download is only available in the desktop app.");
+}
+
 export async function checkMcpServerStatus(): Promise<import("./tauri").McpServerStatus> {
   return {
     installed: false,

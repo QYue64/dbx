@@ -375,12 +375,12 @@ export interface ToolbarItems {
   sqlFile: boolean;
   schemaDiff: boolean;
   dataCompare: boolean;
+  automation: boolean;
   checkUpdates: boolean;
   sqlLibrary: boolean;
   history: boolean;
   ai: boolean;
   theme: boolean;
-  github: boolean;
 }
 
 export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
@@ -389,12 +389,12 @@ export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   sqlFile: true,
   schemaDiff: true,
   dataCompare: true,
+  automation: true,
   checkUpdates: true,
   sqlLibrary: true,
   history: true,
   ai: true,
   theme: true,
-  github: true,
 };
 
 export const EDITOR_THEMES: { value: EditorTheme; label: string; dark: boolean }[] = [
@@ -564,12 +564,12 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
     sqlFile: items.sqlFile ?? defaults.sqlFile,
     schemaDiff: items.schemaDiff ?? defaults.schemaDiff,
     dataCompare: items.dataCompare ?? defaults.dataCompare,
+    automation: items.automation ?? defaults.automation,
     checkUpdates: items.checkUpdates ?? defaults.checkUpdates,
     sqlLibrary: items.sqlLibrary ?? defaults.sqlLibrary,
     history: items.history ?? defaults.history,
     ai: items.ai ?? defaults.ai,
     theme: items.theme ?? defaults.theme,
-    github: items.github ?? defaults.github,
   };
 }
 

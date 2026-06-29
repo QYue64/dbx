@@ -125,6 +125,26 @@ export function useAppUpdater() {
     openUrl(url);
   }
 
+  async function downloadPortableUpdateZip() {
+    if (!isTauriRuntime() || isDownloadingUpdate.value || !updateInfo.value?.update_available) return;
+    isDownloadingUpdate.value = true;
+    downloadProgress.value = 0;
+    try {
+      const path = await api.downloadPortableUpdateZip(updateInfo.value.latest_version);
+      downloadProgress.value = 100;
+      toast(t("updates.portableDownloadSaved", { path }), 5000);
+      try {
+        await api.revealPathInFileManager(path);
+      } catch {
+        // 下载成功比打开文件管理器更重要，这里只保留成功提示。
+      }
+    } catch (e: any) {
+      toast(t("updates.downloadFailed", { error: e?.message || String(e) }), 5000);
+    } finally {
+      isDownloadingUpdate.value = false;
+    }
+  }
+
   async function downloadAndInstallUpdate() {
     if (!isTauriRuntime() || isDownloadingUpdate.value) return;
     if (!canDownloadAndInstallUpdate(updateInfo.value, true)) {
@@ -177,6 +197,7 @@ export function useAppUpdater() {
     checkAndInstallUpdate,
     formatUpdateError,
     openLatestRelease,
+    downloadPortableUpdateZip,
     downloadAndInstallUpdate,
     restartApp,
   };

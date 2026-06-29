@@ -357,6 +357,25 @@ describe("hasMultipleExecutionTargets", () => {
   });
 });
 
+describe("hasMultipleExecutionTargets", () => {
+  it("returns false for a single SQL statement", () => {
+    expect(hasMultipleExecutionTargets("SELECT 1;")).toBe(false);
+  });
+
+  it("returns true for multiple SQL statements", () => {
+    expect(hasMultipleExecutionTargets("SELECT 1;\nSELECT 2;")).toBe(true);
+  });
+
+  it("ignores comments when counting SQL statements", () => {
+    expect(hasMultipleExecutionTargets("-- check one thing\nSELECT 1;")).toBe(false);
+  });
+
+  it("counts executable Redis command lines", () => {
+    expect(hasMultipleExecutionTargets("GET user:1", "redis")).toBe(false);
+    expect(hasMultipleExecutionTargets("GET user:1\n# comment\nDEL user:2", "redis")).toBe(true);
+  });
+});
+
 describe("supportsExecutionTargetPicker", () => {
   it("enables the picker for SQL database connections and Redis", () => {
     expect(supportsExecutionTargetPicker("mysql")).toBe(true);

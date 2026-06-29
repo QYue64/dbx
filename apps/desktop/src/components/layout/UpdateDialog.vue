@@ -20,6 +20,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   "download-and-install": [];
+  "download-portable-zip": [];
   restart: [];
 }>();
 
@@ -105,7 +106,14 @@ watch(
       <DialogFooter class="gap-2 sm:flex-wrap">
         <Button v-if="!isDownloadingUpdate && !updateReady" variant="outline" @click="open = false">{{ t("dangerDialog.cancel") }}</Button>
         <template v-if="updateInfo?.update_available">
-          <template v-if="canDownloadAndInstallUpdate(updateInfo, isDesktop)">
+          <template v-if="isDesktop && updateInfo.portable_mode">
+            <Button v-if="isDownloadingUpdate" disabled>
+              <Loader2 class="h-4 w-4 animate-spin" />
+              {{ t("updates.downloadingPortableZip") }}
+            </Button>
+            <Button v-else @click="emit('download-portable-zip')">{{ t("updates.downloadPortableZip") }}</Button>
+          </template>
+          <template v-else-if="canDownloadAndInstallUpdate(updateInfo, isDesktop)">
             <div v-if="updateReady" class="flex flex-col items-end gap-1">
               <Button @click="emit('restart')">{{ t("updates.restart") }}</Button>
               <span class="text-xs text-muted-foreground">{{ t("updates.reopenHint") }}</span>

@@ -5,7 +5,7 @@ use std::sync::{
 
 pub use dbx_core::update::UpdateInfo;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
 const OFFICIAL_UPDATE_ENDPOINTS: [&str; 2] = [
@@ -141,6 +141,59 @@ pub async fn download_and_install_update(
         )
         .await
         .map_err(|e| format!("Failed to download and install update: {e}"))
+}
+
+#[tauri::command]
+pub async fn download_portable_update_zip(app: tauri::AppHandle, version: String) -> Result<String, String> {
+    let version = dbx_core::update::normalize_version(&version);
+    if version.is_empty() {
+        return Err("version is empty".to_string());
+    }
+
+    let file_name = dbx_core::update::portable_asset_filename(&version);
+    let download_url = dbx_core::update::portable_asset_download_url(&version);
+    let download_dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|e| format!("Failed to resolve download directory: {e}"))?;
+    std::fs::create_dir_all(&download_dir).map_err(|e| format!("Failed to create download directory: {e}"))?;
+
+    let dest = unique_download_path(download_dir.join(file_name));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .user_agent("dbx-portable-update-downloader")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let bytes = client
+        .get(download_url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("Failed to download portable ZIP: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read portable ZIP: {e}"))?;
+    tokio::fs::write(&dest, &bytes).await.map_err(|e| format!("Failed to save portable ZIP: {e}"))?;
+
+    Ok(dest.to_string_lossy().to_string())
+}
+
+fn unique_download_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    if !path.exists() {
+        return path;
+    }
+
+    let parent = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or("DBX_update");
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("zip");
+    for index in 1..1000 {
+        let candidate = parent.join(format!("{stem} ({index}).{extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path
 }
 
 #[cfg(test)]

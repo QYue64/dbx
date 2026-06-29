@@ -84,6 +84,9 @@ export function useSqlExecution(deps: {
   }
 
   async function continueExecute(sql: string) {
+    const tab = deps.activeTab.value;
+    if (!tab) return;
+
     // Redis: block dangerous commands when toggle is on (check each line for multi-line input)
     if (deps.activeConnection.value?.db_type === "redis" && deps.blockDangerousRedisCommands?.value !== false) {
       const commands = sql

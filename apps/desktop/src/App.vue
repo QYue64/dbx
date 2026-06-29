@@ -102,7 +102,7 @@ const settingsStore = useSettingsStore();
 const savedSqlStore = useSavedSqlStore();
 const { message: toastMessage, visible: toastVisible, toast } = useToast();
 const { isDark, themeMode, applyTheme, setThemeMode } = useTheme();
-const { checkingUpdates, updateInfo, updateCheckMessage, showUpdateDialog, isDownloadingUpdate, downloadProgress, updateReady, hasUpdateAvailable, openUrl, checkUpdates, downloadAndInstallUpdate, restartApp } = useAppUpdater();
+const { checkingUpdates, updateInfo, updateCheckMessage, showUpdateDialog, isDownloadingUpdate, downloadProgress, updateReady, hasUpdateAvailable, openUrl, checkUpdates, downloadPortableUpdateZip, downloadAndInstallUpdate, restartApp } = useAppUpdater();
 const { setupFileDrop } = useFileDrop();
 
 const isDesktop = isTauriRuntime();
@@ -250,7 +250,7 @@ const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
 const { showCloseActionPrompt, chooseQuit, chooseMinimize, setupCloseActionPromptListener, cleanupCloseActionPromptListener } = useCloseActionPrompt();
 useVisibilityChange();
 useWebDavAutoUpload();
-useAutomationScheduler();
+const automationScheduler = useAutomationScheduler({ autoStart: false });
 
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
@@ -1294,6 +1294,7 @@ function initApp() {
     .then(() => {
       console.log(`[STARTUP]   connectionStore.initFromDisk: ${(performance.now() - t0).toFixed(0)}ms`);
       restoreActiveConnectionContext();
+      automationScheduler.start();
     })
     .catch((e: any) => {
       toast(t("connection.loadFailed", { message: e?.message || String(e) }), 5000);
@@ -1469,7 +1470,6 @@ onUnmounted(() => {
           @toggle-ai="toggleAiPanel"
           @toggle-history="showHistory = !showHistory"
           @toggle-sql-library="toggleSqlLibrary"
-          @open-github="openGitHub"
           @open-settings="openSettings()"
           @open-automation="showAutomationCenter = true"
           @open-governance="showGovernanceCenter = true"
@@ -1686,6 +1686,7 @@ onUnmounted(() => {
           :download-progress="downloadProgress"
           :update-ready="updateReady"
           @download-and-install="downloadAndInstallUpdate"
+          @download-portable-zip="downloadPortableUpdateZip"
           @restart="restartApp"
         />
         <CloseActionPromptDialog v-if="isDesktop && showCloseActionPrompt" v-model:open="showCloseActionPrompt" @quit="chooseQuit" @minimize="chooseMinimize" />

@@ -639,6 +639,18 @@ fn sqlserver_cell_to_json(cell: &ColumnData<'static>) -> serde_json::Value {
         return serde_json::Value::String(v.to_string());
     }
     if let Ok(Some(v)) = <Vec<u8> as tiberius::FromSqlOwned>::from_sql_owned(cell.clone()) {
+        // Try to decode as UTF-16 LE (SQL Server NVARCHAR encoding) with lossy conversion
+        // This handles cases where sys.sql_modules.definition contains invalid UTF-8 sequences
+        if v.len() >= 2 && v.len() % 2 == 0 {
+            let utf16_units: Vec<u16> =
+                v.chunks_exact(2).map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])).collect();
+            if let Ok(decoded) = String::from_utf16(&utf16_units) {
+                return serde_json::Value::String(decoded);
+            }
+            // Use lossy conversion as fallback for invalid UTF-16 sequences
+            let lossy_decoded = String::from_utf16_lossy(&utf16_units);
+            return serde_json::Value::String(lossy_decoded);
+        }
         return super::binary_value_to_json(&v);
     }
     serde_json::Value::Null

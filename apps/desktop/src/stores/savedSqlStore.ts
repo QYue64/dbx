@@ -122,6 +122,12 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     await initFromStoragePromise;
   }
 
+  async function reloadFromStorage() {
+    await migrateLegacyLocalStorage();
+    applyLibrary(await api.loadSavedSqlLibrary());
+    isLoaded.value = true;
+  }
+
   function listFolders(connectionId: string) {
     return listChildFolders(connectionId);
   }
@@ -502,6 +508,7 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     isLoaded,
     version,
     initFromStorage,
+    reloadFromStorage,
     listFolders,
     listChildFolders,
     listFiles,
@@ -518,6 +525,7 @@ export const useSavedSqlStore = defineStore("savedSql", () => {
     moveFolderToFolder,
     reorderFiles,
     moveFileToFolder,
+    syncEntries,
     syncToLocalDirectory,
     allFolders,
     allFoldersTreeOrder,

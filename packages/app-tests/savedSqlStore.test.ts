@@ -72,3 +72,30 @@ test("saved SQL summaries load file content on demand", async () => {
   assert.equal(store.files[0]?.sql, "SELECT 1;");
   assert.equal(apiMock.loadSavedSqlFile.mock.calls.length, 1);
 });
+
+test("reloads saved SQL library even after initial load", async () => {
+  const firstFile: SavedSqlFile = {
+    id: "sql-1",
+    connectionId: "conn-1",
+    name: "first.sql",
+    database: "",
+    sql: "select 1",
+    createdAt: "2026-06-27T00:00:00.000Z",
+    updatedAt: "2026-06-27T00:00:00.000Z",
+  };
+  const secondFile: SavedSqlFile = {
+    ...firstFile,
+    id: "sql-2",
+    name: "second.sql",
+    sql: "select 2",
+  };
+  apiMock.loadSavedSqlLibrary.mockResolvedValueOnce({ folders: [], files: [firstFile] }).mockResolvedValueOnce({ folders: [], files: [secondFile] });
+
+  const store = useSavedSqlStore();
+  await store.initFromStorage();
+  assert.equal(store.files[0]?.id, "sql-1");
+
+  await store.reloadFromStorage();
+  assert.equal(store.files.length, 1);
+  assert.equal(store.files[0]?.id, "sql-2");
+});

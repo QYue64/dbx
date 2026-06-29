@@ -1147,6 +1147,10 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
   return invoke("check_for_updates");
 }
 
+export async function downloadPortableUpdateZip(version: string): Promise<string> {
+  return invoke("download_portable_update_zip", { version });
+}
+
 export async function getSystemProxyUrl(): Promise<string | null> {
   return invoke("get_system_proxy_url");
 }

@@ -474,7 +474,6 @@ function syncEditStateFromStores() {
   editCompactColumnHeaderActions.value = settingsStore.editorSettings.compactColumnHeaderActions;
   editInfiniteScroll.value = settingsStore.editorSettings.infiniteScroll;
   editInfiniteScrollMaxRows.value = settingsStore.editorSettings.infiniteScrollMaxRows;
-  editRedisScanPageSize.value = settingsStore.editorSettings.redisScanPageSize;
   editTableColumnTemplateRows.value = tableColumnTemplateRowsFromSettings(settingsStore.editorSettings.tableColumnTemplateFields);
   editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
   editSqlFormatter.value = normalizeSqlFormatterSettings(settingsStore.editorSettings.sqlFormatter);
@@ -1286,7 +1285,7 @@ async function downloadWebDavSnapshot() {
     await settingsStore.updateDesktopSettings(result.desktopSettings);
     syncEditStateFromStores();
     await connectionStore.initFromDisk();
-    await savedSqlStore.initFromStorage();
+    await savedSqlStore.reloadFromStorage();
     const message = t("settings.syncDownloadSuccess", {
       bytes: result.summary.bytes,
       path: result.summary.remotePath,
@@ -2375,12 +2374,12 @@ watch(
                       { key: 'sqlFile', label: t('sqlFile.title') },
                       { key: 'schemaDiff', label: t('diff.title') },
                       { key: 'dataCompare', label: t('dataCompare.title') },
+                      { key: 'automation', label: t('automationCenter.title') },
                       { key: 'checkUpdates', label: t('updates.check') },
                       { key: 'sqlLibrary', label: t('sqlLibrary.title') },
                       { key: 'history', label: t('history.title') },
                       { key: 'ai', label: 'AI' },
                       { key: 'theme', label: t('toolbar.theme') },
-                      { key: 'github', label: 'GitHub' },
                     ]"
                     :key="item.key"
                     class="flex items-center gap-2"
