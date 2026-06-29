@@ -594,6 +594,9 @@ pub async fn stream_first_result_set(
 }
 
 fn sqlserver_cell_to_json(cell: &ColumnData<'static>) -> serde_json::Value {
+    if let ColumnData::Binary(Some(value)) = cell {
+        return super::binary_value_to_json(value.as_ref());
+    }
     if let Ok(Some(v)) = <&str as FromSql>::from_sql(cell) {
         return serde_json::Value::String(v.to_string());
     }
