@@ -17,6 +17,7 @@ use crate::agent_manager::{JavaRuntimeMode, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
 use crate::db;
 use crate::db::agent_driver::AgentMethod;
+use crate::db::http_tunnel::HttpTunnelManager;
 use crate::db::proxy_tunnel::ProxyTunnelManager;
 use crate::db::ssh_tunnel::TunnelManager;
 use crate::models::connection::{
@@ -161,6 +162,7 @@ pub struct AppState {
     pub running_queries: RunningQueries,
     pub tunnels: TunnelManager,
     pub proxy_tunnels: ProxyTunnelManager,
+    pub http_tunnels: HttpTunnelManager,
     pub storage: Storage,
     pub plugins: PluginRegistry,
     pub agent_manager: crate::agent_manager::AgentManager,
@@ -457,6 +459,7 @@ impl AppState {
             running_queries: RunningQueries::default(),
             tunnels: TunnelManager::new(),
             proxy_tunnels: ProxyTunnelManager::new(),
+            http_tunnels: HttpTunnelManager::new(),
             storage,
             plugins: PluginRegistry::new(plugin_dir),
             agent_manager: crate::agent_manager::AgentManager::new_with_base_dir_and_app_version(
@@ -1123,6 +1126,7 @@ impl AppState {
             remote_port,
             &self.tunnels,
             &self.proxy_tunnels,
+            &self.http_tunnels,
         )
         .await?;
 
@@ -1154,6 +1158,7 @@ impl AppState {
                     sentinel.port,
                     &self.tunnels,
                     &self.proxy_tunnels,
+                    &self.http_tunnels,
                 )
                 .await
                 {
@@ -1178,6 +1183,7 @@ impl AppState {
                                 layer_count,
                                 &self.tunnels,
                                 &self.proxy_tunnels,
+                                &self.http_tunnels,
                             )
                             .await;
                             continue;
@@ -1192,6 +1198,7 @@ impl AppState {
                     master.port,
                     &self.tunnels,
                     &self.proxy_tunnels,
+                    &self.http_tunnels,
                 )
                 .await
                 {
@@ -1206,6 +1213,7 @@ impl AppState {
                             layer_count,
                             &self.tunnels,
                             &self.proxy_tunnels,
+                            &self.http_tunnels,
                         )
                         .await;
                         continue;
@@ -1226,6 +1234,7 @@ impl AppState {
                             layer_count,
                             &self.tunnels,
                             &self.proxy_tunnels,
+                            &self.http_tunnels,
                         )
                         .await;
                         db::transport_layer_tunnel::stop_transport_layers(
@@ -1233,6 +1242,7 @@ impl AppState {
                             layer_count,
                             &self.tunnels,
                             &self.proxy_tunnels,
+                            &self.http_tunnels,
                         )
                         .await;
                     }
@@ -1247,6 +1257,7 @@ impl AppState {
             let redis_sentinel_prefix = redis_sentinel_transport_prefix(connection_id);
             self.tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
             self.proxy_tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
+            self.http_tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
         }
 
         result
@@ -1278,6 +1289,7 @@ impl AppState {
             let redis_cluster_prefix = redis_cluster_transport_prefix(connection_id);
             self.tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
             self.proxy_tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
+            self.http_tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
         }
 
         result
@@ -1299,6 +1311,7 @@ impl AppState {
                 node.port,
                 &self.tunnels,
                 &self.proxy_tunnels,
+                &self.http_tunnels,
             )
             .await?;
             routes.push(db::redis_driver::RedisNodeRoute {
@@ -1743,18 +1756,22 @@ impl AppState {
         let redis_cluster_prefix = redis_cluster_transport_prefix(connection_id);
         self.tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
         self.proxy_tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
+        self.http_tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
         let redis_sentinel_prefix = redis_sentinel_transport_prefix(connection_id);
         self.tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
         self.proxy_tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
+        self.http_tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
         db::transport_layer_tunnel::stop_transport_layers(
             connection_id,
             layer_count,
             &self.tunnels,
             &self.proxy_tunnels,
+            &self.http_tunnels,
         )
         .await;
         self.tunnels.stop_tunnel(connection_id).await;
         self.proxy_tunnels.stop_tunnel(connection_id).await;
+        self.http_tunnels.stop_tunnel(connection_id).await;
     }
 
     /// Health-check the base connection pool for a given connection_id.

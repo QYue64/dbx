@@ -156,7 +156,7 @@ export interface ConnectionConfig {
   read_only?: boolean;
 }
 
-export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig);
+export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig) | ({ type: "http_tunnel" } & HttpTunnelConfig);
 
 export interface SshTunnelConfig {
   id: string;
@@ -183,6 +183,15 @@ export interface ProxyTunnelConfig {
   port: number;
   username?: string;
   password?: string;
+}
+
+export interface HttpTunnelConfig {
+  id: string;
+  name?: string;
+  enabled?: boolean;
+  url: string;
+  token?: string;
+  connect_timeout_secs?: number;
 }
 
 export interface AttachedDatabaseConfig {

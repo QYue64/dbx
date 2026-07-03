@@ -95,6 +95,8 @@ pub struct ConnectionConfig {
 pub enum TransportLayerConfig {
     Ssh(SshTunnelConfig),
     Proxy(ProxyTunnelConfig),
+    #[serde(rename = "http_tunnel")]
+    HttpTunnel(HttpTunnelConfig),
 }
 
 impl TransportLayerConfig {
@@ -102,6 +104,7 @@ impl TransportLayerConfig {
         match self {
             TransportLayerConfig::Ssh(layer) => &layer.id,
             TransportLayerConfig::Proxy(layer) => &layer.id,
+            TransportLayerConfig::HttpTunnel(layer) => &layer.id,
         }
     }
 
@@ -109,6 +112,7 @@ impl TransportLayerConfig {
         match self {
             TransportLayerConfig::Ssh(layer) => &layer.name,
             TransportLayerConfig::Proxy(layer) => &layer.name,
+            TransportLayerConfig::HttpTunnel(layer) => &layer.name,
         }
     }
 
@@ -116,6 +120,7 @@ impl TransportLayerConfig {
         match self {
             TransportLayerConfig::Ssh(layer) => layer.enabled,
             TransportLayerConfig::Proxy(layer) => layer.enabled,
+            TransportLayerConfig::HttpTunnel(layer) => layer.enabled,
         }
     }
 
@@ -123,6 +128,9 @@ impl TransportLayerConfig {
         match self {
             TransportLayerConfig::Ssh(layer) => (&layer.host, layer.port),
             TransportLayerConfig::Proxy(layer) => (&layer.host, layer.port),
+            // HTTP script tunnel layers dial a PHP script URL instead of a host:port
+            // endpoint, and are validated as the outermost transport layer.
+            TransportLayerConfig::HttpTunnel(_) => ("", 0),
         }
     }
 }
@@ -181,6 +189,22 @@ pub struct ProxyTunnelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpTunnelConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default = "default_http_tunnel_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachedDatabaseConfig {
     pub name: String,
     pub path: String,
@@ -196,6 +220,10 @@ fn default_ssh_port() -> u16 {
 
 pub fn default_ssh_connect_timeout_secs() -> u64 {
     5
+}
+
+pub fn default_http_tunnel_connect_timeout_secs() -> u64 {
+    10
 }
 
 pub fn default_connect_timeout_secs() -> u64 {
@@ -592,7 +620,7 @@ impl ConnectionConfig {
             .into_iter()
             .filter_map(|layer| match layer {
                 TransportLayerConfig::Ssh(ssh) => Some(ssh),
-                TransportLayerConfig::Proxy(_) => None,
+                TransportLayerConfig::Proxy(_) | TransportLayerConfig::HttpTunnel(_) => None,
             })
             .collect()
     }
@@ -1920,7 +1948,7 @@ mod tests {
                 assert_eq!(proxy.username, "alice");
                 assert_eq!(proxy.password, "secret");
             }
-            TransportLayerConfig::Ssh(_) => panic!("expected proxy layer"),
+            _ => panic!("expected proxy layer"),
         }
     }
 

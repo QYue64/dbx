@@ -13,7 +13,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
-import type { ConnectionConfig, DatabaseType, JdbcDriverInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
+import type { ConnectionConfig, DatabaseType, HttpTunnelConfig, JdbcDriverInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { NacosAdminConfig, NacosAuthConfig } from "@/types/nacos";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -234,6 +234,17 @@ function defaultProxyTunnel(): ProxyTunnelConfig {
   };
 }
 
+function defaultHttpTunnel(): HttpTunnelConfig {
+  return {
+    id: uuid(),
+    name: "",
+    enabled: true,
+    url: "",
+    token: "",
+    connect_timeout_secs: 10,
+  };
+}
+
 function normalizeProxyTunnel(layer: Partial<ProxyTunnelConfig>): ProxyTunnelConfig {
   return {
     id: layer.id || uuid(),
@@ -247,9 +258,23 @@ function normalizeProxyTunnel(layer: Partial<ProxyTunnelConfig>): ProxyTunnelCon
   };
 }
 
+function normalizeHttpTunnel(layer: Partial<HttpTunnelConfig>): HttpTunnelConfig {
+  return {
+    id: layer.id || uuid(),
+    name: layer.name || "",
+    enabled: layer.enabled !== false,
+    url: layer.url || "",
+    token: layer.token || "",
+    connect_timeout_secs: Number(layer.connect_timeout_secs) || 10,
+  };
+}
+
 function normalizeTransportLayer(layer: Partial<TransportLayerConfig>): TransportLayerConfig {
   if (layer.type === "proxy") {
     return { type: "proxy", ...normalizeProxyTunnel(layer) };
+  }
+  if (layer.type === "http_tunnel") {
+    return { type: "http_tunnel", ...normalizeHttpTunnel(layer) };
   }
   return { type: "ssh", ...normalizeSshTunnel(layer as Partial<SshTunnelConfig>) };
 }
@@ -1334,16 +1359,22 @@ const selectedTransportLayer = computed(() => {
 });
 const selectedSshLayer = computed(() => (selectedTransportLayer.value?.type === "ssh" ? selectedTransportLayer.value : null));
 const selectedProxyLayer = computed(() => (selectedTransportLayer.value?.type === "proxy" ? selectedTransportLayer.value : null));
+const selectedHttpTunnelLayer = computed(() => (selectedTransportLayer.value?.type === "http_tunnel" ? selectedTransportLayer.value : null));
+
+function transportLayerDefaultName(layer: TransportLayerConfig, index: number): string {
+  if (layer.type === "proxy") return `Proxy ${index + 1}`;
+  if (layer.type === "http_tunnel") return t("connection.httpTunnelDefaultName", { index: index + 1 });
+  return t("connection.sshHopDefaultName", { index: index + 1 });
+}
+
+function transportLayerDisplayName(layer: TransportLayerConfig, index: number): string {
+  const target = layer.type === "http_tunnel" ? layer.url?.trim() : layer.host?.trim();
+  return layer.name?.trim() || target || transportLayerDefaultName(layer, index);
+}
+
 const transportPathSegments = computed(() => {
   const layers = transportLayers.value.filter((layer) => layer.enabled !== false);
-  return [
-    "DBX",
-    ...layers.map((layer, index) => {
-      const fallback = layer.type === "proxy" ? `Proxy ${index + 1}` : `SSH ${index + 1}`;
-      return layer.name?.trim() || layer.host?.trim() || fallback;
-    }),
-    form.value.host || "Database",
-  ];
+  return ["DBX", ...layers.map(transportLayerDisplayName), form.value.host || "Database"];
 });
 
 function defaultDatabaseForProfile() {
@@ -2838,6 +2869,14 @@ function addProxyTunnel() {
   resetTestState();
 }
 
+function addHttpTunnel() {
+  const next: TransportLayerConfig = { type: "http_tunnel", ...defaultHttpTunnel() };
+  next.name = t("connection.httpTunnelDefaultName", { index: 1 });
+  form.value.transport_layers = [next, ...transportLayers.value];
+  selectedTransportLayerId.value = next.id;
+  resetTestState();
+}
+
 function duplicateTransportLayer(layer: TransportLayerConfig) {
   const next = normalizeTransportLayer({ ...layer, id: uuid(), name: layer.name ? `${layer.name} copy` : "" });
   form.value.transport_layers = [...transportLayers.value, next];
@@ -2875,10 +2914,11 @@ function dropTransportLayer(targetId: string) {
   resetTestState();
 }
 
-function changeSelectedTransportLayerType(type: "ssh" | "proxy") {
+function changeSelectedTransportLayerType(type: "ssh" | "proxy" | "http_tunnel") {
   const selected = selectedTransportLayer.value;
   if (!selected || selected.type === type) return;
-  const replacement: TransportLayerConfig = type === "proxy" ? { type: "proxy", ...defaultProxyTunnel(), id: selected.id, name: selected.name } : { type: "ssh", ...defaultSshTunnel(), id: selected.id, name: selected.name };
+  const replacement: TransportLayerConfig =
+    type === "proxy" ? { type: "proxy", ...defaultProxyTunnel(), id: selected.id, name: selected.name } : type === "http_tunnel" ? { type: "http_tunnel", ...defaultHttpTunnel(), id: selected.id, name: selected.name } : { type: "ssh", ...defaultSshTunnel(), id: selected.id, name: selected.name };
   form.value.transport_layers = transportLayers.value.map((layer) => (layer.id === selected.id ? replacement : layer));
   resetTestState();
 }
@@ -2894,7 +2934,16 @@ function validateTransportLayers(config: LegacyConnectionConfig) {
   const layers = config.transport_layers || [];
   layers.forEach((layer, index) => {
     if (layer.enabled === false) return;
-    const label = layer.name?.trim() || t("connection.sshHopDefaultName", { index: index + 1 });
+    const label = layer.name?.trim() || transportLayerDefaultName(layer, index);
+    if (layer.type === "http_tunnel") {
+      if (index !== 0) throw new Error(t("connection.httpTunnelInvalidOrder", { hop: label }));
+      if (!layer.url?.trim()) throw new Error(t("connection.httpTunnelInvalidUrl", { hop: label }));
+      const timeout = Number(layer.connect_timeout_secs);
+      if (!Number.isFinite(timeout) || timeout < 1 || timeout > 300) {
+        throw new Error(t("connection.httpTunnelInvalidTimeout", { hop: label }));
+      }
+      return;
+    }
     if (!layer.host?.trim()) throw new Error(t("connection.sshHopInvalidHost", { hop: label }));
     const port = Number(layer.port);
     if (!Number.isFinite(port) || port < 1 || port > 65535) {
@@ -4589,17 +4638,17 @@ function openExternalUrl(url: string) {
             </TabsContent>
 
             <TabsContent v-if="canUseTransportLayers" value="transport" class="m-0">
-              <div class="connection-form-body grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto">
-                <div class="connection-label-wide-grid grid grid-cols-4 items-start gap-4">
+              <div class="connection-form-body grid gap-4 py-4 pr-2 max-h-[65vh] overflow-y-auto overflow-x-hidden">
+                <div class="connection-label-wide-grid grid min-w-0 grid-cols-4 items-start gap-4">
                   <Label :class="connectionLabelSmallPaddedClass">{{ t("connection.sshHops") }}</Label>
-                  <div class="col-span-3 grid gap-3">
-                    <div class="flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
+                  <div class="col-span-3 grid min-w-0 gap-3">
+                    <div class="flex min-w-0 flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
                       <template v-for="(segment, index) in transportPathSegments" :key="`${segment}-${index}`">
-                        <span class="rounded border bg-muted/40 px-2 py-1">{{ segment }}</span>
+                        <span class="inline-block max-w-full truncate rounded border bg-muted/40 px-2 py-1">{{ segment }}</span>
                         <ChevronRight v-if="index < transportPathSegments.length - 1" class="h-3 w-3" />
                       </template>
                     </div>
-                    <div class="grid gap-2">
+                    <div class="grid min-w-0 gap-2">
                       <button
                         v-for="(hop, index) in transportLayers"
                         :key="hop.id"
@@ -4616,7 +4665,7 @@ function openExternalUrl(url: string) {
                         <span class="w-5 shrink-0 text-muted-foreground">{{ index + 1 }}</span>
                         <input v-model="hop.enabled" type="checkbox" class="mr-0" @click.stop />
                         <span class="min-w-0 flex-1 truncate">
-                          {{ hop.name || hop.host || (hop.type === "proxy" ? `Proxy ${index + 1}` : t("connection.sshHopDefaultName", { index: index + 1 })) }}
+                          {{ transportLayerDisplayName(hop, index) }}
                         </span>
                         <Tooltip>
                           <TooltipTrigger as-child>
@@ -4636,7 +4685,7 @@ function openExternalUrl(url: string) {
                         </Tooltip>
                       </button>
                     </div>
-                    <div class="flex items-center gap-2">
+                    <div class="flex min-w-0 flex-wrap items-center gap-2">
                       <Button type="button" variant="outline" size="sm" @click="addSshTunnel">
                         <Plus class="mr-1.5 h-3.5 w-3.5" />
                         {{ t("connection.sshHopAdd") }}
@@ -4644,6 +4693,10 @@ function openExternalUrl(url: string) {
                       <Button type="button" variant="outline" size="sm" @click="addProxyTunnel">
                         <Plus class="mr-1.5 h-3.5 w-3.5" />
                         {{ t("connection.proxy") }}
+                      </Button>
+                      <Button type="button" variant="outline" size="sm" @click="addHttpTunnel">
+                        <Plus class="mr-1.5 h-3.5 w-3.5" />
+                        {{ t("connection.httpTunnelAdd") }}
                       </Button>
                       <Button v-if="selectedTransportLayer" type="button" variant="outline" size="sm" @click="duplicateTransportLayer(selectedTransportLayer)">
                         <Copy class="mr-1.5 h-3.5 w-3.5" />
@@ -4671,6 +4724,7 @@ function openExternalUrl(url: string) {
                       <SelectContent>
                         <SelectItem value="ssh">SSH</SelectItem>
                         <SelectItem value="proxy">Proxy</SelectItem>
+                        <SelectItem value="http_tunnel">{{ t("connection.httpTunnel") }}</SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
@@ -4754,6 +4808,20 @@ function openExternalUrl(url: string) {
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelSmallClass">{{ t("connection.proxyPassword") }}</Label>
                       <PasswordInput v-model="selectedProxyLayer.password" class="col-span-3" :placeholder="t('connection.proxyPasswordPlaceholder')" :disabled="selectedProxyLayer.enabled === false" />
+                    </div>
+                  </template>
+                  <template v-else-if="selectedHttpTunnelLayer">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.httpTunnelUrl") }}</Label>
+                      <Input v-model="selectedHttpTunnelLayer.url" class="col-span-3" placeholder="https://dbx.example.com/dbx_tunnel.php" :disabled="selectedHttpTunnelLayer.enabled === false" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.httpTunnelToken") }}</Label>
+                      <PasswordInput v-model="selectedHttpTunnelLayer.token" class="col-span-3" :placeholder="t('connection.httpTunnelTokenPlaceholder')" :disabled="selectedHttpTunnelLayer.enabled === false" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label :class="connectionLabelSmallClass">{{ t("connection.httpTunnelConnectTimeout") }}</Label>
+                      <Input v-model.number="selectedHttpTunnelLayer.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" :disabled="selectedHttpTunnelLayer.enabled === false" />
                     </div>
                   </template>
                 </template>
@@ -4959,9 +5027,5 @@ function openExternalUrl(url: string) {
 .connection-dialog-content[data-wide="true"] .connection-form-body {
   width: min(100%, 36rem);
   margin-inline: auto;
-}
-
-.connection-dialog-content .grid.grid-cols-4.connection-label-wide-grid {
-  grid-template-columns: 7.75rem repeat(3, minmax(0, 1fr));
 }
 </style>
