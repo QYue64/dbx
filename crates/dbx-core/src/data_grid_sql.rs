@@ -1029,6 +1029,10 @@ pub fn format_grid_sql_literal(
         return format_pg_array_sql_literal(arr);
     }
     let text = value.as_str().map_or_else(|| value.to_string(), ToString::to_string);
+    if column_info.map(|column| is_numeric_type(&column.data_type)).unwrap_or(false) && is_numeric_literal(&text) {
+        // BigDecimal/BigInteger cells cross JSON-RPC as strings so browsers cannot round them.
+        return text;
+    }
     if database_type == Some(DatabaseType::ManticoreSearch) {
         if let Some(typed_value) = manticore_typed_attribute_value(&text, column_info) {
             return format_grid_sql_literal(&typed_value, database_type, column_info);
@@ -2309,6 +2313,25 @@ mod tests {
         assert_eq!(
             format_grid_sql_literal(&json!("2022-08-25 09:58:43"), Some(DatabaseType::Oracle), Some(&date)),
             "TO_DATE('2022-08-25 09:58:43', 'YYYY-MM-DD HH24:MI:SS')"
+        );
+    }
+
+    #[test]
+    fn formats_numeric_string_literals_for_numeric_columns_without_quotes() {
+        let number = column("amount", "NUMBER(20,0)", true, None);
+        let text = column("code", "VARCHAR2(32)", true, None);
+
+        assert_eq!(
+            format_grid_sql_literal(&json!("12345678901234567890"), Some(DatabaseType::Oracle), Some(&number)),
+            "12345678901234567890"
+        );
+        assert_eq!(
+            format_grid_sql_literal(&json!("12345678901234567890"), Some(DatabaseType::Oracle), Some(&text)),
+            "'12345678901234567890'"
+        );
+        assert_eq!(
+            format_grid_sql_literal(&json!("123-not-a-number"), Some(DatabaseType::Oracle), Some(&number)),
+            "'123-not-a-number'"
         );
     }
 
