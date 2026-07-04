@@ -638,6 +638,8 @@ impl AppState {
         pool: PoolKind,
         config: &ConnectionConfig,
     ) {
+        // mq_registry only exists in mq-admin builds; other builds reject MQ connects before a pool is created.
+        #[cfg(feature = "mq-admin")]
         if matches!(pool, PoolKind::MessageQueue) {
             self.mq_registry.drop_connection(connection_id).await;
         }
