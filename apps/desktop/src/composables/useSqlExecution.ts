@@ -5,14 +5,14 @@ import { useHistoryStore } from "@/stores/historyStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
-import { isSingleDatabase } from "@/lib/databaseCapabilities";
-import { classifySqlActivityKind } from "@/lib/historyActivityKind";
-import { appendGovernanceAuditRecord, createQueryAuditRecord, evaluateSqlGovernance, findConnectionSharePolicy, readGovernancePolicy, type WorkspacePrincipal } from "@/lib/workspaceGovernance";
-import { sqlMetadataRefreshTarget } from "@/lib/sqlMetadataRefresh";
-import { classifyRedisCommandSafety, firstRedisCommandToken } from "@/lib/redisCommandSafety";
-import { isSqlExecutionSnapshot, resolveExecutableSql, type SqlExecutionOverride, type SqlExecutionSnapshot } from "@/lib/sqlExecutionTarget";
-import { uuid } from "@/lib/utils";
-import { extractSqlParameters } from "@/lib/sqlParameters";
+import { isSingleDatabase } from "@/lib/database/databaseCapabilities";
+import { canExecuteWithoutSelectedDatabase } from "@/lib/connection/connectionLevelDatabaseBootstrap";
+import { classifySqlActivityKind } from "@/lib/history/historyActivityKind";
+import { sqlMetadataRefreshTarget } from "@/lib/sql/sqlMetadataRefresh";
+import { classifyRedisCommandSafety, firstRedisCommandToken } from "@/lib/redis/redisCommandSafety";
+import { isSqlExecutionSnapshot, resolveExecutableSql, type SqlExecutionOverride, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
+import { extractSqlParameters } from "@/lib/sql/sqlParameters";
+import { appendGovernanceAuditRecord, createQueryAuditRecord, evaluateSqlGovernance, findConnectionSharePolicy, readGovernancePolicy, type QueryAuditRecord, type WorkspacePrincipal } from "@/lib/workspaceGovernance";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
 const DANGER_RE = /^\s*(DROP|DELETE|TRUNCATE|ALTER|UPDATE|MERGE|REPLACE)\b/i;
@@ -75,7 +75,7 @@ export function useSqlExecution(deps: {
     const tab = deps.activeTab.value;
     const sql = await resolvedExecutableSql(sqlOverride);
     if (!tab || !sql.trim()) return;
-    if (requiresDatabaseSelection(tab, deps.activeConnection.value)) {
+    if (requiresDatabaseSelection(tab, deps.activeConnection.value, sql)) {
       deps.onMissingDatabase?.();
       return;
     }
@@ -84,9 +84,6 @@ export function useSqlExecution(deps: {
   }
 
   async function continueExecute(sql: string) {
-    const tab = deps.activeTab.value;
-    if (!tab) return;
-
     // Redis: block dangerous commands when toggle is on (check each line for multi-line input)
     if (deps.activeConnection.value?.db_type === "redis" && deps.blockDangerousRedisCommands?.value !== false) {
       const commands = sql
@@ -101,24 +98,7 @@ export function useSqlExecution(deps: {
         }
       }
     }
-    const governanceDecision = currentGovernanceDecision(sql, tab.connectionId);
-    if (!governanceDecision.allowed) {
-      appendGovernanceAuditRecord({
-        ...createQueryAuditRecord({
-          id: uuid(),
-          connectionId: tab.connectionId,
-          principalId: LOCAL_PRINCIPAL_ID,
-          sql,
-          decision: governanceDecision,
-          createdAt: new Date().toISOString(),
-        }),
-        status: "error",
-        error: `Governance blocked: ${governanceDecision.reasons.join(", ")}`,
-      });
-      toast(`Governance blocked SQL: ${governanceDecision.reasons.join(", ")}`, 5000);
-      return;
-    }
-    if (governanceDecision.requiresApproval || (isDangerousSql(sql) && settingsStore.editorSettings.confirmDangerousSqlExecution)) {
+    if (isDangerousSql(sql) && settingsStore.editorSettings.confirmDangerousSqlExecution) {
       dangerSql.value = sql;
       pendingDangerSql.value = sql;
       suppressDangerConfirm.value = false;
@@ -141,8 +121,18 @@ export function useSqlExecution(deps: {
     sql ??= await resolvedExecutableSql();
     const tab = deps.activeTab.value;
     if (!tab || !sql.trim()) return;
-    if (requiresDatabaseSelection(tab, deps.activeConnection.value)) {
+    if (requiresDatabaseSelection(tab, deps.activeConnection.value, sql)) {
       deps.onMissingDatabase?.();
+      return;
+    }
+    const governanceAudit = currentGovernanceDecision(sql, tab.connectionId);
+    if (!governanceAudit.decision.allowed) {
+      appendGovernanceAuditRecord({
+        ...governanceAudit.auditRecord,
+        status: "error",
+        error: governanceAudit.decision.reasons.join(", ") || "governance_blocked",
+      });
+      toast(t("ai.agentStepTitles.blocked"), 5000);
       return;
     }
     deps.activeOutputView.value = "result";
@@ -155,21 +145,6 @@ export function useSqlExecution(deps: {
     }
     const elapsed = Date.now() - start;
     const success = !tab.result?.columns.includes("Error");
-    const error = success ? undefined : String(tab.result?.rows?.[0]?.[0] ?? "");
-    const governanceDecision = currentGovernanceDecision(sql, tab.connectionId);
-    appendGovernanceAuditRecord({
-      ...createQueryAuditRecord({
-        id: uuid(),
-        connectionId: tab.connectionId,
-        principalId: LOCAL_PRINCIPAL_ID,
-        sql,
-        decision: governanceDecision,
-        createdAt: new Date().toISOString(),
-      }),
-      status: success ? "success" : "error",
-      executionTimeMs: elapsed,
-      error,
-    });
     historyStore.add({
       connection_id: tab.connectionId,
       connection_name: connName,
@@ -177,10 +152,16 @@ export function useSqlExecution(deps: {
       sql,
       execution_time_ms: elapsed,
       success,
-      error,
+      error: success ? undefined : String(tab.result?.rows?.[0]?.[0] ?? ""),
       activity_kind: classifySqlActivityKind(sql),
       operation: primarySqlOperation(sql),
       affected_rows: success ? tab.result?.affected_rows : undefined,
+    });
+    appendGovernanceAuditRecord({
+      ...governanceAudit.auditRecord,
+      status: success ? "success" : "error",
+      executionTimeMs: elapsed,
+      error: success ? undefined : String(tab.result?.rows?.[0]?.[0] ?? ""),
     });
     if (success) {
       const refreshTarget = sqlMetadataRefreshTarget(sql, tab.schema);
@@ -190,6 +171,28 @@ export function useSqlExecution(deps: {
         await connectionStore.refreshObjectListTreeNode(tab.connectionId, tab.database, refreshTarget.schema);
       }
     }
+  }
+
+  function currentGovernanceDecision(sql: string, connectionId: string): { auditRecord: QueryAuditRecord; decision: ReturnType<typeof evaluateSqlGovernance> } {
+    const policy = readGovernancePolicy();
+    const principal: WorkspacePrincipal = { id: LOCAL_PRINCIPAL_ID, role: policy.principalRole };
+    const connection = connectionStore.getConfig(connectionId);
+    const decision = evaluateSqlGovernance(sql, connection, {
+      principal,
+      sharePolicy: findConnectionSharePolicy(connectionId),
+      requireApprovalForWrites: policy.requireApprovalForWrites,
+      allowDangerousSql: policy.allowDangerousSql,
+      allowProductionWrites: policy.allowProductionWrites,
+    });
+    const auditRecord = createQueryAuditRecord({
+      id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      connectionId,
+      principalId: principal.id,
+      sql,
+      decision,
+      createdAt: new Date().toISOString(),
+    });
+    return { auditRecord, decision };
   }
 
   function cancelActiveExecution() {
@@ -203,21 +206,6 @@ export function useSqlExecution(deps: {
     if (reason === "unsupported") return t("explain.unsupported");
     if (reason === "unsafe") return t("explain.unsafe");
     return t("explain.emptySql");
-  }
-
-  function currentGovernanceDecision(sql: string, connectionId: string) {
-    const policy = readGovernancePolicy();
-    const principal: WorkspacePrincipal = {
-      id: LOCAL_PRINCIPAL_ID,
-      role: policy.principalRole,
-    };
-    return evaluateSqlGovernance(sql, deps.activeConnection.value, {
-      principal,
-      sharePolicy: findConnectionSharePolicy(connectionId),
-      allowDangerousSql: policy.allowDangerousSql,
-      allowProductionWrites: policy.allowProductionWrites,
-      requireApprovalForWrites: policy.requireApprovalForWrites,
-    });
   }
 
   async function tryExplain(sqlOverride?: SqlExecutionOverride) {
@@ -279,9 +267,10 @@ function supportsSqlTemplateParameters(connection: ConnectionConfig | undefined)
   return connection.db_type !== "redis" && connection.db_type !== "mongodb";
 }
 
-function requiresDatabaseSelection(tab: QueryTab, connection: ConnectionConfig | undefined): boolean {
+export function requiresDatabaseSelection(tab: QueryTab, connection: ConnectionConfig | undefined, sql = ""): boolean {
   if (tab.mode !== "query") return false;
   if (!connection || tab.database) return false;
   if (isSingleDatabase(connection.db_type)) return false;
+  if (canExecuteWithoutSelectedDatabase(connection, sql)) return false;
   return !["elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "zookeeper"].includes(connection.db_type);
 }

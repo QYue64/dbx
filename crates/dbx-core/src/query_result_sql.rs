@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::connection::DatabaseType;
 use crate::sql::find_statement_at_cursor;
-use crate::sql_dialect::{pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy};
+use crate::sql_dialect::{
+    firebird_rows_clause, pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy,
+};
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -187,6 +189,7 @@ pub fn build_paginated_query_sql(options: PaginatedQuerySqlOptions) -> QuerySqlB
             .unwrap_or_else(|| err("unsupported")),
         TablePaginationStrategy::QuestDbLimit => ok(add_questdb_limit(&statement, safe_limit, safe_offset)),
         TablePaginationStrategy::InformixFirst => ok(add_informix_first_limit(&statement, safe_limit, safe_offset)),
+        TablePaginationStrategy::FirebirdRows => ok(add_firebird_rows_limit(&statement, safe_limit, safe_offset)),
         TablePaginationStrategy::Db2FetchFirst | TablePaginationStrategy::FetchFirst => {
             ok(add_fetch_first_limit(&statement, safe_limit, safe_offset))
         }
@@ -790,6 +793,26 @@ fn has_top_level_informix_row_limit(sql: &str) -> bool {
     tokens[select_index + 1..from_index].iter().any(|token| token.text == "FIRST" || token.text == "SKIP")
 }
 
+fn has_top_level_firebird_row_limit(sql: &str) -> bool {
+    if has_top_level_fetch_first(sql) {
+        return true;
+    }
+    let tokens = top_level_sql_tokens(sql);
+    if tokens.iter().any(|token| token.text == "ROWS") {
+        return true;
+    }
+    let Some(select_index) = tokens.iter().position(|token| token.text == "SELECT") else {
+        return false;
+    };
+    let from_index = tokens
+        .iter()
+        .enumerate()
+        .find(|(index, token)| *index > select_index && token.text == "FROM")
+        .map(|(index, _)| index)
+        .unwrap_or(tokens.len());
+    tokens[select_index + 1..from_index].iter().any(|token| token.text == "FIRST" || token.text == "SKIP")
+}
+
 fn has_top_level_fetch_first(sql: &str) -> bool {
     let tokens = top_level_sql_tokens(sql);
     tokens.windows(2).any(|w| w[0].text == "FETCH" && w[1].text == "FIRST")
@@ -820,6 +843,14 @@ fn add_fetch_first_limit(statement: &str, limit: usize, offset: usize) -> String
     }
     let offset_sql = if offset > 0 { format!(" OFFSET {offset} ROWS") } else { String::new() };
     append_sql_suffix(statement, &format!("{offset_sql} FETCH FIRST {limit} ROWS ONLY;"))
+}
+
+fn add_firebird_rows_limit(statement: &str, limit: usize, offset: usize) -> String {
+    if has_top_level_firebird_row_limit(statement) {
+        return format!("{statement};");
+    }
+    let rows = firebird_rows_clause(limit, offset);
+    append_sql_suffix(statement, &format!("{rows};"))
 }
 
 fn add_rownum_limit(statement: &str, limit: usize, offset: usize) -> String {
@@ -862,7 +893,11 @@ fn add_standard_limit(
         return format!("{statement};");
     }
     let offset_sql = if offset > 0 { format!(" OFFSET {offset}") } else { String::new() };
-    append_sql_suffix(statement, &format!("{order_sql} LIMIT {limit}{offset_sql};"))
+    let limit_sql = format!("{order_sql} LIMIT {limit}{offset_sql}");
+    if database_type == Some(DatabaseType::ClickHouse) {
+        return add_clickhouse_limit(statement, &limit_sql);
+    }
+    append_sql_suffix(statement, &format!("{limit_sql};"))
 }
 
 fn add_outer_standard_limit(
@@ -874,6 +909,20 @@ fn add_outer_standard_limit(
 ) -> String {
     let alias = quote_table_identifier(database_type, "dbx_page");
     derived_table_sql("SELECT * FROM", statement, &format!("{alias}{order_sql} LIMIT {limit} OFFSET {offset};"))
+}
+
+fn add_clickhouse_limit(statement: &str, limit_sql: &str) -> String {
+    let limit_sql = limit_sql.trim();
+    let settings_index =
+        top_level_sql_tokens(statement).iter().find(|token| token.text == "SETTINGS").map(|token| token.start);
+
+    if let Some(index) = settings_index {
+        let statement_before_settings = statement[..index].trim_end();
+        let settings_clause = statement[index..].trim_start();
+        return format!("{statement_before_settings} {limit_sql} {settings_clause};");
+    }
+
+    append_sql_suffix(statement, &format!("{limit_sql};"))
 }
 
 fn derived_table_sql(prefix: &str, statement: &str, suffix: &str) -> String {
@@ -1511,6 +1560,43 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn clickhouse_settings_clause_is_paginated_before_settings() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT * FROM system.clusters SETTINGS max_execution_time = 0".to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            limit: 50,
+            offset: 100,
+        });
+
+        assert!(result.ok);
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM system.clusters LIMIT 50 OFFSET 100 SETTINGS max_execution_time = 0;"
+        );
+    }
+
+    #[test]
+    fn clickhouse_query_plan_places_limit_before_settings() {
+        let sql = "SELECT * FROM system.clusters SETTINGS max_execution_time = 0";
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: Some(DatabaseType::ClickHouse),
+            pagination: QueryPagination { limit: 100, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        assert_eq!(plan.sql_to_execute, "SELECT * FROM system.clusters LIMIT 100 SETTINGS max_execution_time = 0;");
+        assert_eq!(
+            plan.page_sql,
+            Some("SELECT * FROM system.clusters LIMIT 100 SETTINGS max_execution_time = 0;".to_string())
+        );
+        assert_eq!(plan.page_limit, Some(100));
+        assert_eq!(plan.page_offset, Some(0));
+    }
+
+    #[test]
     fn clickhouse_scalar_with_select_can_be_counted() {
         let result = build_count_query_sql(CountQuerySqlOptions {
             original_sql: "WITH 1 AS min_id SELECT dept, COUNT(*) FROM employees WHERE id >= min_id GROUP BY dept"
@@ -1665,6 +1751,30 @@ WHERE u.id = picked.id;
         });
 
         assert_eq!(result.sql.unwrap(), "SELECT FIRST 20 id FROM users;");
+    }
+
+    #[test]
+    fn uses_rows_pagination_for_firebird() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users WHERE active = 1 ORDER BY id".to_string(),
+            database_type: Some(DatabaseType::Firebird),
+            limit: 50,
+            offset: 100,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT id FROM users WHERE active = 1 ORDER BY id ROWS 101 TO 150;");
+    }
+
+    #[test]
+    fn firebird_pagination_keeps_existing_rows_clause() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users ROWS 20".to_string(),
+            database_type: Some(DatabaseType::Firebird),
+            limit: 50,
+            offset: 0,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT id FROM users ROWS 20;");
     }
 
     #[test]
@@ -2088,7 +2198,7 @@ WHERE u.id = picked.id;
         // `add_outer_standard_limit` always includes OFFSET clause.
         assert_eq!(
             result.sql.unwrap(),
-            "SELECT * FROM (SELECT DISTINCT a, b, c FROM t LIMIT 500) \"dbx_page\" ORDER BY 1, 2, 3 LIMIT 100 OFFSET 0;"
+            "SELECT * FROM (SELECT DISTINCT a, b, c FROM t LIMIT 500) `dbx_page` ORDER BY 1, 2, 3 LIMIT 100 OFFSET 0;"
         );
     }
 

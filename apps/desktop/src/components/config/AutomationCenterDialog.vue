@@ -8,8 +8,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import * as api from "@/lib/api";
-import { copyToClipboard } from "@/lib/clipboard";
+import * as api from "@/lib/backend/api";
+import { copyToClipboard } from "@/lib/common/clipboard";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
 import { useAutomationScheduler } from "@/composables/useAutomationScheduler";
@@ -30,7 +30,7 @@ import {
   type AutomationRunRecord,
   type AutomationSchedule,
 } from "@/lib/workspaceAutomation";
-import type { WebDavConfig } from "@/lib/tauri";
+import type { WebDavConfig } from "@/lib/backend/tauri";
 
 const open = defineModel<boolean>("open", { default: false });
 const props = defineProps<{

@@ -5,6 +5,7 @@ import {
   DBX_ROWID_COLUMN,
   DBX_TDENGINE_TBNAME_COLUMN,
   canEditExistingTableRows,
+  canInsertTableRows,
   editablePrimaryKeys,
   hiveTablePropertiesIndicateTransactional,
   isHiddenGridColumn,
@@ -12,7 +13,7 @@ import {
   isTableDataEditable,
   supportsDataGridTransaction,
   usesSyntheticRowIdKey,
-} from "../../apps/desktop/src/lib/tableEditing.ts";
+} from "../../apps/desktop/src/lib/table/tableEditing.ts";
 import type { ColumnInfo } from "../../apps/desktop/src/types/database.ts";
 
 function column(name: string, isPrimaryKey = false): ColumnInfo {
@@ -65,6 +66,15 @@ test("does not use transactional grid saves for non-transactional engines", () =
   assert.equal(supportsDataGridTransaction("jdbc"), false);
   assert.equal(supportsDataGridTransaction("yashandb"), true);
   assert.equal(supportsDataGridTransaction("postgres"), true);
+});
+
+test("detects whether table data supports inserted rows", () => {
+  assert.equal(canInsertTableRows("postgres"), true);
+  assert.equal(canInsertTableRows("mysql"), true);
+  assert.equal(canInsertTableRows("hive"), true);
+  assert.equal(canInsertTableRows("jdbc"), false);
+  assert.equal(canInsertTableRows("clickhouse"), true);
+  assert.equal(canInsertTableRows("influxdb"), false);
 });
 
 test("allows existing row edits according to database-specific key requirements", () => {
@@ -124,6 +134,8 @@ test("keeps TDengine existing row identity and tag columns read-only", () => {
 test("detects the synthetic Oracle ROWID key case", () => {
   assert.equal(usesSyntheticRowIdKey("oracle", [DBX_ROWID_COLUMN]), true);
   assert.equal(usesSyntheticRowIdKey("oracle", [DBX_ROWID_COLUMN.toLowerCase()]), true);
+  assert.equal(usesSyntheticRowIdKey("oracle", [DBX_ROWID_COLUMN], "VIEW"), false);
+  assert.equal(usesSyntheticRowIdKey("oracle", [DBX_ROWID_COLUMN], "MATERIALIZED_VIEW"), false);
   assert.equal(usesSyntheticRowIdKey("postgres", [DBX_ROWID_COLUMN]), false);
   assert.equal(usesSyntheticRowIdKey("oracle", ["ID"]), false);
   assert.equal(usesSyntheticRowIdKey("neo4j", [DBX_NEO4J_ELEMENT_ID_COLUMN]), true);
@@ -131,6 +143,7 @@ test("detects the synthetic Oracle ROWID key case", () => {
 
 test("hides only the synthetic Oracle ROWID grid column", () => {
   assert.equal(isHiddenGridColumn("oracle", DBX_ROWID_COLUMN, [DBX_ROWID_COLUMN]), true);
+  assert.equal(isHiddenGridColumn("oracle", DBX_ROWID_COLUMN, [DBX_ROWID_COLUMN], "VIEW"), false);
   assert.equal(isHiddenGridColumn("oracle", "ROWID", [DBX_ROWID_COLUMN]), false);
   assert.equal(isHiddenGridColumn("mysql", DBX_ROWID_COLUMN, [DBX_ROWID_COLUMN]), false);
   assert.equal(isHiddenGridColumn("neo4j", DBX_NEO4J_ELEMENT_ID_COLUMN, [DBX_NEO4J_ELEMENT_ID_COLUMN]), true);

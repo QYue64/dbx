@@ -1,11 +1,11 @@
-import * as api from "@/lib/api";
-import { classifyAiSqlExecution, classifyConnectionEnvironment } from "@/lib/aiSqlExecutionPolicy";
-import { usesAgentCursorForQuery } from "@/lib/databaseDriverManifest";
-import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
-import { queryTimeoutSecsForConnection } from "@/lib/queryTimeout";
+import * as api from "@/lib/backend/api";
+import { classifyAiSqlExecution, classifyConnectionEnvironment } from "@/lib/ai/aiSqlExecutionPolicy";
+import { usesAgentCursorForQuery } from "@/lib/database/databaseDriverManifest";
+import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { appendGovernanceAuditRecord, createQueryAuditRecord, evaluateSqlGovernance, findConnectionSharePolicy, profileQueryResultQuality, readGovernancePolicy, type DataQualityProfile, type GovernanceSeverity } from "@/lib/workspaceGovernance";
-import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan } from "@/lib/dataCompare";
-import type { SavedSqlSyncEntry, WebDavConfig } from "@/lib/tauri";
+import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan } from "@/lib/dataGrid/dataCompare";
+import type { SavedSqlSyncEntry, WebDavConfig } from "@/lib/backend/tauri";
 import type { ConnectionConfig, QueryResult } from "@/types/database";
 
 export type AutomationJobKind = "sql" | "export" | "sync" | "quality-check";

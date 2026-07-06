@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { classifyAiSqlExecution } from "../../apps/desktop/src/lib/aiSqlExecutionPolicy.ts";
+import { classifyAiSqlExecution } from "../../apps/desktop/src/lib/ai/aiSqlExecutionPolicy.ts";
 import {
   appendAutomationDraft,
   buildAuditReport,

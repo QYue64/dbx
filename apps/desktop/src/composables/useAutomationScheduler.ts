@@ -47,7 +47,7 @@ export function useAutomationScheduler(options: { autoStart?: boolean } = {}) {
           }
           await settingsStore.updateDesktopSettings(result.desktopSettings);
           await connectionStore.initFromDisk();
-          await savedSqlStore.reloadFromStorage();
+          await savedSqlStore.initFromStorage();
         },
         savedSqlEntries: async () => {
           await savedSqlStore.initFromStorage();

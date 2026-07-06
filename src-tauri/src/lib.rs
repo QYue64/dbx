@@ -1,6 +1,8 @@
 mod commands;
 mod data_dir;
 mod db;
+#[cfg(target_os = "macos")]
+mod macos_app_delegate;
 mod models;
 mod window_state_guard;
 
@@ -9,6 +11,10 @@ use dbx_core::storage::{maybe_import_user_data_db, DesktopIconTheme, DesktopSett
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+#[cfg(target_os = "macos")]
+use tauri::menu::Menu;
+#[cfg(target_os = "macos")]
+use tauri::menu::{AboutMetadata, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::RunEvent;
 use tauri::{
     menu::MenuBuilder,
@@ -19,31 +25,25 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 const DESKTOP_TRAY_ID: &str = "main-tray";
+const APP_CLOSE_REQUESTED_EVENT: &str = "dbx-app-close-requested";
+#[cfg(target_os = "macos")]
+const APP_MENU_QUIT_ID: &str = "app-menu-quit";
 
 pub struct CloseBehaviorState {
-    quit_on_close: AtomicBool,
-    prompted: AtomicBool,
+    confirmed_exit: AtomicBool,
 }
 
 impl CloseBehaviorState {
-    fn new(settings: &DesktopSettings) -> Self {
-        Self {
-            quit_on_close: AtomicBool::new(settings.quit_on_close),
-            prompted: AtomicBool::new(settings.close_action_prompted),
-        }
+    fn new() -> Self {
+        Self { confirmed_exit: AtomicBool::new(false) }
     }
 
-    fn apply(&self, settings: &DesktopSettings) {
-        self.quit_on_close.store(settings.quit_on_close, Ordering::Relaxed);
-        self.prompted.store(settings.close_action_prompted, Ordering::Relaxed);
+    pub(crate) fn allow_next_exit(&self) {
+        self.confirmed_exit.store(true, Ordering::Relaxed);
     }
 
-    fn quit_on_close(&self) -> bool {
-        self.quit_on_close.load(Ordering::Relaxed)
-    }
-
-    fn prompted(&self) -> bool {
-        self.prompted.load(Ordering::Relaxed)
+    fn take_confirmed_exit(&self) -> bool {
+        self.confirmed_exit.swap(false, Ordering::Relaxed)
     }
 }
 #[cfg(target_os = "macos")]
@@ -66,11 +66,79 @@ fn should_show_main_window_after_setup() -> bool {
     true
 }
 
+fn should_confirm_app_exit_request(target_os: &str, exit_code: Option<i32>, confirmed_exit: bool) -> bool {
+    should_hide_window_on_close(target_os) && exit_code != Some(tauri::RESTART_EXIT_CODE) && !confirmed_exit
+}
+
 fn native_window_decorations_override(target_os: &str) -> Option<bool> {
     match target_os {
         "windows" | "linux" => Some(false),
         _ => None,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let pkg_info = app_handle.package_info();
+    let config = app_handle.config();
+    let app_name = pkg_info.name.clone();
+    let about_metadata = AboutMetadata {
+        name: Some(app_name.clone()),
+        version: Some(pkg_info.version.to_string()),
+        copyright: config.bundle.copyright.clone(),
+        authors: config.bundle.publisher.clone().map(|p| vec![p]),
+        ..Default::default()
+    };
+    let quit_item = MenuItem::with_id(app_handle, APP_MENU_QUIT_ID, format!("Quit {app_name}"), true, Some("Cmd+Q"))?;
+
+    Menu::with_items(
+        app_handle,
+        &[
+            &Submenu::with_items(
+                app_handle,
+                app_name,
+                true,
+                &[
+                    &PredefinedMenuItem::about(app_handle, None, Some(about_metadata))?,
+                    &PredefinedMenuItem::separator(app_handle)?,
+                    &PredefinedMenuItem::services(app_handle, None)?,
+                    &PredefinedMenuItem::separator(app_handle)?,
+                    &PredefinedMenuItem::hide(app_handle, None)?,
+                    &PredefinedMenuItem::hide_others(app_handle, None)?,
+                    &PredefinedMenuItem::separator(app_handle)?,
+                    &quit_item,
+                ],
+            )?,
+            &Submenu::with_items(app_handle, "File", true, &[&PredefinedMenuItem::close_window(app_handle, None)?])?,
+            &Submenu::with_items(
+                app_handle,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::undo(app_handle, None)?,
+                    &PredefinedMenuItem::redo(app_handle, None)?,
+                    &PredefinedMenuItem::separator(app_handle)?,
+                    &PredefinedMenuItem::cut(app_handle, None)?,
+                    &PredefinedMenuItem::copy(app_handle, None)?,
+                    &PredefinedMenuItem::paste(app_handle, None)?,
+                    &PredefinedMenuItem::select_all(app_handle, None)?,
+                ],
+            )?,
+            &Submenu::with_items(app_handle, "View", true, &[&PredefinedMenuItem::fullscreen(app_handle, None)?])?,
+            &Submenu::with_items(
+                app_handle,
+                "Window",
+                true,
+                &[
+                    &PredefinedMenuItem::minimize(app_handle, None)?,
+                    &PredefinedMenuItem::maximize(app_handle, None)?,
+                    &PredefinedMenuItem::separator(app_handle)?,
+                    &PredefinedMenuItem::close_window(app_handle, None)?,
+                ],
+            )?,
+            &Submenu::with_items(app_handle, "Help", true, &[])?,
+        ],
+    )
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -196,7 +264,7 @@ fn clear_main_webview_focus<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
-fn hide_main_window_for_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, window: &tauri::Window<R>) {
+pub(crate) fn hide_main_window_for_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, window: &tauri::Window<R>) {
     clear_main_webview_focus(app);
 
     #[cfg(target_os = "macos")]
@@ -231,6 +299,11 @@ fn hide_main_window_for_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, wind
     }
 
     let _ = window.hide();
+}
+
+pub(crate) fn request_app_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, target: &str) {
+    show_main_window(app);
+    let _ = app.emit(APP_CLOSE_REQUESTED_EVENT, target);
 }
 
 fn open_connection_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
@@ -277,7 +350,7 @@ fn setup_desktop_tray<R: tauri::Runtime, M: Manager<R>>(
         if event.id() == "show" {
             show_main_window(app);
         } else if event.id() == "quit" {
-            app.exit(0);
+            request_app_close(app, "quit");
         }
     })
     .on_tray_icon_event(|tray, event| match event {
@@ -324,9 +397,6 @@ fn apply_desktop_tray_icon_theme(app: &tauri::AppHandle, _icon_theme: DesktopIco
 
 pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &DesktopSettings) -> tauri::Result<()> {
     apply_debug_log_level(desktop_settings.debug_logging_enabled);
-    if let Some(state) = app.try_state::<CloseBehaviorState>() {
-        state.apply(desktop_settings);
-    }
     apply_desktop_icon_theme(app, desktop_settings.icon_theme)?;
     if matches!(std::env::consts::OS, "macos" | "windows") {
         if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
@@ -344,8 +414,8 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 mod tests {
     use super::{
         linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
-        linux_webkit_rendering_workarounds, native_window_decorations_override, should_hide_window_on_close,
-        should_setup_desktop_tray, should_show_main_window_after_setup,
+        linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
+        should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
     };
     use std::ffi::OsStr;
 
@@ -374,6 +444,15 @@ mod tests {
     #[test]
     fn shows_main_window_after_regular_startup_setup() {
         assert!(should_show_main_window_after_setup());
+    }
+
+    #[test]
+    fn only_user_requested_app_exit_needs_frontend_confirmation() {
+        assert!(should_confirm_app_exit_request("windows", None, false));
+        assert!(should_confirm_app_exit_request("macos", Some(0), false));
+        assert!(!should_confirm_app_exit_request("windows", Some(0), true));
+        assert!(!should_confirm_app_exit_request("windows", Some(tauri::RESTART_EXIT_CODE), false));
+        assert!(!should_confirm_app_exit_request("linux", Some(0), false));
     }
 
     #[test]
@@ -494,7 +573,7 @@ pub fn run() {
 
     let startup_begin = Instant::now();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -523,7 +602,18 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_window_state::Builder::default().build());
+
+    // macOS app menu (Cmd+Q / Dock Quit). Skip on Linux/Windows so an empty menu bar
+    // is not installed where there was none before.
+    #[cfg(target_os = "macos")]
+    let builder = builder.menu(build_app_menu).on_menu_event(|app, event| {
+        if event.id() == APP_MENU_QUIT_ID {
+            request_app_close(app, "quit");
+        }
+    });
+
+    builder
         .setup(move |app| {
             let setup_start = Instant::now();
             eprintln!("[STARTUP] plugins registered in {:?}", startup_begin.elapsed());
@@ -562,27 +652,32 @@ pub fn run() {
             );
 
             let state = if let Some(agent_dir) = agent_dir {
-                Arc::new(AppState::new_with_plugin_and_agent_dir_and_app_version(
+                AppState::new_with_plugin_and_agent_dir_and_app_version(
                     storage,
                     plugin_dir,
                     agent_dir,
                     env!("CARGO_PKG_VERSION"),
-                ))
+                )
             } else {
-                Arc::new(AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION")))
+                AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION"))
             };
+            state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
+            state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
+            let state = Arc::new(state);
             app.manage(state.clone());
             commands::redis_pubsub_server::start_pubsub_server(state.clone());
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
-            app.manage(CloseBehaviorState::new(&desktop_settings));
+            app.manage(CloseBehaviorState::new());
+            #[cfg(target_os = "macos")]
+            macos_app_delegate::install_dock_quit_handler(app.handle());
             let startup_links = commands::deep_link::connection_deep_links_from_args(std::env::args().skip(1));
             open_connection_deep_links(app.handle(), startup_links);
 
             let app_handle = app.handle().clone();
-            commands::mcp_bridge::start(app_handle, state);
+            commands::mcp_bridge::start(app_handle, state, data_dir);
             eprintln!("[STARTUP] setup complete in {:?} (total {:?})", setup_start.elapsed(), startup_begin.elapsed());
 
             if let Some(decorations) = native_window_decorations_override(std::env::consts::OS) {
@@ -609,22 +704,13 @@ pub fn run() {
                     return;
                 }
                 let app = window.app_handle();
-                let Some(state) = app.try_state::<CloseBehaviorState>() else {
+                if app.try_state::<CloseBehaviorState>().is_none() {
                     api.prevent_close();
                     hide_main_window_for_close(&app, window);
                     return;
-                };
-                if !state.prompted() {
-                    api.prevent_close();
-                    let _ = app.emit("dbx-close-action-prompt", ());
-                    return;
-                }
-                if state.quit_on_close() {
-                    app.exit(0);
-                    return;
                 }
                 api.prevent_close();
-                hide_main_window_for_close(&app, window);
+                request_app_close(&app, "settings");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -636,22 +722,35 @@ pub fn run() {
             commands::ai::ai_list_models,
             commands::ai::save_ai_config,
             commands::ai::load_ai_config,
+            commands::ai::save_ai_provider_config,
+            commands::ai::load_ai_provider_configs,
             commands::ai::save_ai_conversation,
             commands::ai::load_ai_conversations,
             commands::ai::delete_ai_conversation,
             commands::app_settings::load_desktop_settings,
             commands::app_settings::save_desktop_settings,
+            commands::app_settings::complete_app_close,
+            commands::app_settings::request_app_close_from_window_controls,
             commands::app_settings::set_driver_store_dir,
             commands::app_settings::set_plugin_store_dir,
             commands::app_settings::set_agent_store_dir,
             commands::app_settings::get_driver_store_path,
             commands::app_settings::load_pinned_tree_node_ids,
             commands::app_settings::save_pinned_tree_node_ids,
+            commands::app_settings::load_editor_settings,
+            commands::app_settings::save_editor_settings,
+            commands::app_settings::load_open_tabs_state,
+            commands::app_settings::save_open_tabs_state,
+            commands::app_settings::load_saved_sql_editor_positions,
+            commands::app_settings::save_saved_sql_editor_positions,
             commands::app_settings::load_native_debug_logs,
             commands::cloud_sync::webdav_sync_test,
             commands::cloud_sync::webdav_password_status,
             commands::cloud_sync::save_webdav_saved_password,
             commands::cloud_sync::forget_webdav_saved_password,
+            commands::cloud_sync::webdav_sync_secrets_status,
+            commands::cloud_sync::save_webdav_sync_secrets_preference,
+            commands::cloud_sync::forget_webdav_sync_secrets_passphrase,
             commands::cloud_sync::webdav_sync_upload,
             commands::cloud_sync::webdav_sync_download,
             commands::connection::test_connection,
@@ -701,6 +800,8 @@ pub fn run() {
             commands::schema::list_sequences,
             commands::schema::list_rules,
             commands::schema::list_owners,
+            commands::schema::list_extensions,
+            commands::schema::list_available_extensions,
             commands::schema_diff::prepare_schema_diff,
             commands::schema_diff::generate_schema_sync_sql,
             commands::schema_cache::save_schema_cache,
@@ -717,6 +818,10 @@ pub fn run() {
             commands::query::execute_batch,
             commands::query::execute_script,
             commands::query::execute_in_transaction,
+            commands::query::begin_manual_transaction,
+            commands::query::execute_in_manual_transaction,
+            commands::query::commit_manual_transaction,
+            commands::query::rollback_manual_transaction,
             commands::query::analyze_sql_references,
             commands::query::find_statement_at_cursor,
             commands::query::prepare_query_pagination_execution_plan,
@@ -739,8 +844,10 @@ pub fn run() {
             commands::query::build_truncate_table_sql,
             commands::query::build_drop_database_sql,
             commands::query::build_create_schema_sql,
+            commands::query::build_update_database_properties_sql,
             commands::query::build_drop_schema_sql,
             commands::query::build_duplicate_table_structure_sql,
+            commands::query::build_copy_table_data_sql,
             commands::query::build_executable_object_source_statements,
             commands::query::build_executable_object_source_sql,
             commands::query::build_editable_object_source,
@@ -755,6 +862,8 @@ pub fn run() {
             commands::query::build_data_grid_copy_insert_statement,
             commands::query::build_data_grid_context_filter_condition,
             commands::query::build_data_grid_column_value_filter_condition,
+            commands::query::build_data_grid_column_values_filter_condition,
+            commands::query::build_data_grid_column_distinct_values_sql,
             commands::query::build_data_grid_count_sql,
             commands::query::build_hive_table_properties_sql,
             commands::query::build_export_insert_statements,
@@ -802,6 +911,7 @@ pub fn run() {
             commands::redis_cmd::redis_execute_command,
             commands::redis_cmd::redis_load_more,
             commands::redis_cmd::redis_pubsub_publish,
+            commands::redis_pubsub_server::redis_pubsub_server_port,
             commands::redis_cmd::redis_slowlog_get,
             commands::redis_cmd::redis_cluster_master_nodes,
             commands::etcd_cmd::etcd_list_prefix,
@@ -841,16 +951,33 @@ pub fn run() {
             commands::sqlite_backup::backup_sqlite_database,
             commands::mongo_cmd::mongo_list_databases,
             commands::mongo_cmd::mongo_list_collections,
+            commands::mongo_cmd::vector_collection_detail,
             commands::mongo_cmd::mongo_create_database,
             commands::mongo_cmd::mongo_drop_database,
             commands::mongo_cmd::mongo_drop_collection,
-            commands::mongo_cmd::document_find_documents,
+            commands::document_cmd::document_list_databases,
+            commands::document_cmd::document_list_collections,
+            commands::document_cmd::document_find_documents,
+            commands::document_cmd::document_list_gridfs_buckets,
+            commands::document_cmd::document_create_gridfs_bucket,
+            commands::document_cmd::document_delete_gridfs_bucket,
+            commands::document_cmd::document_list_gridfs_files,
+            commands::document_cmd::document_download_gridfs_file,
+            commands::document_cmd::document_upload_gridfs_file,
+            commands::document_cmd::document_delete_gridfs_file,
             commands::mongo_cmd::mongo_find_documents,
+            commands::mongo_cmd::mongo_server_version,
+            commands::mongo_cmd::mongo_collection_stats,
             commands::mongo_cmd::mongo_aggregate_documents,
+            commands::mongo_cmd::mongo_create_index,
+            commands::mongo_cmd::mongo_drop_indexes,
+            commands::document_cmd::document_insert_document,
             commands::mongo_cmd::mongo_insert_document,
             commands::mongo_cmd::mongo_insert_documents,
+            commands::document_cmd::document_update_document,
             commands::mongo_cmd::mongo_update_document,
             commands::mongo_cmd::mongo_update_documents,
+            commands::document_cmd::document_delete_document,
             commands::mongo_cmd::mongo_delete_document,
             commands::mongo_cmd::mongo_delete_documents,
             #[cfg(feature = "mq-admin")]
@@ -932,7 +1059,11 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_get_backlog,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_get_cluster_info,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_raw_request,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_send_message,
             commands::history::save_history,
             commands::history::load_history,
             commands::history::clear_history,
@@ -976,12 +1107,24 @@ pub fn run() {
             commands::agents::import_agents_from_zip,
             commands::agents::import_agent_jar_cmd,
             commands::system_fonts::list_system_fonts,
+            commands::ssh_config::list_ssh_config_hosts,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             #[cfg(not(target_os = "macos"))]
             let _ = (&app_handle, &event);
+
+            if let RunEvent::ExitRequested { code, api, .. } = &event {
+                let confirmed_exit = app_handle
+                    .try_state::<CloseBehaviorState>()
+                    .map(|state| state.take_confirmed_exit())
+                    .unwrap_or(false);
+                if should_confirm_app_exit_request(std::env::consts::OS, *code, confirmed_exit) {
+                    api.prevent_exit();
+                    request_app_close(app_handle, "quit");
+                }
+            }
 
             #[cfg(target_os = "macos")]
             if let RunEvent::Opened { urls } = &event {

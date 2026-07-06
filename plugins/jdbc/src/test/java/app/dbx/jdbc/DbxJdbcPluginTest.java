@@ -256,6 +256,124 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
+    void connectionUsernameWithMultipleAtSignsIsPassedToDriverProperties() throws Exception {
+        RecordingConnectDriver driver = new RecordingConnectDriver("jdbc:dbx-proxysql-form:");
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("testConnection", """
+                {
+                  "connection": {
+                    "connection_string": "jdbc:dbx-proxysql-form://127.0.0.1:6033/example",
+                    "username": "xxxxx@db_readonly@127.0.0.1",
+                    "password": "p@wd",
+                    "connect_timeout_secs": 30
+                  }
+                }
+                """);
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals("jdbc:dbx-proxysql-form://127.0.0.1:6033/example", driver.urls.get(0));
+            assertEquals("xxxxx@db_readonly@127.0.0.1", driver.properties.get(0).getProperty("user"));
+            assertEquals("p@wd", driver.properties.get(0).getProperty("password"));
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void jdbcUrlUserParamsWithMultipleAtSignsAreDecodedIntoDriverProperties() throws Exception {
+        RecordingConnectDriver driver = new RecordingConnectDriver("jdbc:dbx-proxysql-url:");
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("testConnection", """
+                {
+                  "connection": {
+                    "connection_string": "jdbc:dbx-proxysql-url://127.0.0.1:6033/example?socketTimeout=5&user=xxxxx%40db_readonly%40127.0.0.1&password=p%40wd&useSSL=false",
+                    "connect_timeout_secs": 30
+                  }
+                }
+                """);
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals("jdbc:dbx-proxysql-url://127.0.0.1:6033/example?socketTimeout=5&useSSL=false", driver.urls.get(0));
+            assertEquals("xxxxx@db_readonly@127.0.0.1", driver.properties.get(0).getProperty("user"));
+            assertEquals("p@wd", driver.properties.get(0).getProperty("password"));
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void jdbcUrlCredentialExtractionKeepsSemicolonInsidePasswordValue() throws Exception {
+        RecordingConnectDriver driver = new RecordingConnectDriver("jdbc:dbx-proxysql-semicolon-password:");
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("testConnection", """
+                {
+                  "connection": {
+                    "connection_string": "jdbc:dbx-proxysql-semicolon-password://127.0.0.1:6033/example?password=p;ss&useSSL=false",
+                    "connect_timeout_secs": 30
+                  }
+                }
+                """);
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals("jdbc:dbx-proxysql-semicolon-password://127.0.0.1:6033/example?useSSL=false", driver.urls.get(0));
+            assertEquals("p;ss", driver.properties.get(0).getProperty("password"));
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void jdbcUrlCredentialExtractionPreservesDecodedWhitespace() throws Exception {
+        RecordingConnectDriver driver = new RecordingConnectDriver("jdbc:dbx-proxysql-space-password:");
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("testConnection", """
+                {
+                  "connection": {
+                    "connection_string": "jdbc:dbx-proxysql-space-password://127.0.0.1:6033/example?user=tenant%40host&password=%20secret%20&useSSL=false",
+                    "connect_timeout_secs": 30
+                  }
+                }
+                """);
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals("jdbc:dbx-proxysql-space-password://127.0.0.1:6033/example?useSSL=false", driver.urls.get(0));
+            assertEquals("tenant@host", driver.properties.get(0).getProperty("user"));
+            assertEquals(" secret ", driver.properties.get(0).getProperty("password"));
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void explicitConnectionCredentialsOverrideJdbcUrlCredentialParams() throws Exception {
+        RecordingConnectDriver driver = new RecordingConnectDriver("jdbc:dbx-proxysql-override:");
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("testConnection", """
+                {
+                  "connection": {
+                    "connection_string": "jdbc:dbx-proxysql-override://127.0.0.1:6033/example?user=url%40tenant&password=url-secret&useSSL=false",
+                    "username": "form@tenant@host",
+                    "password": "form-secret",
+                    "connect_timeout_secs": 30
+                  }
+                }
+                """);
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals("jdbc:dbx-proxysql-override://127.0.0.1:6033/example?useSSL=false", driver.urls.get(0));
+            assertEquals("form@tenant@host", driver.properties.get(0).getProperty("user"));
+            assertEquals("form-secret", driver.properties.get(0).getProperty("password"));
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
     void connectTimeoutIsMappedToDriverProperties() throws Exception {
         Method method = DbxJdbcPlugin.class.getDeclaredMethod("applyConnectTimeout", JsonNode.class, Properties.class);
         method.setAccessible(true);
@@ -268,6 +386,25 @@ final class DbxJdbcPluginTest {
 
         assertEquals("45", properties.getProperty("loginTimeout"));
         assertEquals("45", properties.getProperty("connectTimeout"));
+    }
+
+    @Test
+    void prestoConnectTimeoutDoesNotSetUnsupportedDriverProperties() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod("applyConnectTimeout", JsonNode.class, Properties.class);
+        method.setAccessible(true);
+        Properties properties = new Properties();
+        JsonNode connection = MAPPER.readTree("""
+            {
+              "connection_string": "jdbc:presto://presto.example.test:8080/hive",
+              "jdbc_driver_class": "io.prestosql.jdbc.PrestoDriver",
+              "connect_timeout_secs": 45
+            }
+            """);
+
+        method.invoke(null, connection, properties);
+
+        assertFalse(properties.containsKey("loginTimeout"));
+        assertFalse(properties.containsKey("connectTimeout"));
     }
 
     @Test
@@ -595,6 +732,43 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
+    void listTablesAppliesMetadataConstraints() throws Exception {
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "CREATE SCHEMA IF NOT EXISTS app"
+            }
+            """.formatted(CONNECTION));
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "CREATE TABLE IF NOT EXISTS app.people (id INT PRIMARY KEY)"
+            }
+            """.formatted(CONNECTION));
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "CREATE TABLE IF NOT EXISTS app.people_archive (id INT PRIMARY KEY)"
+            }
+            """.formatted(CONNECTION));
+
+        JsonNode response = request("listTables", """
+            {
+              "connection": %s,
+              "schema": "APP",
+              "filter": "people",
+              "limit": 1,
+              "offset": 1,
+              "object_types": ["TABLE"]
+            }
+            """.formatted(CONNECTION));
+
+        assertFalse(response.has("error"), response.toString());
+        assertEquals(1, response.path("result").size());
+        assertEquals("PEOPLE_ARCHIVE", response.path("result").path(0).path("name").asText());
+    }
+
+    @Test
     void listDatabasesIncludesConfiguredDatabaseWhenDriverDoesNotReturnIt() throws Exception {
         String connection = """
             {
@@ -655,6 +829,43 @@ final class DbxJdbcPluginTest {
 
         assertFalse(response.has("error"), response.toString());
         assertEquals("PEOPLE", response.path("result").path(0).path("name").asText());
+    }
+
+    @Test
+    void listObjectsAppliesMetadataConstraints() throws Exception {
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "CREATE SCHEMA IF NOT EXISTS app"
+            }
+            """.formatted(CONNECTION));
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "CREATE TABLE IF NOT EXISTS app.people (id INT PRIMARY KEY)"
+            }
+            """.formatted(CONNECTION));
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "CREATE TABLE IF NOT EXISTS app.people_archive (id INT PRIMARY KEY)"
+            }
+            """.formatted(CONNECTION));
+
+        JsonNode response = request("listObjects", """
+            {
+              "connection": %s,
+              "schema": "APP",
+              "filter": "people",
+              "limit": 1,
+              "offset": 1,
+              "object_types": ["TABLE"]
+            }
+            """.formatted(CONNECTION));
+
+        assertFalse(response.has("error"), response.toString());
+        assertEquals(1, response.path("result").size());
+        assertEquals("PEOPLE_ARCHIVE", response.path("result").path(0).path("name").asText());
     }
 
     @Test
@@ -765,6 +976,77 @@ final class DbxJdbcPluginTest {
                 List.of(
                     "prepare:SELECT table_name, table_type FROM \"hive\".information_schema.tables WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_type, table_name",
                     "setString:1:sales_analytics",
+                    "executeQuery"
+                ),
+                calls
+            );
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void prestoListTablesPushesFilterAndLimitToInformationSchema() throws Exception {
+        List<String> calls = new ArrayList<>();
+        Driver driver = new PrestoMetadataDriver(calls);
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("listTables", """
+                {
+                  "connection": {
+                    "connection_string": "jdbc:presto://presto.example.test:8080/hive",
+                    "connect_timeout_secs": 30
+                  },
+                  "database": "hive",
+                  "schema": "sales_analytics",
+                  "filter": "Daily_%",
+                  "limit": 20
+                }
+                """);
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(
+                List.of(
+                    "prepare:SELECT table_name, table_type FROM \"hive\".information_schema.tables WHERE table_schema = ? AND table_type IN ('BASE TABLE', 'VIEW') AND lower(table_name) LIKE ? ESCAPE '\\' ORDER BY table_type, table_name LIMIT 20",
+                    "setString:1:sales_analytics",
+                    "setString:2:daily\\_\\%%",
+                    "executeQuery"
+                ),
+                calls
+            );
+        } finally {
+            DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void prestoGetColumnsUsesInformationSchemaInsteadOfJdbcMetadata() throws Exception {
+        List<String> calls = new ArrayList<>();
+        Driver driver = new PrestoMetadataDriver(calls);
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("getColumns", """
+                {
+                  "connection": {
+                    "connection_string": "jdbc:presto://presto.example.test:8080/hive",
+                    "connect_timeout_secs": 30
+                  },
+                  "database": "hive",
+                  "schema": "sales_analytics",
+                  "table": "daily_revenue"
+                }
+                """);
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals("amount", response.path("result").path(0).path("name").asText());
+            assertEquals("decimal(12,2)", response.path("result").path(0).path("data_type").asText());
+            assertEquals(12, response.path("result").path(0).path("numeric_precision").asInt());
+            assertEquals(2, response.path("result").path(0).path("numeric_scale").asInt());
+            assertEquals(
+                List.of(
+                    "prepare:SELECT column_name, data_type, is_nullable, column_default, comment FROM \"hive\".information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+                    "setString:1:sales_analytics",
+                    "setString:2:daily_revenue",
                     "executeQuery"
                 ),
                 calls
@@ -1202,10 +1484,11 @@ final class DbxJdbcPluginTest {
             new Class<?>[] { Connection.class },
             (proxy, method, args) -> switch (method.getName()) {
                 case "prepareStatement" -> {
-                    calls.add("prepare:" + args[0]);
-                    yield prestoMetadataStatement(calls);
+                    String sql = String.valueOf(args[0]);
+                    calls.add("prepare:" + sql);
+                    yield prestoMetadataStatement(calls, sql);
                 }
-                case "getMetaData" -> throw new SQLException("DatabaseMetaData should not be used for Presto listTables");
+                case "getMetaData" -> throw new SQLException("DatabaseMetaData should not be used for Presto metadata");
                 case "isClosed" -> false;
                 case "close" -> null;
                 default -> defaultValue(method.getReturnType());
@@ -1213,7 +1496,7 @@ final class DbxJdbcPluginTest {
         );
     }
 
-    private static PreparedStatement prestoMetadataStatement(List<String> calls) {
+    private static PreparedStatement prestoMetadataStatement(List<String> calls, String sql) {
         return (PreparedStatement) Proxy.newProxyInstance(
             DbxJdbcPluginTest.class.getClassLoader(),
             new Class<?>[] { PreparedStatement.class },
@@ -1224,10 +1507,37 @@ final class DbxJdbcPluginTest {
                 }
                 case "executeQuery" -> {
                     calls.add("executeQuery");
-                    yield prestoMetadataResultSet();
+                    yield sql.contains("information_schema.columns") ? prestoColumnMetadataResultSet() : prestoMetadataResultSet();
                 }
                 case "close" -> null;
                 default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static ResultSet prestoColumnMetadataResultSet() {
+        String[] labels = { "column_name", "data_type", "is_nullable", "column_default", "comment" };
+        Object[][] rows = { { "amount", "decimal(12,2)", "NO", null, "daily amount" } };
+        return (ResultSet) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { ResultSet.class },
+            new java.lang.reflect.InvocationHandler() {
+                private int index = -1;
+
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) {
+                    return switch (method.getName()) {
+                        case "next" -> ++index < rows.length;
+                        case "getMetaData" -> resultSetMeta(labels);
+                        case "getString" -> {
+                            Object value = rows[index][((Integer) args[0]) - 1];
+                            yield value == null ? null : value.toString();
+                        }
+                        case "getObject" -> rows[index][((Integer) args[0]) - 1];
+                        case "close" -> null;
+                        default -> defaultValue(method.getReturnType());
+                    };
+                }
             }
         );
     }
@@ -1252,6 +1562,71 @@ final class DbxJdbcPluginTest {
                         default -> defaultValue(method.getReturnType());
                     };
                 }
+            }
+        );
+    }
+
+    private static final class RecordingConnectDriver implements Driver {
+        private final String urlPrefix;
+        private final List<String> urls = new ArrayList<>();
+        private final List<Properties> properties = new ArrayList<>();
+
+        private RecordingConnectDriver(String urlPrefix) {
+            this.urlPrefix = urlPrefix;
+        }
+
+        @Override
+        public Connection connect(String url, Properties info) throws SQLException {
+            if (!acceptsURL(url)) {
+                return null;
+            }
+            urls.add(url);
+            Properties copy = new Properties();
+            copy.putAll(info);
+            properties.add(copy);
+            return recordingConnection();
+        }
+
+        @Override
+        public boolean acceptsURL(String url) {
+            return url != null && url.startsWith(urlPrefix);
+        }
+
+        @Override
+        public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) {
+            return new DriverPropertyInfo[0];
+        }
+
+        @Override
+        public int getMajorVersion() {
+            return 1;
+        }
+
+        @Override
+        public int getMinorVersion() {
+            return 0;
+        }
+
+        @Override
+        public boolean jdbcCompliant() {
+            return false;
+        }
+
+        @Override
+        public java.util.logging.Logger getParentLogger() {
+            return java.util.logging.Logger.getGlobal();
+        }
+    }
+
+    private static Connection recordingConnection() {
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "isClosed" -> false;
+                case "isValid" -> true;
+                case "close" -> null;
+                default -> defaultValue(method.getReturnType());
             }
         );
     }

@@ -12,14 +12,14 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import DriverInstallProgressCircle from "@/components/config/DriverInstallProgressCircle.vue";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import { useToast } from "@/composables/useToast";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { countAvailableDriverUpdates } from "@/lib/agentDriverUpdateBadge";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { countAvailableDriverUpdates } from "@/lib/connection/agentDriverUpdateBadge";
 import type { JdbcDriverInfo, JdbcMavenBundleInfo, JdbcPluginStatus } from "@/types/database";
-import * as api from "@/lib/api";
-import type { AgentDriverInfo, DriverRuntimeInfo, DriverRuntimeSummary, DriverStoreUsage, JavaRuntimeConfig } from "@/lib/api";
-import { formatRuntimeBytes, formatRuntimeCpu, formatRuntimeUptime, runtimeHealthClass, runtimeStatusClass, runtimeStatusDotClass } from "@/lib/driverRuntimePresentation";
-import { addDriverInstallQueue, driverInstallProgressPercent, isDriverInstallProgressTarget, removeDriverInstallQueue, takeNextDriverInstallQueue, type DriverInstallProgress } from "@/lib/driverInstallProgressUi";
-import { PRESTOSQL_DRIVER_DB_TYPE, prestoSqlBuiltinDriverRow, prestoSqlMavenBundle } from "@/lib/prestoSqlBuiltinDriver";
+import * as api from "@/lib/backend/api";
+import type { AgentDriverInfo, DriverRuntimeInfo, DriverRuntimeSummary, DriverStoreUsage, JavaRuntimeConfig } from "@/lib/backend/api";
+import { formatRuntimeBytes, formatRuntimeCpu, formatRuntimeUptime, runtimeHealthClass, runtimeStatusClass, runtimeStatusDotClass } from "@/lib/connection/driverRuntimePresentation";
+import { addDriverInstallQueue, driverInstallProgressPercent, isDriverInstallProgressTarget, removeDriverInstallQueue, takeNextDriverInstallQueue, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
+import { PRESTOSQL_DRIVER_DB_TYPE, prestoSqlBuiltinDriverRow, prestoSqlMavenBundle } from "@/lib/database/prestoSqlBuiltinDriver";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -43,7 +43,7 @@ const driverStoreTab = ref("agent");
 // ──────────── Driver store path ────────────
 
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { DriverStorePathInfo } from "@/lib/api";
+import type { DriverStorePathInfo } from "@/lib/backend/api";
 const settingsStore = useSettingsStore();
 
 type DriverStoreDirKind = "plugin" | "agent";
@@ -180,7 +180,7 @@ const lastProgressPercent = ref<number | null>(null);
 const installedJres = computed(() => {
   const jreMap = new Map<string, boolean>();
   for (const d of drivers.value) {
-    if (!jreMap.has(d.jre)) {
+    if (driverRequiresJavaRuntime(d) && d.jre && !jreMap.has(d.jre)) {
       jreMap.set(d.jre, d.jre_installed);
     }
   }
@@ -256,6 +256,10 @@ function isDriverProgressActive(dbType: string): boolean {
     upgradingAll: upgradingAll.value,
     progress: progress.value,
   });
+}
+
+function driverRequiresJavaRuntime(driver: AgentDriverInfo): boolean {
+  return driver.requires_java_runtime ?? Boolean(driver.jre);
 }
 
 function progressTitle(fallback: string): string {
@@ -636,7 +640,7 @@ type JdbcDriverListItem =
 const filteredAgentDrivers = computed(() => {
   const query = agentDriverSearch.value.trim().toLowerCase();
   if (!query) return builtinDriverRows.value;
-  return builtinDriverRows.value.filter((driver) => [driver.label, driver.db_type, driver.version, driver.installed_version, driver.jre].filter(Boolean).join(" ").toLowerCase().includes(query));
+  return builtinDriverRows.value.filter((driver) => [driver.label, driver.db_type, driver.version, driver.installed_version, driverRequiresJavaRuntime(driver) ? driver.jre : ""].filter(Boolean).join(" ").toLowerCase().includes(query));
 });
 
 const jdbcDriverListItems = computed<JdbcDriverListItem[]>(() => {
@@ -1116,7 +1120,7 @@ watch(driverStoreTab, (tab) => {
                   <div class="text-sm font-medium">{{ driver.label }}</div>
                 </div>
                 <div class="flex shrink-0 items-center gap-1.5">
-                  <span v-if="driver.jre" class="rounded-full px-2 py-0.5 text-[11px]" :class="driver.jre !== '21' ? 'bg-blue-500/10 text-blue-600' : 'bg-muted text-muted-foreground'">JRE {{ driver.jre }}</span>
+                  <span v-if="driverRequiresJavaRuntime(driver) && driver.jre" class="rounded-full px-2 py-0.5 text-[11px]" :class="driver.jre !== '21' ? 'bg-blue-500/10 text-blue-600' : 'bg-muted text-muted-foreground'">JRE {{ driver.jre }}</span>
                   <template v-if="driver.installed">
                     <span class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">v{{ driver.installed_version }}</span>
                     <span v-if="driver.update_available" class="rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-600">→ v{{ driver.version }}</span>
@@ -1147,7 +1151,7 @@ watch(driverStoreTab, (tab) => {
                   >
                     <FileUp class="h-3.5 w-3.5" />
                   </Button>
-                  <template v-else>
+                  <template v-if="driver.installed">
                     <Check v-if="!(driver.update_available && isDriverProgressActive(driver.db_type))" class="h-4 w-4 text-green-600" />
                     <Button
                       v-if="driver.update_available && isDriverQueued(driver.db_type)"

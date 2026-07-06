@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { executeQuery, inferMongoColumns, mongoAggregateWriteStage, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoWriteCommand } from "../src/database.js";
+import { executeQuery, inferMongoColumns, mongoAggregateWriteStage, mongoCollectionStatsToQueryResult, mongoDocumentsToQueryResult, parseMongoAggregateCommand, parseMongoCollectionStatsCommand, parseMongoCountDocumentsCommand, parseMongoFindCommand, parseMongoGetIndexesCommand, parseMongoVersionCommand, parseMongoWriteCommand } from "../src/database.js";
 
 test("parseMongoFindCommand accepts shell-style find commands", () => {
   assert.deepEqual(parseMongoFindCommand('db.getCollection("operation_logs").find({"level":"info"}).sort({"ts":-1}).skip(5).limit(10)'), {
@@ -36,6 +36,20 @@ test("parseMongoFindCommand accepts Compass-style unquoted keys and ObjectId", (
   assert.deepEqual(JSON.parse(command.filter), { _id: { $oid: "6a045a92d2971e44243771a1" } });
 });
 
+test("parseMongoFindCommand accepts projection arguments", () => {
+  const command = parseMongoFindCommand("db.jobs.find({status: 'open'}, {title: 1, _id: 0}).sort({title: 1})");
+  assert.ok(command);
+  assert.equal(command.collection, "jobs");
+  assert.deepEqual(JSON.parse(command.filter), { status: "open" });
+  assert.deepEqual(JSON.parse(command.projection || "{}"), { title: 1, _id: 0 });
+  assert.deepEqual(JSON.parse(command.sort || "{}"), { title: 1 });
+});
+
+test("parseMongoVersionCommand accepts db.version", () => {
+  assert.equal(parseMongoVersionCommand("db.version();"), true);
+  assert.equal(parseMongoVersionCommand("db.jobs.version()"), false);
+});
+
 test("parseMongoWriteCommand accepts unquoted update operator keys", () => {
   assert.deepEqual(parseMongoWriteCommand("db.projects.updateOne({_id: ObjectId('507f1f77bcf86cd799439011')}, {$set: {name: 'next'}})"), {
     kind: "update",
@@ -53,6 +67,22 @@ test("parseMongoCountDocumentsCommand accepts shell-style count commands", () =>
   });
 });
 
+test("parseMongoCountDocumentsCommand accepts legacy count helpers", () => {
+  assert.deepEqual(parseMongoCountDocumentsCommand("db.projects.count({ active: true })"), {
+    collection: "projects",
+    filter: '{ "active": true }',
+  });
+  assert.deepEqual(parseMongoCountDocumentsCommand('db.getCollection("audit.logs").count()'), {
+    collection: "audit.logs",
+    filter: "{}",
+  });
+  assert.deepEqual(parseMongoCountDocumentsCommand("db.projects.find({ active: true }).count()"), {
+    collection: "projects",
+    filter: '{ "active": true }',
+  });
+  assert.equal(parseMongoFindCommand("db.projects.find({ active: true }).count()"), null);
+});
+
 test("parseMongoAggregateCommand accepts aggregate pipelines", () => {
   assert.deepEqual(parseMongoAggregateCommand('db.projects.aggregate([{"$match":{"active":true}},{"$group":{"_id":"$owner","total":{"$sum":1}}}])'), {
     collection: "projects",
@@ -68,6 +98,63 @@ test("parseMongoGetIndexesCommand accepts shell-style index commands", () => {
     collection: "audit.logs",
   });
   assert.equal(parseMongoGetIndexesCommand("db.web_log.getIndexes({})"), null);
+});
+
+test("parseMongoCollectionStatsCommand accepts Mongo shell stats helpers", () => {
+  assert.deepEqual(parseMongoCollectionStatsCommand("db.users.dataSize()"), {
+    collection: "users",
+    metric: "dataSize",
+  });
+  assert.deepEqual(parseMongoCollectionStatsCommand('db.getCollection("audit.logs").dataSize(1024)'), {
+    collection: "audit.logs",
+    metric: "dataSize",
+    scale: 1024,
+  });
+  assert.deepEqual(parseMongoCollectionStatsCommand("db.users.storageSize(1024)"), {
+    collection: "users",
+    metric: "storageSize",
+    scale: 1024,
+  });
+  assert.deepEqual(parseMongoCollectionStatsCommand("db.users.totalIndexSize()"), {
+    collection: "users",
+    metric: "totalIndexSize",
+  });
+  assert.deepEqual(parseMongoCollectionStatsCommand("db.users.stats()"), {
+    collection: "users",
+    metric: "stats",
+  });
+  assert.deepEqual(parseMongoCollectionStatsCommand("db.users.stats(1024)"), {
+    collection: "users",
+    metric: "stats",
+    scale: 1024,
+  });
+});
+
+test("parseMongoCollectionStatsCommand rejects unsupported stats helper arguments", () => {
+  assert.equal(parseMongoCollectionStatsCommand("db.users.dataSize(1, 2)"), null);
+  assert.equal(parseMongoCollectionStatsCommand("db.users.storageSize({scale: 1024})"), null);
+  assert.equal(parseMongoCollectionStatsCommand("db.users.stats().limit(1)"), null);
+});
+
+test("mongoCollectionStatsToQueryResult maps dataSize helper to collStats size", () => {
+  assert.deepEqual(mongoCollectionStatsToQueryResult("dataSize", { size: 2048 }), {
+    columns: ["dataSize"],
+    rows: [{ dataSize: 2048 }],
+    row_count: 1,
+  });
+  assert.deepEqual(
+    mongoCollectionStatsToQueryResult("stats", {
+      count: 3,
+      size: 128,
+      storageSize: 512,
+      totalIndexSize: 64,
+    }),
+    {
+      columns: ["count", "size", "avgObjSize", "storageSize", "totalIndexSize", "nindexes"],
+      rows: [{ count: 3, size: 128, avgObjSize: null, storageSize: 512, totalIndexSize: 64, nindexes: null }],
+      row_count: 1,
+    },
+  );
 });
 
 test("mongoAggregateWriteStage detects write stages", () => {
@@ -121,6 +208,38 @@ test("parseMongoWriteCommand accepts supported write commands", () => {
     filter: '{"stale":true}',
     many: true,
   });
+  assert.deepEqual(parseMongoWriteCommand('db.projects.createIndex({"email":1},{"unique":true,"name":"projects_email_unique"})'), {
+    kind: "createIndex",
+    collection: "projects",
+    keys: '{"email":1}',
+    options: '{"unique":true,"name":"projects_email_unique"}',
+  });
+  assert.deepEqual(parseMongoWriteCommand('db.projects.dropIndex("projects_email_unique")'), {
+    kind: "dropIndex",
+    collection: "projects",
+    index: '"projects_email_unique"',
+  });
+  assert.deepEqual(parseMongoWriteCommand("db.projects.dropIndexes()"), {
+    kind: "dropIndexes",
+    collection: "projects",
+  });
+  assert.deepEqual(parseMongoWriteCommand('db.projects.dropIndexes({"email":1})'), {
+    kind: "dropIndexes",
+    collection: "projects",
+    indexes: '{"email":1}',
+  });
+  assert.deepEqual(parseMongoWriteCommand('db.projects.dropIndexes(["a_1","b_1"])'), {
+    kind: "dropIndexes",
+    collection: "projects",
+    indexes: '["a_1","b_1"]',
+  });
+});
+
+test("parseMongoWriteCommand rejects invalid dropIndex and dropIndexes commands", () => {
+  assert.equal(parseMongoWriteCommand("db.projects.dropIndex()"), null);
+  assert.equal(parseMongoWriteCommand('db.projects.dropIndex("*")'), null);
+  assert.equal(parseMongoWriteCommand('db.projects.dropIndex(["a_1"])'), null);
+  assert.equal(parseMongoWriteCommand('db.projects.dropIndexes([{"email":1}])'), null);
 });
 
 test("mongodb executeQuery blocks writes when writes are explicitly disabled", async () => {
@@ -146,6 +265,85 @@ test("mongodb executeQuery blocks writes when writes are explicitly disabled", a
   );
   if (oldAllowWrites === undefined) delete process.env.DBX_MCP_ALLOW_WRITES;
   else process.env.DBX_MCP_ALLOW_WRITES = oldAllowWrites;
+});
+
+test("mongodb executeQuery treats createIndex as a write when writes are explicitly disabled", async () => {
+  const oldAllowWrites = process.env.DBX_MCP_ALLOW_WRITES;
+  process.env.DBX_MCP_ALLOW_WRITES = "0";
+  await assert.rejects(
+    executeQuery(
+      {
+        id: "mongo",
+        name: "mongo",
+        db_type: "mongodb",
+        host: "127.0.0.1",
+        port: 27017,
+        username: "",
+        password: "",
+        database: "app",
+        ssh_enabled: false,
+        ssl: false,
+      },
+      'db.projects.createIndex({"email":1})',
+    ),
+    /read-only/i,
+  );
+  if (oldAllowWrites === undefined) delete process.env.DBX_MCP_ALLOW_WRITES;
+  else process.env.DBX_MCP_ALLOW_WRITES = oldAllowWrites;
+});
+
+test("mongodb executeQuery treats dropIndex as a write when writes are explicitly disabled", async () => {
+  const oldAllowWrites = process.env.DBX_MCP_ALLOW_WRITES;
+  process.env.DBX_MCP_ALLOW_WRITES = "0";
+  await assert.rejects(
+    executeQuery(
+      {
+        id: "mongo",
+        name: "mongo",
+        db_type: "mongodb",
+        host: "127.0.0.1",
+        port: 27017,
+        username: "",
+        password: "",
+        database: "app",
+        ssh_enabled: false,
+        ssl: false,
+      },
+      'db.projects.dropIndex("projects_email_unique")',
+    ),
+    /read-only/i,
+  );
+  if (oldAllowWrites === undefined) delete process.env.DBX_MCP_ALLOW_WRITES;
+  else process.env.DBX_MCP_ALLOW_WRITES = oldAllowWrites;
+});
+
+test("mongodb executeQuery blocks dangerous dropIndexes shapes until dangerous SQL is enabled", async () => {
+  const oldAllowWrites = process.env.DBX_MCP_ALLOW_WRITES;
+  const oldAllowDangerous = process.env.DBX_MCP_ALLOW_DANGEROUS_SQL;
+  process.env.DBX_MCP_ALLOW_WRITES = "1";
+  delete process.env.DBX_MCP_ALLOW_DANGEROUS_SQL;
+
+  const config = {
+    id: "mongo",
+    name: "mongo",
+    db_type: "mongodb",
+    host: "127.0.0.1",
+    port: 27017,
+    username: "",
+    password: "",
+    database: "app",
+    ssh_enabled: false,
+    ssl: false,
+  } as const;
+
+  await assert.rejects(executeQuery(config, "db.projects.dropIndexes()"), /DBX_MCP_ALLOW_DANGEROUS_SQL=1/);
+  await assert.rejects(executeQuery(config, 'db.projects.dropIndexes("*")'), /DBX_MCP_ALLOW_DANGEROUS_SQL=1/);
+  await assert.rejects(executeQuery(config, 'db.projects.dropIndexes(["a_1","b_1"])'), /DBX_MCP_ALLOW_DANGEROUS_SQL=1/);
+
+  if (oldAllowWrites === undefined) delete process.env.DBX_MCP_ALLOW_WRITES;
+  else process.env.DBX_MCP_ALLOW_WRITES = oldAllowWrites;
+  if (oldAllowDangerous === undefined) delete process.env.DBX_MCP_ALLOW_DANGEROUS_SQL;
+  else process.env.DBX_MCP_ALLOW_DANGEROUS_SQL = oldAllowDangerous;
 });
 
 test("mongoDocumentsToQueryResult turns documents into rows", () => {

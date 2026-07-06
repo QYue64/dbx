@@ -502,8 +502,17 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
     let result = match probe_result {
         Err(e) => Err(e),
         Ok(()) => match config.db_type {
-            DatabaseType::Mysql if config.needs_bare_mysql() => {
+            DatabaseType::Mysql if config.needs_bare_mysql() && !config.bare_mysql_uses_tls() => {
                 match db::mysql::connect_bare(&url, connect_timeout).await {
+                    Ok(pool) => {
+                        let _ = pool.disconnect().await;
+                        Ok("Connection successful".to_string())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            DatabaseType::Mysql if config.needs_bare_mysql() && config.bare_mysql_uses_tls() => {
+                match db::mysql::connect_with_ca_cert(&url, Some(&config.ca_cert_path), connect_timeout).await {
                     Ok(pool) => {
                         let _ = pool.disconnect().await;
                         Ok("Connection successful".to_string())
@@ -520,8 +529,22 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     Err(e) => Err(e),
                 }
             }
-            DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::ManticoreSearch => {
+            DatabaseType::Doris | DatabaseType::ManticoreSearch => {
                 match db::mysql::connect_bare(&url, connect_timeout).await {
+                    Ok(pool) => {
+                        let _ = pool.disconnect().await;
+                        Ok("Connection successful".to_string())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            DatabaseType::StarRocks => {
+                let connect = if config.bare_mysql_uses_tls() {
+                    db::mysql::connect_with_ca_cert(&url, Some(&config.ca_cert_path), connect_timeout).await
+                } else {
+                    db::mysql::connect_bare(&url, connect_timeout).await
+                };
+                match connect {
                     Ok(pool) => {
                         let _ = pool.disconnect().await;
                         Ok("Connection successful".to_string())
@@ -559,7 +582,8 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     state.connect_redis_cluster(&tunnel_id, &config).await?;
                     return Ok("Connection successful".to_string());
                 } else if config.uses_redis_sentinel() {
-                    db::redis_driver::connect_sentinel(&config).await?
+                    state.connect_redis_sentinel(&tunnel_id, &config).await?;
+                    return Ok("Connection successful".to_string());
                 } else {
                     db::redis_driver::connect(&url, connect_timeout).await?
                 };
@@ -636,6 +660,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 &config.username,
                 &config.password,
                 config.database.as_deref(),
+                config.url_params.as_deref(),
                 connect_timeout,
             )
             .await
@@ -735,8 +760,18 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
                 let mqc = state.mq_admin_config_for_connection(connection_id, &config).await?;
-                let adapter = state.mq_registry.build_transient_config(mqc).await?;
-                adapter.test_connection().await?;
+                let kafka_launch = dbx_core::mq::service::resolve_kafka_launch_spec(&mqc, &state);
+                let adapter = match state.mq_registry.get_or_build_config(connection_id, mqc, kafka_launch).await {
+                    Ok(adapter) => adapter,
+                    Err(err) => {
+                        state.mq_registry.drop_connection(connection_id).await;
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = adapter.test_connection().await {
+                    state.mq_registry.drop_connection(connection_id).await;
+                    return Err(err);
+                }
                 Ok("Connection successful".to_string())
             }
             #[cfg(not(feature = "mq-admin"))]
@@ -772,11 +807,15 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
 }
 
 #[tauri::command]
-pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfig) -> Result<String, String> {
+pub async fn connect_db(
+    state: State<'_, Arc<AppState>>,
+    config: ConnectionConfig,
+    client_attempt: Option<u64>,
+) -> Result<String, String> {
     let config = config.canonicalized();
     let id = config.id.clone();
     let db_config = metadata_connection_config(&config);
-    let attempt = state.begin_connection_attempt(&id).await;
+    let attempt = state.begin_connection_attempt_with_client_attempt(&id, client_attempt).await;
     let mut connected_config = config.clone();
     let mut connected_db_config = db_config.clone();
 
@@ -784,7 +823,15 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
     state.reset_connection_transport_for_config(&id, &db_config).await;
 
     let (host, port) = state.connection_host_port(&id, &db_config).await?;
+    if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
+        state.reset_connection_transport_for_config(&id, &db_config).await;
+        return Err(err);
+    }
     probe_connection_endpoint(&db_config, &host, port).await?;
+    if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
+        state.reset_connection_transport_for_config(&id, &db_config).await;
+        return Err(err);
+    }
     let url = connection_url_for_endpoint(&db_config, &host, port);
     let connect_timeout = std::time::Duration::from_secs(db_config.effective_connect_timeout_secs());
     let idle_timeout = std::time::Duration::from_secs(db_config.idle_timeout_secs);
@@ -824,7 +871,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 ))
             } else if db_config.uses_redis_sentinel() {
                 PoolKind::Redis(db::redis_driver::RedisConnection::Direct(tokio::sync::Mutex::new(
-                    db::redis_driver::connect_sentinel(&db_config).await?,
+                    state.connect_redis_sentinel(&id, &db_config).await?,
                 )))
             } else {
                 PoolKind::Redis(db::redis_driver::RedisConnection::Direct(tokio::sync::Mutex::new(
@@ -850,14 +897,17 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             if mongo_uses_legacy_driver(&db_config) {
                 let mut client =
                     state.agent_manager.spawn(&db_config.db_type, Some(MONGO_LEGACY_DRIVER_PROFILE)).await?;
+                state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
                 client
                     .connect(mongo_legacy_connect_params(&db_config, &host, port))
                     .await
                     .map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
+                state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
                 PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
             } else {
                 let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                     Ok(client) => {
+                        state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
                         match db::mongo_driver::test_connection(
                             &client,
                             connect_timeout,
@@ -866,7 +916,8 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                         .await
                         {
                             Ok(()) => {
-                                state
+                                state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+                                if let Err(err) = state
                                     .insert_connection_pool_for_attempt(
                                         &id,
                                         attempt,
@@ -874,7 +925,11 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                                         PoolKind::MongoDb(client),
                                         &db_config,
                                     )
-                                    .await?;
+                                    .await
+                                {
+                                    state.reset_connection_transport_for_config(&id, &db_config).await;
+                                    return Err(err);
+                                }
                                 state.configs.write().await.insert(id.clone(), config);
                                 return Ok(id);
                             }
@@ -887,12 +942,14 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                     log::info!("Native MongoDB driver failed ({native_err}), falling back to agent driver");
                     let mut client =
                         state.agent_manager.spawn(&db_config.db_type, Some(MONGO_LEGACY_DRIVER_PROFILE)).await?;
+                    state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
                     client.connect(mongo_legacy_connect_params(&db_config, &host, port)).await.map_err(|err| {
                         format!(
                             "{native_err}\n\nFallback with MongoDB (Legacy) driver failed: {}",
                             mongo_legacy_error_with_auth_hint(&err)
                         )
                     })?;
+                    state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
                     mark_mongo_legacy_driver(&mut connected_config);
                     connected_db_config = metadata_connection_config(&connected_config);
                     persist_mongo_legacy_driver_profile(state.inner(), &connected_config).await?;
@@ -923,6 +980,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 &db_config.username,
                 &db_config.password,
                 db_config.database.as_deref(),
+                db_config.url_params.as_deref(),
                 connect_timeout,
             )
             .await?;
@@ -1018,8 +1076,26 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         #[cfg(feature = "mq-admin")]
         DatabaseType::MessageQueue => {
             let mqc = state.mq_admin_config_for_connection(&id, &config).await?;
-            let adapter = state.mq_registry.build_transient_config(mqc).await?;
-            adapter.test_connection().await?;
+            let kafka_launch = dbx_core::mq::service::resolve_kafka_launch_spec(&mqc, &state);
+            let adapter = match state.mq_registry.get_or_build_config(&id, mqc, kafka_launch).await {
+                Ok(adapter) => adapter,
+                Err(err) => {
+                    state.mq_registry.drop_connection(&id).await;
+                    return Err(err);
+                }
+            };
+            if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
+                state.mq_registry.drop_connection(&id).await;
+                return Err(err);
+            }
+            if let Err(err) = adapter.test_connection().await {
+                state.mq_registry.drop_connection(&id).await;
+                return Err(err);
+            }
+            if let Err(err) = state.ensure_current_connection_attempt(&id, Some(attempt)).await {
+                state.mq_registry.drop_connection(&id).await;
+                return Err(err);
+            }
             PoolKind::MessageQueue
         }
         #[cfg(not(feature = "mq-admin"))]
@@ -1040,7 +1116,12 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         db_type => return Err(format!("Unsupported database type: {db_type:?}")),
     };
 
-    state.insert_connection_pool_for_attempt(&id, attempt, id.clone(), pool, &connected_db_config).await?;
+    if let Err(err) =
+        state.insert_connection_pool_for_attempt(&id, attempt, id.clone(), pool, &connected_db_config).await
+    {
+        state.reset_connection_transport_for_config(&id, &connected_db_config).await;
+        return Err(err);
+    }
     state.configs.write().await.insert(id.clone(), connected_config);
 
     Ok(id)
@@ -1065,8 +1146,20 @@ pub async fn connection_final_proxy_port(
 }
 
 #[tauri::command]
-pub async fn disconnect_db(state: State<'_, Arc<AppState>>, connection_id: String) -> Result<(), String> {
-    state.supersede_connection_attempt(&connection_id).await;
+pub async fn disconnect_db(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    client_attempt: Option<u64>,
+) -> Result<(), String> {
+    let should_disconnect = if let Some(client_attempt) = client_attempt {
+        state.supersede_connection_attempt_if_client_attempt(&connection_id, client_attempt).await
+    } else {
+        state.supersede_connection_attempt(&connection_id).await;
+        true
+    };
+    if !should_disconnect {
+        return Ok(());
+    }
     state.remove_connection_pools_detached(&connection_id).await;
     drop_nacos_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
     drop_mq_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;

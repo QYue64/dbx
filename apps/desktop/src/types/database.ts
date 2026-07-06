@@ -51,6 +51,7 @@ export type DatabaseType =
   | "bigquery"
   | "kylin"
   | "sundb"
+  | "oscar"
   | "tdengine"
   | "xugu"
   | "iotdb"
@@ -155,7 +156,7 @@ export interface ConnectionConfig {
   read_only?: boolean;
 }
 
-export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig);
+export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig) | ({ type: "http_tunnel" } & HttpTunnelConfig);
 
 export interface SshTunnelConfig {
   id: string;
@@ -171,6 +172,25 @@ export interface SshTunnelConfig {
   expose_lan?: boolean;
   use_ssh_agent?: boolean;
   ssh_agent_sock_path?: string;
+  /**
+   * UI-facing choice of login method. Drives which credential inputs the
+   * connection dialog shows; the backend still probes "none" then falls
+   * back to key > password > agent based on which fields are non-empty,
+   * independent of this selector (see `db/ssh_tunnel.rs`).
+   *
+   * `"agent"` is a legacy value: it's no longer offered as a dropdown
+   * choice for new connections, but is preserved and displayed read-only
+   * for connections that already have `use_ssh_agent` configured.
+   */
+  auth_method?: "password" | "key" | "agent" | "none";
+}
+
+export interface SshConfigHostEntry {
+  alias: string;
+  host_name?: string;
+  port?: number;
+  user?: string;
+  identity_file?: string;
 }
 
 export interface ProxyTunnelConfig {
@@ -182,6 +202,15 @@ export interface ProxyTunnelConfig {
   port: number;
   username?: string;
   password?: string;
+}
+
+export interface HttpTunnelConfig {
+  id: string;
+  name?: string;
+  enabled?: boolean;
+  url: string;
+  token?: string;
+  connect_timeout_secs?: number;
 }
 
 export interface AttachedDatabaseConfig {
@@ -281,6 +310,7 @@ export interface ObjectInfo {
   name: string;
   object_type: DatabaseObjectType | string;
   schema?: string | null;
+  signature?: string | null;
   comment?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
@@ -370,6 +400,13 @@ export interface RuleInfo {
   definition: string;
 }
 
+export interface ExtensionInfo {
+  name: string;
+  version: string;
+  comment?: string | null;
+  schema?: string | null;
+}
+
 export interface OwnerInfo {
   object_name: string;
   object_type: string;
@@ -446,17 +483,25 @@ export interface SqlTableReference {
   schema?: string | null;
   alias?: string | null;
   span: SqlTextSpan;
+  scope_id?: number;
 }
 
 export interface SqlColumnReference {
   name: string;
   qualifier?: string | null;
   span: SqlTextSpan;
+  scope_id?: number;
+}
+
+export interface SqlReferenceScope {
+  id: number;
+  parent_id?: number | null;
 }
 
 export interface SqlReferenceAnalysis {
   tables: SqlTableReference[];
   columns: SqlColumnReference[];
+  scopes?: SqlReferenceScope[];
 }
 
 export type TreeNodeType =
@@ -488,11 +533,14 @@ export type TreeNodeType =
   | "group-sequences"
   | "group-packages"
   | "group-partitions"
+  | "group-extensions"
+  | "extension"
   | "object-browser"
   | "user-admin"
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
+  | "table-search-control"
   | "load-more"
   | "column"
   | "index"
@@ -504,6 +552,9 @@ export type TreeNodeType =
   | "etcd-root"
   | "zookeeper-root"
   | "mongo-db"
+  | "mongo-gridfs"
+  | "mongo-buckets"
+  | "mongo-bucket"
   | "mongo-collection"
   | "vector-collection"
   | "elasticsearch-index";
@@ -535,6 +586,7 @@ export interface TreeNode {
   linkedCatalog?: string;
   linkedSchema?: string;
   mqTenant?: string;
+  mqInitialTab?: "topics";
   nacosNamespace?: string;
   nacosNamespaceName?: string;
   schema?: string;
@@ -547,9 +599,10 @@ export interface TreeNode {
   partitionParentSchema?: string;
   partitionParentName?: string;
   hiddenChildren?: TreeNode[];
+  tableSearchParentId?: string;
   savedSqlId?: string;
   savedSqlFolderId?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | VectorCollectionMeta;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ExtensionInfo | VectorCollectionMeta;
   loadMore?: {
     parentId: string;
     offset: number;
@@ -558,6 +611,18 @@ export interface TreeNode {
 }
 
 export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
+
+export interface TableStructureEditorDraft {
+  activeTab: TableInfoTab;
+  newTableName: string;
+  tableComment: string;
+  originalTableComment: string;
+  columns: import("@/lib/table/tableStructureEditorSql").EditableStructureColumn[];
+  indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
+  foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
+  triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
+  initialized: boolean;
+}
 
 export interface QueryTab {
   id: string;
@@ -596,7 +661,7 @@ export interface QueryTab {
   resultRuns?: QueryResultRun[];
   activeResultRunId?: string;
   resultAutoSave?: boolean;
-  explainPlan?: import("@/lib/explainPlan").ParsedExplainPlan;
+  explainPlan?: import("@/lib/diagram/explainPlan").ParsedExplainPlan;
   explainError?: string;
   explainSql?: string;
   lastExplainedSql?: string;
@@ -614,11 +679,15 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users";
+  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users";
   mqTenant?: string;
+  mqInitialTab?: "topics";
   nacosNamespace?: string;
   nacosNamespaceName?: string;
   structureTableName?: string;
+  structureInitialTab?: TableInfoTab;
+  structureInitialTabRequestId?: number;
+  structureDraft?: TableStructureEditorDraft;
   objectBrowser?: {
     schema?: string;
     objectType?: "tables";
@@ -657,9 +726,19 @@ export interface QueryTab {
     collection: string;
     idColumn: "_id";
   };
+  mongoBucket?: {
+    bucketName: string;
+  };
   resultEvicted?: boolean;
   whereInput?: string;
   previewSql?: string;
+  /** Whether to use auto-commit mode (default true). When false, multiple statements are
+   *  wrapped in a single transaction. */
+  autoCommit?: boolean;
+  /** Session ID for an active manual transaction, set after beginManualTransaction */
+  txnSessionId?: string;
+  /** Set to true when a manual transaction was auto-rolled back due to inactivity */
+  txnAutoRolledBack?: boolean;
 }
 
 export interface SavedSqlFolder {
@@ -701,4 +780,6 @@ export interface CollectionInfo {
   name: string;
   id: string;
   dimension?: number;
+  kind?: "collection" | "bucket";
+  bucketName?: string;
 }

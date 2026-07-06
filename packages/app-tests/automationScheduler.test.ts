@@ -70,7 +70,7 @@ vi.mock("@/stores/settingsStore", () => ({
   }),
 }));
 
-vi.mock("@/lib/api", () => ({
+vi.mock("@/lib/backend/api", () => ({
   executeMulti: executeMultiMock,
 }));
 

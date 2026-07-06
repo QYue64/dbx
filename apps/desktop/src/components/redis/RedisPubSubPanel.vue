@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, nextTick, onBeforeUnmount } from "vue";
 import { useI18n } from "vue-i18n";
-import * as api from "@/lib/api";
+import * as api from "@/lib/backend/api";
 import { useToast } from "@/composables/useToast";
 
 const props = defineProps<{
@@ -65,7 +65,7 @@ async function connect() {
   if (ws && ws.readyState === WebSocket.OPEN) return;
   connecting.value = true;
   try {
-    ws = api.redisPubSubConnect(props.connectionId);
+    ws = await api.redisPubSubConnect(props.connectionId);
 
     ws.onopen = () => {
       connected.value = true;

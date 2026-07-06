@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { formatError } from "@/lib/errorUtils";
+import { formatError } from "@/lib/backend/errorUtils";
 import { computed, ref, watch } from "vue";
 import type { BacklogQuota, DispatchRate, PolicyScope, PublishRate, RetentionPolicy, SubscribeRate, TopicInfo } from "@/types/mq";
-import { mqGetEffectivePolicies, mqSetBacklogQuota, mqSetDispatchRate, mqSetPublishRate, mqSetRetention, mqSetSubscribeRate } from "@/lib/api";
-import { defaultMqPolicyForms, policyFormsFromEffectivePolicies } from "@/lib/mqPolicyForms";
+import { mqGetEffectivePolicies, mqSetBacklogQuota, mqSetDispatchRate, mqSetPublishRate, mqSetRetention, mqSetSubscribeRate } from "@/lib/backend/api";
+import { defaultMqPolicyForms, policyFormsFromEffectivePolicies } from "@/lib/mq/mqPolicyForms";
 
 interface Props {
   connectionId: string;
@@ -11,6 +11,7 @@ interface Props {
   namespace?: string;
   topic?: TopicInfo;
   readOnly?: boolean;
+  isKafkaCluster?: boolean;
   supportsRateLimits?: boolean;
   supportsBacklogQuota?: boolean;
   supportsRetention?: boolean;
@@ -37,6 +38,7 @@ const retentionForm = ref<RetentionPolicy>({ ...defaultForms.retentionForm });
 
 const scope = computed<PolicyScope | null>(() => {
   if (!props.tenant || !props.namespace) return null;
+  if (props.isKafkaCluster && !props.topic) return null;
   if (props.topic) {
     return {
       level: "topic",
@@ -52,6 +54,8 @@ const scope = computed<PolicyScope | null>(() => {
     namespace: props.namespace,
   };
 });
+
+const scopePlaceholderMessage = computed(() => (props.isKafkaCluster ? "请先选择主题" : "请选择命名空间或主题"));
 
 const scopeLabel = computed(() => {
   const current = scope.value;
@@ -97,7 +101,7 @@ async function applyPolicy(kind: string, action: (current: PolicyScope) => Promi
   if (!guardWritable()) return;
   const current = scope.value;
   if (!current) {
-    error.value = "请先选择命名空间或主题";
+    error.value = scopePlaceholderMessage.value;
     return;
   }
 
@@ -174,7 +178,7 @@ watch(
       </button>
     </div>
 
-    <div v-if="!scope" class="panel-placeholder">请先选择命名空间或主题</div>
+    <div v-if="!scope" class="panel-placeholder">{{ scopePlaceholderMessage }}</div>
 
     <div v-else class="policies-content">
       <div v-if="readOnly" class="readonly-hint">当前连接为只读模式，策略编辑已禁用。</div>

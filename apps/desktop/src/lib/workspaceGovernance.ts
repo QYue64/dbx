@@ -1,4 +1,4 @@
-import { classifyAiSqlExecution, classifyConnectionEnvironment, stripAiSqlComments, type AiSqlExecutionDecision } from "@/lib/aiSqlExecutionPolicy";
+import { classifyAiSqlExecution, classifyConnectionEnvironment, stripAiSqlComments, type AiSqlExecutionDecision } from "@/lib/ai/aiSqlExecutionPolicy";
 import type { ConnectionConfig, InstalledPlugin, PluginManifest, QueryResult } from "@/types/database";
 
 export type WorkspaceRole = "owner" | "admin" | "editor" | "analyst" | "viewer";

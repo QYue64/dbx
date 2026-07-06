@@ -7,8 +7,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import * as api from "@/lib/api";
-import type { RedisSlowlogEntry, RedisNodeEndpoint } from "@/lib/api";
+import * as api from "@/lib/backend/api";
+import type { RedisSlowlogEntry, RedisNodeEndpoint } from "@/lib/backend/api";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
 
@@ -59,9 +59,10 @@ const showClientColumns = computed(() => {
 onMounted(async () => {
   if (connectionMode.value === "cluster") {
     try {
+      await connectionStore.ensureConnected(props.connectionId);
       nodes.value = await api.redisClusterMasterNodes(props.connectionId);
-    } catch {
-      // Silently fail — nodes list is best-effort
+    } catch (e) {
+      console.warn("[DBX] ensureConnected failed for", props.connectionId, e);
     }
   }
 });

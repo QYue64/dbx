@@ -27,7 +27,7 @@ import {
   type ConnectionSharePolicy,
 } from "@/lib/workspaceGovernance";
 import { useToast } from "@/composables/useToast";
-import { getDriverRuntimeSummary, loadDesktopSettings, saveDesktopSettings, type DriverRuntimeSummary } from "@/lib/api";
+import { getDriverRuntimeSummary, loadDesktopSettings, saveDesktopSettings, type DriverRuntimeSummary } from "@/lib/backend/api";
 
 const open = defineModel<boolean>("open", { default: false });
 const connectionStore = useConnectionStore();

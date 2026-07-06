@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
-import { effectiveDatabaseTypeForConnection, inferJdbcDialect } from "../../apps/desktop/src/lib/jdbcDialect.ts";
+import { effectiveDatabaseTypeForConnection, inferJdbcDialect } from "../../apps/desktop/src/lib/database/jdbcDialect.ts";
 
 test("infers GoldenDB for generic JDBC connections", () => {
   assert.equal(
@@ -16,5 +16,15 @@ test("infers GoldenDB for generic JDBC connections", () => {
       jdbc_driver_class: "com.goldendb.jdbc.Driver",
     }),
     "goldendb",
+  );
+});
+
+test("infers JDBC dialect from driver profile", () => {
+  assert.equal(
+    inferJdbcDialect({
+      db_type: "jdbc",
+      driver_profile: "sqlserver",
+    }),
+    "sqlserver",
   );
 });

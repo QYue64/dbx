@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onBeforeUnmount } from "vue";
-import { uuid } from "@/lib/utils";
+import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
 import { RefreshCw, RefreshCcw, Loader2, Trash2, Plus, Save, ChevronLeft, ChevronRight, Table2, Braces, X, Columns3, Check, Search, Wrench, Filter } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -12,12 +12,24 @@ import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ErrorBanner from "@/components/ui/ErrorBanner.vue";
 import DataGrid from "@/components/grid/DataGrid.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
-import * as api from "@/lib/api";
-import { clampSearchSplitWidth } from "@/lib/dataGridSearchSplit";
-import { documentViewerFontStyle } from "@/lib/documentViewerFontStyle";
-import { buildDocumentFilterCondition, combineDocumentFilterConditions, currentDocumentFilterJson, defaultDocumentFilterRule, documentFilterModeNeedsValue, documentFilterModeOptions, documentStoreProviderFor, type DocumentFilterMode, type DocumentFilterRule } from "@/lib/documentStoreProvider";
-import { buildMongoInsertDocument, buildMongoUpdateDocument, formatMongoShellLiteral, parseMongoDocumentInputValue, type MongoInputValue } from "@/lib/mongoDocumentValues";
-import { normalizeResultPageSize } from "@/lib/paginationPageSize";
+import * as api from "@/lib/backend/api";
+import { useConnectionStore } from "@/stores/connectionStore";
+import { clampSearchSplitWidth } from "@/lib/dataGrid/dataGridSearchSplit";
+import { documentViewerFontStyle } from "@/lib/document/documentViewerFontStyle";
+import {
+  buildDocumentFilterCondition,
+  combineDocumentFilterConditions,
+  currentDocumentFilterJson,
+  currentDocumentSortJson,
+  defaultDocumentFilterRule,
+  documentFilterModeNeedsValue,
+  documentFilterModeOptions,
+  documentStoreProviderFor,
+  type DocumentFilterMode,
+  type DocumentFilterRule,
+} from "@/lib/app/documentStoreProvider";
+import { buildMongoInsertDocument, buildMongoUpdateDocument, formatMongoShellLiteral, parseMongoDocumentInputValue, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
+import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { useSettingsStore } from "@/stores/settingsStore";
 import JsonEditNode from "./JsonEditNode.vue";
 import type { EditNode } from "@/types/editor";
@@ -28,6 +40,7 @@ import "splitpanes/dist/splitpanes.css";
 
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
+const connectionStore = useConnectionStore();
 
 const props = defineProps<{
   connectionId: string;
@@ -197,7 +210,7 @@ function resetDocumentFilterBuilder() {
 }
 
 function currentDocumentFilter(): string | undefined {
-  return currentDocumentFilterJson(filterInput.value, appliedDocumentFilter.value);
+  return currentDocumentFilterJson(filterInput.value, appliedDocumentFilter.value, documentStoreProvider.value.kind);
 }
 
 const documentQueryPreview = computed(() => {
@@ -217,7 +230,12 @@ const documentQueryPreview = computed(() => {
 });
 
 async function applyDocumentStructuredFilters() {
-  const items = documentFilterRules.value.map((rule) => ({ rule, condition: buildDocumentFilterCondition(rule) })).filter((item): item is { rule: DocumentFilterRule; condition: Record<string, unknown> } => !!item.condition);
+  const items = documentFilterRules.value
+    .map((rule) => ({
+      rule,
+      condition: buildDocumentFilterCondition(rule, { kind: documentStoreProvider.value.kind }),
+    }))
+    .filter((item): item is { rule: DocumentFilterRule; condition: Record<string, unknown> } => !!item.condition);
   const structured = combineDocumentFilterConditions(
     items.map((item) => item.condition),
     items.map((item) => item.rule),
@@ -242,6 +260,22 @@ function documentIdFromGridValue(value: MongoInputValue | undefined): string | n
   return id.trim() ? id : null;
 }
 
+function documentRoutingValue(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  const routing = typeof value === "string" ? value : String(value);
+  const trimmed = routing.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function documentRoutingFromDocument(doc: JsonRecord | undefined): string | undefined {
+  return documentRoutingValue(doc?._routing);
+}
+
+function documentRoutingFromGridRow(row: MongoInputValue[] | undefined, columns: string[]): string | undefined {
+  const routingColIdx = columns.indexOf("_routing");
+  return routingColIdx >= 0 ? documentRoutingValue(row?.[routingColIdx]) : undefined;
+}
+
 async function gridSave(changes: DocumentGridChanges) {
   const cols = changes.columns;
   const idColIdx = cols.indexOf("_id");
@@ -256,30 +290,32 @@ async function gridSave(changes: DocumentGridChanges) {
     if (isEs) {
       const doc = documents.value[rowIdx];
       if (!doc) continue;
+      const routing = documentRoutingFromDocument(doc);
       const updated = { ...doc };
       for (const [colIdx, newVal] of dirtyCols) {
         const col = cols[colIdx];
-        if (col === "_id") continue;
+        if (col === "_id" || col === "_routing") continue;
         if (newVal === null) {
           delete updated[col];
         } else {
           updated[col] = parseMongoDocumentInputValue(newVal);
         }
       }
-      await api.mongoUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(updated));
+      await api.documentUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(updated), routing);
       continue;
     }
 
     const updateDoc = buildMongoUpdateDocument(dirtyCols, cols);
     if (Object.keys(updateDoc).length === 0) continue;
-    await api.mongoUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(updateDoc));
+    await api.documentUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(updateDoc));
   }
 
   for (const rowIdx of changes.deletedRows) {
     const row = changes.rows[rowIdx];
     const id = row?.[idColIdx];
     if (id == null) continue;
-    await api.mongoDeleteDocument(props.connectionId, props.database, props.collection, String(id));
+    const routing = isEs ? documentRoutingFromDocument(documents.value[rowIdx]) : undefined;
+    await api.documentDeleteDocument(props.connectionId, props.database, props.collection, String(id), routing);
   }
 
   for (const newRow of changes.newRows) {
@@ -287,13 +323,13 @@ async function gridSave(changes: DocumentGridChanges) {
     if (isEs) {
       const id = documentIdFromGridValue(newRow[idColIdx]);
       if (id) {
-        await api.mongoUpdateDocument(props.connectionId, props.database, props.collection, id, JSON.stringify(doc));
+        await api.documentUpdateDocument(props.connectionId, props.database, props.collection, id, JSON.stringify(doc), documentRoutingFromGridRow(newRow, cols));
       } else {
-        await api.mongoInsertDocument(props.connectionId, props.database, props.collection, JSON.stringify(doc));
+        await api.documentInsertDocument(props.connectionId, props.database, props.collection, JSON.stringify(doc));
       }
       continue;
     }
-    await api.mongoInsertDocument(props.connectionId, props.database, props.collection, JSON.stringify(doc));
+    await api.documentInsertDocument(props.connectionId, props.database, props.collection, JSON.stringify(doc));
   }
 
   await load();
@@ -316,6 +352,20 @@ function elasticsearchPathIdPreview(id: string): string {
   return encodeURIComponent(id);
 }
 
+function elasticsearchRoutingPreview(routing: string | undefined): string {
+  return routing ? `?routing=${encodeURIComponent(routing)}` : "";
+}
+
+function buildElasticsearchPartialUpdateDocument(changes: Map<number, MongoInputValue>, columns: string[]): Record<string, unknown> {
+  const filtered = new Map<number, MongoInputValue>();
+  for (const [colIdx, newVal] of changes) {
+    const col = columns[colIdx];
+    if (col === "_id" || col === "_routing") continue;
+    filtered.set(colIdx, newVal);
+  }
+  return buildMongoUpdateDocument(filtered, columns);
+}
+
 async function previewDocumentChanges(changes: DocumentGridChanges): Promise<string[]> {
   const { dirtyRows, deletedRows, newRows, columns, rows } = changes;
   const idColIdx = columns.indexOf("_id");
@@ -328,8 +378,9 @@ async function previewDocumentChanges(changes: DocumentGridChanges): Promise<str
     const id = row?.[idColIdx];
     if (id == null) continue;
     if (isEs) {
-      const updateDoc = buildMongoUpdateDocument(dirtyCols, columns);
-      stmts.push(`POST /${coll}/_update/${elasticsearchPathIdPreview(String(id))}\n${JSON.stringify({ doc: updateDoc.$set ?? updateDoc }, null, 2)}`);
+      const updateDoc = buildElasticsearchPartialUpdateDocument(dirtyCols, columns);
+      const routing = documentRoutingFromGridRow(row, columns);
+      stmts.push(`POST /${coll}/_update/${elasticsearchPathIdPreview(String(id))}${elasticsearchRoutingPreview(routing)}\n${JSON.stringify({ doc: updateDoc.$set ?? updateDoc }, null, 2)}`);
     } else {
       const updateDoc = buildMongoUpdateDocument(dirtyCols, columns);
       stmts.push(`db.${coll}.updateOne({_id: ${mongoIdPreview(id)}}, ${formatMongoShellLiteral(updateDoc)})`);
@@ -341,7 +392,8 @@ async function previewDocumentChanges(changes: DocumentGridChanges): Promise<str
     const id = row?.[idColIdx];
     if (id == null) continue;
     if (isEs) {
-      stmts.push(`DELETE /${coll}/_doc/${elasticsearchPathIdPreview(String(id))}`);
+      const routing = documentRoutingFromGridRow(row, columns);
+      stmts.push(`DELETE /${coll}/_doc/${elasticsearchPathIdPreview(String(id))}${elasticsearchRoutingPreview(routing)}`);
     } else {
       stmts.push(`db.${coll}.deleteOne({_id: ${mongoIdPreview(id)}})`);
     }
@@ -367,6 +419,8 @@ async function previewDocumentChanges(changes: DocumentGridChanges): Promise<str
 const customSaveHandler = computed<CustomSaveHandler>(() => ({
   save: gridSave,
   preview: previewDocumentChanges,
+  supportsInsert: true,
+  readonlyColumns: documentStoreProvider.value.kind === "elasticsearch" ? ["_routing"] : undefined,
 }));
 
 function stopDocumentLoadingTimer() {
@@ -395,8 +449,8 @@ async function load() {
   const previousSelectedId = previousSelectedIdx === null ? null : documentIdentity(documents.value[previousSelectedIdx]);
   try {
     const filter = currentDocumentFilter();
-    const sort = sortInput.value.trim() || undefined;
-    const result = await api.documentFindDocuments(props.connectionId, props.database, props.collection, page.value * pageSize.value, pageSize.value, filter, sort, executionId);
+    const sort = currentDocumentSortJson(sortInput.value);
+    const result = await api.documentFindDocuments(props.connectionId, props.database, props.collection, page.value * pageSize.value, pageSize.value, filter, undefined, sort, executionId);
     if (documentLoadExecutionId.value !== executionId) return;
     const nextDocuments = result.documents.map(asRecord);
     documents.value = nextDocuments;
@@ -511,7 +565,10 @@ function startNew() {
 function startEdit() {
   const doc = selectedDoc.value;
   if (!doc) return;
-  editFields.value = Object.entries(doc).map(([name, value]) => createEditNode(name, value, name === "_id", name === "_id"));
+  editFields.value = Object.entries(doc).map(([name, value]) => {
+    const readonlyMetadata = name === "_id" || (documentStoreProvider.value.kind === "elasticsearch" && name === "_routing");
+    return createEditNode(name, value, readonlyMetadata, readonlyMetadata);
+  });
   isEditing.value = true;
   isNew.value = false;
 }
@@ -600,7 +657,7 @@ function buildObjectFromNodes(nodes: EditNode[], path: string): JsonRecord {
 
   for (const field of nodes) {
     const name = field.keyName.trim();
-    if (!name || (!path && name === "_id")) continue;
+    if (!name || (!path && (name === "_id" || (documentStoreProvider.value.kind === "elasticsearch" && name === "_routing")))) continue;
     if (seen.has(name)) throw new Error(t("mongo.duplicateField", { field: name }));
     seen.add(name);
     doc[name] = buildValueFromNode(field, path ? `${path}.${name}` : name);
@@ -626,7 +683,7 @@ async function saveDoc() {
   try {
     const doc = buildDocumentFromFields();
     if (isNew.value) {
-      await api.mongoInsertDocument(props.connectionId, props.database, props.collection, JSON.stringify(doc));
+      await api.documentInsertDocument(props.connectionId, props.database, props.collection, JSON.stringify(doc));
     } else if (selectedIdx.value !== null) {
       const current = documents.value[selectedIdx.value];
       const id = current?._id;
@@ -634,7 +691,7 @@ async function saveDoc() {
         error.value = "No _id field";
         return;
       }
-      await api.mongoUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(doc));
+      await api.documentUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(doc), documentRoutingFromDocument(current));
     }
     isEditing.value = false;
     isNew.value = false;
@@ -654,7 +711,7 @@ async function applyDeleteDoc(idx: number) {
   if (!id) return;
   error.value = "";
   try {
-    await api.mongoDeleteDocument(props.connectionId, props.database, props.collection, String(id));
+    await api.documentDeleteDocument(props.connectionId, props.database, props.collection, String(id), documentRoutingFromDocument(doc));
     if (selectedIdx.value === idx) {
       selectedIdx.value = null;
       editJson.value = "";
@@ -714,7 +771,14 @@ function highlightedJson(json: string): string {
   });
 }
 
-onMounted(load);
+onMounted(async () => {
+  try {
+    await connectionStore.ensureConnected(props.connectionId);
+  } catch (e) {
+    console.warn("[DBX] ensureConnected failed for", props.connectionId, e);
+  }
+  load();
+});
 onBeforeUnmount(() => {
   if (documentLoadExecutionId.value) void api.cancelQuery(documentLoadExecutionId.value);
   stopDocumentLoadingTimer();

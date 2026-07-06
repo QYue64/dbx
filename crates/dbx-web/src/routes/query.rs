@@ -170,8 +170,20 @@ pub struct BuildSchemaNameSqlRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BuildDatabasePropertyEditSqlRequest {
+    pub options: dbx_core::db_admin_sql::DatabasePropertyEditSqlOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildDuplicateTableStructureSqlRequest {
     pub options: dbx_core::db_admin_sql::DuplicateTableStructureSqlOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildCopyTableDataSqlRequest {
+    pub options: dbx_core::db_admin_sql::CopyTableDataSqlOptions,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +248,18 @@ pub struct BuildDataGridColumnValueFilterConditionRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BuildDataGridColumnValuesFilterConditionRequest {
+    pub options: dbx_core::data_grid_sql::DataGridColumnValuesFilterConditionOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildDataGridColumnDistinctValuesSqlRequest {
+    pub options: dbx_core::data_grid_sql::DataGridColumnDistinctValuesSqlOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildDataGridCountSqlRequest {
     pub options: dbx_core::data_grid_sql::DataGridCountSqlOptions,
 }
@@ -291,6 +315,7 @@ pub async fn execute_query(
             client_session_id: req.client_session_id,
             timeout_secs: req.timeout_secs,
             execution_id: Some(execution_id),
+            ..Default::default()
         },
     )
     .await
@@ -327,6 +352,7 @@ pub async fn execute_multi(
             client_session_id: req.client_session_id,
             timeout_secs: req.timeout_secs,
             execution_id: Some(execution_id),
+            ..Default::default()
         },
     )
     .await
@@ -562,8 +588,10 @@ pub async fn build_rename_object_sql(Json(req): Json<BuildRenameObjectSqlRequest
     dbx_core::db_admin_sql::build_rename_object_sql(req.options).map(Json).map_err(AppError)
 }
 
-pub async fn build_create_database_sql(Json(req): Json<BuildCreateDatabaseSqlRequest>) -> Json<String> {
-    Json(dbx_core::db_admin_sql::build_create_database_sql(req.options))
+pub async fn build_create_database_sql(
+    Json(req): Json<BuildCreateDatabaseSqlRequest>,
+) -> Result<Json<String>, AppError> {
+    dbx_core::db_admin_sql::build_create_database_sql(req.options).map(Json).map_err(AppError)
 }
 
 pub async fn build_duckdb_attach_database_sql(Json(req): Json<BuildDuckDbAttachDatabaseSqlRequest>) -> Json<String> {
@@ -596,8 +624,14 @@ pub async fn build_drop_database_sql(Json(req): Json<BuildDatabaseNameSqlRequest
     Json(dbx_core::db_admin_sql::build_drop_database_sql(req.options))
 }
 
-pub async fn build_create_schema_sql(Json(req): Json<BuildSchemaNameSqlRequest>) -> Json<String> {
-    Json(dbx_core::db_admin_sql::build_create_schema_sql(req.options))
+pub async fn build_create_schema_sql(Json(req): Json<BuildSchemaNameSqlRequest>) -> Result<Json<String>, AppError> {
+    dbx_core::db_admin_sql::build_create_schema_sql(req.options).map(Json).map_err(AppError)
+}
+
+pub async fn build_update_database_properties_sql(
+    Json(req): Json<BuildDatabasePropertyEditSqlRequest>,
+) -> Result<Json<String>, AppError> {
+    dbx_core::db_admin_sql::build_update_database_properties_sql(req.options).map(Json).map_err(AppError)
 }
 
 pub async fn build_drop_schema_sql(Json(req): Json<BuildSchemaNameSqlRequest>) -> Json<String> {
@@ -608,6 +642,10 @@ pub async fn build_duplicate_table_structure_sql(
     Json(req): Json<BuildDuplicateTableStructureSqlRequest>,
 ) -> Json<String> {
     Json(dbx_core::db_admin_sql::build_duplicate_table_structure_sql(req.options))
+}
+
+pub async fn build_copy_table_data_sql(Json(req): Json<BuildCopyTableDataSqlRequest>) -> Json<String> {
+    Json(dbx_core::db_admin_sql::build_copy_table_data_sql(req.options))
 }
 
 pub async fn build_executable_object_source_statements(
@@ -688,6 +726,18 @@ pub async fn build_data_grid_column_value_filter_condition(
     Json(req): Json<BuildDataGridColumnValueFilterConditionRequest>,
 ) -> Json<Option<String>> {
     Json(dbx_core::data_grid_sql::build_data_grid_column_value_filter_condition(req.options))
+}
+
+pub async fn build_data_grid_column_values_filter_condition(
+    Json(req): Json<BuildDataGridColumnValuesFilterConditionRequest>,
+) -> Json<Option<String>> {
+    Json(dbx_core::data_grid_sql::build_data_grid_column_values_filter_condition(req.options))
+}
+
+pub async fn build_data_grid_column_distinct_values_sql(
+    Json(req): Json<BuildDataGridColumnDistinctValuesSqlRequest>,
+) -> Json<String> {
+    Json(dbx_core::data_grid_sql::build_data_grid_column_distinct_values_sql(req.options))
 }
 
 pub async fn build_data_grid_count_sql(Json(req): Json<BuildDataGridCountSqlRequest>) -> Json<String> {
