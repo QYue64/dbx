@@ -800,19 +800,24 @@ function selectTreeNodeRange(node: TreeNode) {
   connectionStore.selectedTreeNodeId = node.id;
 }
 
-const selectedConnectionIds = computed(() => {
+function selectedConnectionIdsForAction(): string[] {
   const connectionIds = new Set(connectionStore.connections.map((connection) => connection.id));
   return connectionStore.selectedTreeNodeIds.filter((id) => connectionIds.has(id));
-});
+}
 
-const isConnectionSelectionChecked = computed(() => connectionStore.connectionMultiSelectActive && props.node.type === "connection" && !!props.node.connectionId && selectedConnectionIds.value.includes(props.node.connectionId));
+const isConnectionSelectionChecked = computed(() => {
+  if (!connectionStore.connectionMultiSelectActive || props.node.type !== "connection" || !props.node.connectionId) return false;
+  return connectionStore.selectedTreeNodeIds.includes(props.node.connectionId);
+});
 
 function toggleConnectionMultiSelection(event: MouseEvent) {
   event.preventDefault();
   event.stopPropagation();
   if (props.node.type !== "connection" || !props.node.connectionId) return;
 
-  const next = new Set(connectionStore.connectionMultiSelectActive ? selectedConnectionIds.value : []);
+  // Keep connection-id normalization off the row render path; this handler only
+  // runs when the checkbox is clicked, while the checked state updates often.
+  const next = new Set(connectionStore.connectionMultiSelectActive ? selectedConnectionIdsForAction() : []);
   if (next.has(props.node.connectionId)) next.delete(props.node.connectionId);
   else next.add(props.node.connectionId);
 
