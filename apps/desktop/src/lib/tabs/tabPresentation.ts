@@ -117,6 +117,9 @@ export function tabTooltipLines(tab: QueryTab, t: Translate): { label: string; v
   if (tab.mode === "query" && queryTitle(tab)) {
     lines.unshift({ label: t("tabs.tooltipTitle"), value: tab.title });
   }
+  if (tab.mode === "query" && tab.externalSqlPath) {
+    lines.push({ label: t("tabs.tooltipFilePath"), value: tab.externalSqlPath });
+  }
   if (tab.mode === "data" && tab.tableMeta?.tableName) {
     lines.push({ label: t("tabs.tooltipTable"), value: tab.tableMeta.tableName });
   }
@@ -138,12 +141,28 @@ export function tabTooltipLines(tab: QueryTab, t: Translate): { label: string; v
   return lines;
 }
 
-export function tabularResultItems(results: QueryResult[] | undefined): { result: QueryResult; index: number; n: number; label?: string }[] {
+export function queryResultStatementLabel(result: Pick<QueryResult, "sourceLabel">): string | undefined {
+  return result.sourceLabel;
+}
+
+export function resultSqlForGrid(tab: Pick<QueryTab, "result" | "resultBaseSql" | "lastExecutedSql" | "sql">): string {
+  return tab.result?.sourceStatement || tab.resultBaseSql || tab.lastExecutedSql || tab.sql;
+}
+
+export function queryResultBaseSql(tab: Pick<QueryTab, "result" | "resultBaseSql" | "lastExecutedSql" | "sql">): string {
+  return resultSqlForGrid(tab);
+}
+
+export function queryResultExecutionSql(tab: Pick<QueryTab, "result" | "resultBaseSql" | "resultSortedSql" | "lastExecutedSql" | "sql">): string {
+  return tab.resultSortedSql || resultSqlForGrid(tab);
+}
+
+export function tabularResultItems(results: QueryResult[] | undefined): { result: QueryResult; index: number; n: number; label?: string; title?: string }[] {
   if (!results) return [];
   return results
     .map((result, index) => ({ result, index }))
     .filter((item) => item.result.columns.length > 0)
-    .map((item, ordinal) => ({ ...item, n: ordinal + 1, label: item.result.sourceLabel }));
+    .map((item, ordinal) => ({ ...item, n: ordinal + 1, label: queryResultStatementLabel(item.result), title: item.result.sourceStatement }));
 }
 
 export function activeResultRun(tab: Pick<QueryTab, "resultRuns" | "activeResultRunId">) {

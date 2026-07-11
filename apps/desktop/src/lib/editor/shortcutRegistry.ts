@@ -1,6 +1,9 @@
+import { parseShortcutStrokes, shortcutDisplayParts } from "@/lib/editor/shortcutDisplay";
+
 export type ShortcutActionId =
   | "executeSql"
   | "formatSql"
+  | "toggleLineComment"
   | "saveSql"
   | "acceptCompletion"
   | "indentMore"
@@ -16,6 +19,7 @@ export type ShortcutActionId =
   | "selectAll"
   | "uppercaseSelection"
   | "lowercaseSelection"
+  | "exPasteSqlInCondition"
   | "copyCurrentRow"
   | "deleteCurrentRow"
   | "newQuery"
@@ -45,7 +49,8 @@ export type ShortcutActionId =
   | "toggleSidebar"
   | "copySidebarSelection"
   | "pasteSidebarSelection"
-  | "editSidebarConnection";
+  | "editSidebarConnection"
+  | "sendSelectionToAi";
 
 export type ShortcutScope = "global" | "editor" | "grid" | "search" | "sidebar";
 
@@ -70,6 +75,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutFormatSql",
     scope: "editor",
     defaultShortcut: "Shift+Mod+F",
+  },
+  {
+    id: "toggleLineComment",
+    labelKey: "settings.shortcutToggleLineComment",
+    scope: "editor",
+    defaultShortcut: "Mod+/",
   },
   {
     id: "saveSql",
@@ -160,6 +171,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutLowercaseSelection",
     scope: "editor",
     defaultShortcut: "Shift+Alt+L",
+  },
+  {
+    id: "exPasteSqlInCondition",
+    labelKey: "settings.shortcutExPasteSqlInCondition",
+    scope: "editor",
+    defaultShortcut: "",
   },
   {
     id: "copyCurrentRow",
@@ -341,6 +358,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     scope: "sidebar",
     defaultShortcut: "Mod+E",
   },
+  {
+    id: "sendSelectionToAi",
+    labelKey: "settings.shortcutSendSelectionToAi",
+    scope: "editor",
+    defaultShortcut: "Mod+Shift+A",
+  },
 ];
 
 export const DEFAULT_SHORTCUT_SETTINGS: ShortcutSettings = Object.fromEntries(SHORTCUT_DEFINITIONS.map((definition) => [definition.id, definition.defaultShortcut])) as ShortcutSettings;
@@ -350,19 +373,23 @@ export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>):
 }
 
 export function shortcutToCodeMirrorKey(shortcut: string): string {
-  return shortcut
-    .split("+")
-    .map((part) => (part.length === 1 ? part.toLowerCase() : part))
-    .join("-");
+  return parseShortcutStrokes(shortcut)
+    .map((parts) =>
+      parts
+        .map((part) => (part.length === 1 ? part.toLowerCase() : part))
+        .map((part) => (part === "Plus" ? "+" : part))
+        .join("-"),
+    )
+    .join(" ");
 }
 
 export function formatShortcut(shortcut: string, platform = globalThis.navigator?.platform || ""): string {
   const isMac = platform.toLowerCase().includes("mac");
-  return shortcut
-    .split("+")
+  return shortcutDisplayParts(shortcut, platform)
     .map((part) => {
       if (part === "Mod") return isMac ? "Cmd" : "Ctrl";
       if (part === "Meta") return isMac ? "Cmd" : "Meta";
+      if (part === "Plus") return "+";
       return part;
     })
     .join("+");

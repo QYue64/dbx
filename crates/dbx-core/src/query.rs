@@ -745,8 +745,15 @@ pub fn is_connection_error(err: &str) -> bool {
         || lower.contains("closed")
         || lower.contains("关闭的连接")
         || lower.contains("连接已关闭")
+        || lower.contains("网络通信异常")
+        || lower.contains("通信异常")
+        || lower.contains("communications link failure")
+        || lower.contains("sqlrecoverableexception")
+        || lower.contains("sqlnontransientconnectionexception")
+        || lower.contains("sqltransientconnectionexception")
         || lower.contains("eof")
         || lower.contains("i/o error")
+        || lower.contains("input/output error")
         || lower.contains("not connected")
         || lower.contains("end-of-file")
         || lower.contains("idle")
@@ -845,7 +852,12 @@ fn is_os_connection_error(lower: &str) -> bool {
 }
 
 pub fn timeout_error() -> String {
-    format!("Query timed out after {} seconds", QUERY_TIMEOUT.as_secs())
+    timeout_error_for(QUERY_TIMEOUT)
+}
+
+fn timeout_error_for(timeout_duration: Duration) -> String {
+    let seconds = timeout_duration.as_secs().max(1);
+    format!("Query timed out after {seconds} seconds")
 }
 
 pub fn canceled_error() -> String {
@@ -876,14 +888,25 @@ pub async fn wait_for_query_with_timeout<F>(
 where
     F: Future<Output = Result<db::QueryResult, String>>,
 {
+    wait_for_result_with_timeout(cancel_token, timeout_duration, future).await
+}
+
+async fn wait_for_result_with_timeout<T, F>(
+    cancel_token: Option<CancellationToken>,
+    timeout_duration: Duration,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
     if let Some(token) = cancel_token {
         tokio::select! {
             biased;
             _ = token.cancelled() => Err(canceled_error()),
-            result = timeout(timeout_duration, future) => result.map_err(|_| timeout_error())?,
+            result = timeout(timeout_duration, future) => result.map_err(|_| timeout_error_for(timeout_duration))?,
         }
     } else {
-        timeout(timeout_duration, future).await.map_err(|_| timeout_error())?
+        timeout(timeout_duration, future).await.map_err(|_| timeout_error_for(timeout_duration))?
     }
 }
 
@@ -897,8 +920,19 @@ pub async fn wait_for_query_opt<F>(
 where
     F: Future<Output = Result<db::QueryResult, String>>,
 {
+    wait_for_result_opt(cancel_token, timeout_duration, future).await
+}
+
+async fn wait_for_result_opt<T, F>(
+    cancel_token: Option<CancellationToken>,
+    timeout_duration: Option<Duration>,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
     match timeout_duration {
-        Some(d) => wait_for_query_with_timeout(cancel_token, d, future).await,
+        Some(d) => wait_for_result_with_timeout(cancel_token, d, future).await,
         None => match cancel_token {
             Some(token) => {
                 tokio::select! {
@@ -910,6 +944,48 @@ where
             None => future.await,
         },
     }
+}
+
+async fn wait_for_value_opt<T, F>(
+    cancel_token: Option<CancellationToken>,
+    timeout_duration: Option<Duration>,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = T>,
+{
+    match timeout_duration {
+        Some(timeout_duration) => {
+            if let Some(token) = cancel_token {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Err(canceled_error()),
+                    result = timeout(timeout_duration, future) => result.map_err(|_| timeout_error_for(timeout_duration)),
+                }
+            } else {
+                timeout(timeout_duration, future).await.map_err(|_| timeout_error_for(timeout_duration))
+            }
+        }
+        None => match cancel_token {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => Err(canceled_error()),
+                    result = future => Ok(result),
+                }
+            }
+            None => Ok(future.await),
+        },
+    }
+}
+
+async fn sqlserver_pool_is_current(
+    state: &AppState,
+    pool_key: &str,
+    client: &Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>,
+) -> bool {
+    let connections = state.connections.read().await;
+    matches!(connections.get(pool_key), Some(PoolKind::SqlServer(current)) if Arc::ptr_eq(current, client))
 }
 
 fn resolve_query_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
@@ -935,6 +1011,30 @@ async fn configured_operation_budget_for_pool_key(state: &AppState, pool_key: &s
     crate::connection::config_for_pool_key(pool_key, &configs)
         .map(DbOperationBudget::from_connection_config)
         .unwrap_or_else(DbOperationBudget::with_defaults)
+}
+
+fn oceanbase_mysql_session_timeout_sql(config: Option<&ConnectionConfig>, timeout_secs: Option<u64>) -> Option<String> {
+    let config = config?;
+    let timeout_secs = timeout_secs.unwrap_or(config.query_timeout_secs);
+    crate::connection::oceanbase_mysql_query_timeout_sql(config, timeout_secs)
+}
+
+async fn apply_oceanbase_mysql_session_timeout(
+    state: &AppState,
+    pool_key: &str,
+    conn: &mut mysql_async::Conn,
+    timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let sql = {
+        let configs = state.configs.read().await;
+        oceanbase_mysql_session_timeout_sql(crate::connection::config_for_pool_key(pool_key, &configs), timeout_secs)
+    };
+    if let Some(sql) = sql {
+        // OceanBase enforces query timeouts through a session variable; set it
+        // on the checked-out connection in case the pooled session was reset.
+        conn.query_drop(&sql).await.map_err(|err| format!("Failed to apply OceanBase query timeout: {err}"))?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1075,6 +1175,7 @@ pub async fn do_execute(
                     });
                 });
             }
+            apply_oceanbase_mysql_session_timeout(state, pool_key, &mut conn, options.timeout_secs).await?;
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1326,7 +1427,7 @@ pub async fn do_execute(
                 } else if options.page_size.is_some() {
                     let params =
                         external_driver_query_params(config.as_ref(), &sql, &database, schema.as_deref(), &options);
-                    session.invoke_with_timeout::<db::QueryResult>("executeQueryPage", params, plugin_timeout).await
+                    invoke_external_driver_query_page(session.as_ref(), params, plugin_timeout).await
                 } else {
                     let params =
                         external_driver_query_params(config.as_ref(), &sql, &database, schema.as_deref(), &options);
@@ -1338,6 +1439,33 @@ pub async fn do_execute(
         }
     };
     result.map(normalize_query_result_for_js)
+}
+
+async fn invoke_external_driver_query_page(
+    session: &crate::plugins::PluginDriverSession,
+    params: serde_json::Value,
+    plugin_timeout: Option<Duration>,
+) -> Result<db::QueryResult, String> {
+    match session.invoke_with_timeout::<db::QueryResult>("executeQueryPage", params.clone(), plugin_timeout).await {
+        Ok(result) => Ok(result),
+        Err(error) if is_external_driver_method_unsupported(&error, "executeQueryPage") => {
+            // Plugins installed by older DBX releases predate cursor pagination. Keep
+            // basic queries usable until the user updates the plugin, without retrying
+            // actual JDBC/SQL failures that may have side effects.
+            log::warn!("[query][external-driver] executeQueryPage unsupported; falling back to executeQuery");
+            session.invoke_with_timeout::<db::QueryResult>("executeQuery", params, plugin_timeout).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_external_driver_method_unsupported(error: &str, method: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    let method = method.to_ascii_lowercase();
+    normalized.contains(&method)
+        && (normalized.contains("unsupported jdbc plugin method")
+            || normalized.contains("unknown method")
+            || normalized.contains("method not found"))
 }
 
 fn external_driver_query_params(
@@ -1764,6 +1892,8 @@ async fn execute_multi_mysql(
     };
     let mut results = Vec::with_capacity(statements.len());
 
+    apply_oceanbase_mysql_session_timeout(state, pool_key, &mut conn, options.timeout_secs).await?;
+
     for stmt in statements {
         if is_canceled(&cancel_token) {
             results.push(error_query_result(canceled_error()));
@@ -1833,6 +1963,7 @@ async fn execute_multi_sqlserver(
     check_read_only_for_connection_multi(state, pool_key, &batches).await?;
     let mut all_results = Vec::new();
     let max_rows = options.max_rows;
+    let query_timeout = resolve_query_timeout(options.timeout_secs);
 
     for batch in &batches {
         if is_canceled(&cancel_token) {
@@ -1858,17 +1989,28 @@ async fn execute_multi_sqlserver(
         };
         drop(connections);
 
-        let mut client = match cancel_token.as_ref() {
-            Some(token) => tokio::select! {
-                biased;
-                _ = token.cancelled() => return Err(canceled_error()),
-                guard = client.lock() => guard,
-            },
-            None => client.lock().await,
+        let mut client_guard = match wait_for_value_opt(cancel_token.clone(), query_timeout, client.lock()).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                all_results.push(error_query_result(err));
+                break;
+            }
         };
 
-        let result = db::sqlserver::execute_batch_with_max_rows(&mut client, batch, max_rows).await;
-        drop(client);
+        if !sqlserver_pool_is_current(state, pool_key, &client).await {
+            all_results.push(error_query_result(
+                "SQL Server connection was reset while waiting for the query lock; please retry.".to_string(),
+            ));
+            break;
+        }
+
+        let result = wait_for_result_opt(
+            cancel_token.clone(),
+            query_timeout,
+            db::sqlserver::execute_batch_with_max_rows(&mut client_guard, batch, max_rows),
+        )
+        .await;
+        drop(client_guard);
 
         match result {
             Ok(results) => all_results.extend(results),
@@ -2096,7 +2238,7 @@ pub async fn execute_statements_in_transaction(
             exec_tx_pg_inner(pool, statements, schema, start, operation_budget.clone(), cancel_context).await
         }
         Some(TxPath::Mysql(pool, _bare)) => {
-            exec_tx_mysql_inner(pool, statements, start, operation_budget.clone()).await
+            exec_tx_mysql_inner(state, &pool_key, pool, statements, start, operation_budget.clone()).await
         }
         Some(TxPath::Sqlite(pool)) => exec_tx_sqlite_inner(pool, statements, start).await,
         Some(TxPath::Explicit) => {
@@ -2221,12 +2363,15 @@ async fn exec_tx_pg_statements(
 }
 
 async fn exec_tx_mysql_inner(
+    state: &AppState,
+    pool_key: &str,
     pool: mysql_async::Pool,
     statements: &[String],
     start: std::time::Instant,
     budget: DbOperationBudget,
 ) -> Result<db::QueryResult, String> {
     let mut conn = db::mysql::get_conn_with_health_check_with_timeout(&pool, budget.checkout_timeout).await?;
+    apply_oceanbase_mysql_session_timeout(state, pool_key, &mut conn, None).await?;
     mysql_query_drop_with_timeout(
         &mut conn,
         "START TRANSACTION",
@@ -2850,6 +2995,11 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
 mod tests {
     use super::*;
     use crate::models::connection::{default_redis_key_separator, ConnectionConfig, DatabaseType};
+    #[cfg(unix)]
+    use crate::plugins::{
+        InstalledPlugin, PluginDriverManifest, PluginDriverSession, PluginManifest, PluginRuntimeEnv,
+    };
+    #[cfg(feature = "duckdb-bundled")]
     use crate::storage::Storage;
 
     fn test_connection_config(db_type: DatabaseType) -> ConnectionConfig {
@@ -2860,6 +3010,7 @@ mod tests {
             driver_profile: None,
             driver_label: None,
             url_params: None,
+            agent_java_options: Vec::new(),
             host: "localhost".to_string(),
             port: 0,
             username: String::new(),
@@ -2914,6 +3065,182 @@ mod tests {
         assert!(!is_agent_execute_batch_unsupported("Agent RPC error (-1): unknown method: execute_query"));
     }
 
+    #[test]
+    fn external_driver_method_unsupported_detects_legacy_plugin_errors() {
+        assert!(is_external_driver_method_unsupported(
+            "Unsupported JDBC plugin method: executeQueryPage",
+            "executeQueryPage"
+        ));
+        assert!(is_external_driver_method_unsupported(
+            "Plugin RPC error (-32601): Method not found: executeQueryPage",
+            "executeQueryPage"
+        ));
+        assert!(is_external_driver_method_unsupported("Unknown method executeQueryPage", "executeQueryPage"));
+    }
+
+    #[test]
+    fn external_driver_method_unsupported_ignores_query_and_other_method_errors() {
+        assert!(!is_external_driver_method_unsupported(
+            "The JDBC driver does not support this SQL operation",
+            "executeQueryPage"
+        ));
+        assert!(!is_external_driver_method_unsupported(
+            "Unsupported JDBC plugin method: listTables",
+            "executeQueryPage"
+        ));
+        assert!(!is_external_driver_method_unsupported(
+            "Unknown column executeQueryPage in field list",
+            "executeQueryPage"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_driver_query_page_falls_back_to_legacy_execute_query() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("dbx-legacy-jdbc-plugin-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("plugin.sh");
+        let calls = dir.join("calls.log");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')\n  case \"$line\" in\n    *'\"method\":\"executeQueryPage\"'*)\n      echo executeQueryPage >> '{}'\n      printf '{{\"id\":%s,\"error\":{{\"message\":\"Unsupported JDBC plugin method: executeQueryPage\"}}}}\\n' \"$id\"\n      ;;\n    *'\"method\":\"executeQuery\"'*)\n      echo executeQuery >> '{}'\n      printf '{{\"id\":%s,\"result\":{{\"columns\":[\"value\"],\"rows\":[[42]],\"affected_rows\":0,\"execution_time_ms\":1,\"truncated\":false}}}}\\n' \"$id\"\n      ;;\n  esac\ndone\n",
+                calls.display(),
+                calls.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let plugin = InstalledPlugin {
+            manifest: PluginManifest {
+                id: "jdbc".to_string(),
+                name: "JDBC".to_string(),
+                version: "legacy".to_string(),
+                protocol_version: 1,
+                description: String::new(),
+                executable: Some("plugin.sh".to_string()),
+                drivers: vec![PluginDriverManifest {
+                    id: "jdbc".to_string(),
+                    label: "JDBC".to_string(),
+                    kind: "external".to_string(),
+                    database_type: Some("jdbc".to_string()),
+                }],
+            },
+            path: dir.clone(),
+        };
+        let session = PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default())
+            .await
+            .expect("legacy plugin should start");
+
+        let result = invoke_external_driver_query_page(
+            &session,
+            serde_json::json!({ "sql": "SELECT 42", "pageSize": 100 }),
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect("legacy executeQuery fallback should succeed");
+
+        assert_eq!(result.columns, vec!["value"]);
+        assert_eq!(result.rows, vec![vec![serde_json::json!(42)]]);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "executeQueryPage\nexecuteQuery\n");
+
+        session.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_driver_query_page_does_not_retry_jdbc_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("dbx-jdbc-query-error-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("plugin.sh");
+        let calls = dir.join("calls.log");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')\n  echo request >> '{}'\n  printf '{{\"id\":%s,\"error\":{{\"message\":\"Incorrect syntax near SELECT\"}}}}\\n' \"$id\"\ndone\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let plugin = InstalledPlugin {
+            manifest: PluginManifest {
+                id: "jdbc".to_string(),
+                name: "JDBC".to_string(),
+                version: "current".to_string(),
+                protocol_version: 1,
+                description: String::new(),
+                executable: Some("plugin.sh".to_string()),
+                drivers: vec![PluginDriverManifest {
+                    id: "jdbc".to_string(),
+                    label: "JDBC".to_string(),
+                    kind: "external".to_string(),
+                    database_type: Some("jdbc".to_string()),
+                }],
+            },
+            path: dir.clone(),
+        };
+        let session = PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default())
+            .await
+            .expect("plugin should start");
+
+        let error = invoke_external_driver_query_page(
+            &session,
+            serde_json::json!({ "sql": "SELECT broken", "pageSize": 100 }),
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("JDBC query errors must be returned without retrying");
+
+        assert_eq!(error, "Incorrect syntax near SELECT");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "request\n");
+
+        session.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oceanbase_mysql_session_timeout_sql_uses_connection_timeout_by_default() {
+        let mut config = test_connection_config(DatabaseType::Mysql);
+        config.driver_profile = Some("oceanbase".to_string());
+        config.query_timeout_secs = 300_000;
+
+        assert_eq!(
+            oceanbase_mysql_session_timeout_sql(Some(&config), None),
+            Some("SET ob_query_timeout = 300000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn oceanbase_mysql_session_timeout_sql_prefers_execution_timeout_override() {
+        let mut config = test_connection_config(DatabaseType::Mysql);
+        config.driver_profile = Some("oceanbase".to_string());
+        config.query_timeout_secs = 30;
+
+        assert_eq!(
+            oceanbase_mysql_session_timeout_sql(Some(&config), Some(600)),
+            Some("SET ob_query_timeout = 600000000".to_string())
+        );
+    }
+
+    #[test]
+    fn oceanbase_mysql_session_timeout_sql_skips_plain_mysql() {
+        let config = test_connection_config(DatabaseType::Mysql);
+
+        assert_eq!(oceanbase_mysql_session_timeout_sql(Some(&config), Some(600)), None);
+    }
+
     #[tokio::test]
     async fn wait_for_query_returns_cancelled_when_token_is_cancelled() {
         let token = CancellationToken::new();
@@ -2956,7 +3283,29 @@ mod tests {
         })
         .await;
 
-        assert_eq!(result.unwrap_err(), timeout_error());
+        assert_eq!(result.unwrap_err(), timeout_error_for(Duration::from_millis(10)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_value_opt_times_out_while_waiting_for_lock() {
+        let lock = tokio::sync::Mutex::new(());
+        let _guard = lock.lock().await;
+
+        let result = wait_for_value_opt(None, Some(Duration::from_millis(10)), lock.lock()).await;
+
+        assert_eq!(result.unwrap_err(), timeout_error_for(Duration::from_millis(10)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_value_opt_can_cancel_while_waiting_for_lock() {
+        let lock = tokio::sync::Mutex::new(());
+        let _guard = lock.lock().await;
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = wait_for_value_opt(Some(token), Some(Duration::from_secs(30)), lock.lock()).await;
+
+        assert_eq!(result.unwrap_err(), QUERY_CANCELED);
     }
 
     #[cfg(feature = "duckdb-bundled")]
@@ -3234,6 +3583,13 @@ mod tests {
         assert!(is_connection_error(
             "I/O error: 由于连接方在一段时间后没有正确答复或连接的主机没有反应，连接尝试失败。 (os error 10060)"
         ));
+        assert!(is_connection_error("Agent RPC error (-1): dm.jdbc.driver.DMException: 网络通信异常"));
+        assert!(is_connection_error(
+            "Agent RPC error (-1): java.sql.SQLRecoverableException: IO 错误: Got minus one from a read call"
+        ));
+        assert!(is_connection_error(
+            "Agent RPC error (-1): com.mysql.cj.jdbc.exceptions.CommunicationsException: Communications link failure"
+        ));
     }
 
     #[test]
@@ -3303,6 +3659,9 @@ mod tests {
 
         assert_eq!(pool_error_action(Some(DatabaseType::SqlServer), err), PoolErrorAction::ReconnectAndRetry);
         assert_eq!(pool_error_action(Some(DatabaseType::Postgres), err), PoolErrorAction::ReconnectAndRetry);
+
+        let dameng_err = "Agent RPC error (-1): dm.jdbc.driver.DMException: 网络通信异常";
+        assert_eq!(pool_error_action(Some(DatabaseType::Dameng), dameng_err), PoolErrorAction::ReconnectAndRetry);
     }
 
     #[cfg(feature = "duckdb-bundled")]
@@ -3458,6 +3817,7 @@ mod tests {
             driver_profile: None,
             driver_label: None,
             url_params: None,
+            agent_java_options: Vec::new(),
             host: "localhost".to_string(),
             port: 0,
             username: String::new(),

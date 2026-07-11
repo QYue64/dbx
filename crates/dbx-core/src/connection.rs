@@ -32,9 +32,12 @@ use crate::storage::{normalize_duckdb_worker_max_processes, Storage, DUCKDB_WORK
 pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
     "JDBC plugin is not installed. Install the optional JDBC plugin to use this connection.";
 pub const PRESTOSQL_JDBC_DRIVER_CLASS: &str = "io.prestosql.jdbc.PrestoDriver";
+const SQLSERVER_LEGACY_DRIVER_INSTALL_HINT: &str =
+    "Install the SQL Server legacy compatibility component from Driver Manager, or open the connection settings and enable SQL Server legacy compatibility mode again.";
 const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
+const HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[cfg(feature = "duckdb-bundled")]
 mod duckdb_types {
@@ -64,12 +67,16 @@ fn is_oceanbase_mysql_config(config: &ConnectionConfig) -> bool {
         && config.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("oceanbase"))
 }
 
-fn oceanbase_mysql_setup_queries(config: &ConnectionConfig) -> Vec<String> {
-    if !is_oceanbase_mysql_config(config) || config.query_timeout_secs == 0 {
-        return Vec::new();
+pub(crate) fn oceanbase_mysql_query_timeout_sql(config: &ConnectionConfig, timeout_secs: u64) -> Option<String> {
+    if !is_oceanbase_mysql_config(config) || timeout_secs == 0 {
+        return None;
     }
-    let timeout_us = config.query_timeout_secs.saturating_mul(1_000_000);
-    vec![format!("SET ob_query_timeout = {timeout_us}")]
+    let timeout_us = timeout_secs.saturating_mul(1_000_000);
+    Some(format!("SET ob_query_timeout = {timeout_us}"))
+}
+
+fn oceanbase_mysql_setup_queries(config: &ConnectionConfig) -> Vec<String> {
+    oceanbase_mysql_query_timeout_sql(config, config.query_timeout_secs).into_iter().collect()
 }
 
 pub enum PoolKind {
@@ -139,6 +146,7 @@ macro_rules! agent_connection_pool_database_type {
             | DatabaseType::Snowflake
             | DatabaseType::Trino
             | DatabaseType::Hive
+            | DatabaseType::Spark
             | DatabaseType::Db2
             | DatabaseType::Informix
             | DatabaseType::Neo4j
@@ -182,6 +190,7 @@ pub struct AppState {
 }
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct PoolActivity {
     last_used_at: Instant,
 }
@@ -252,6 +261,24 @@ pub fn prestosql_jdbc_config_for_endpoint(config: &ConnectionConfig, host: &str,
     jdbc_config
 }
 
+pub fn sqlserver_legacy_agent_config(config: &ConnectionConfig) -> ConnectionConfig {
+    let mut legacy_config = config.clone();
+    legacy_config.driver_profile = Some(db::sqlserver::SQLSERVER_LEGACY_DRIVER_PROFILE.to_string());
+    legacy_config.driver_label = Some(db::sqlserver::SQLSERVER_LEGACY_DRIVER_LABEL.to_string());
+    legacy_config
+}
+
+pub fn sqlserver_legacy_agent_error(native_error: &str, agent_error: &str) -> String {
+    let install_hint = if agent_error.contains("driver is not installed") {
+        format!("\n\n{SQLSERVER_LEGACY_DRIVER_INSTALL_HINT}")
+    } else {
+        String::new()
+    };
+    format!(
+        "{native_error}\n\nFallback with SQL Server legacy compatibility component failed: {agent_error}{install_hint}"
+    )
+}
+
 pub async fn connect_mysql_metadata_pool(
     config: &ConnectionConfig,
     db_config: &ConnectionConfig,
@@ -289,6 +316,21 @@ pub async fn connect_mysql_metadata_pool(
                     )
                     .await
                     .map(|pool| (pool, MysqlMode::Bare))
+                } else if let Some(db) = db_config.effective_database() {
+                    let mut unscoped_config = db_config.clone();
+                    unscoped_config.database = None;
+                    let unscoped_url = connection_url_for_endpoint(&unscoped_config, host, port);
+                    log::info!("MySQL connection with database in URL failed ({err}); retrying without database in URL and using USE statement.");
+                    connect_bare_mysql_pool_with_setup_database(
+                        &unscoped_config,
+                        &unscoped_url,
+                        connect_timeout,
+                        max_connections,
+                        db,
+                        &extra_setup_queries,
+                    )
+                    .await
+                    .map(|pool| (pool, MysqlMode::Bare))
                 } else {
                     Err(err)
                 }
@@ -322,6 +364,23 @@ pub async fn connect_mysql_metadata_pool(
                     connect_timeout,
                     max_connections,
                     idle_timeout_secs,
+                    &extra_setup_queries,
+                )
+                .await?;
+                let mode = detect_ob_oracle_mode(config, &pool).await;
+                Ok((pool, mode))
+            } else if let Some(db) = db_config.effective_database() {
+                let mut unscoped_config = db_config.clone();
+                unscoped_config.database = None;
+                let unscoped_url = connection_url_for_endpoint(&unscoped_config, host, port);
+                log::info!("MySQL connection with database in URL failed ({err}); retrying without database in URL and using USE statement.");
+                let pool = db::mysql::connect_with_ca_cert_pool_limit_idle_and_setup_database(
+                    &unscoped_url,
+                    Some(&config.ca_cert_path),
+                    connect_timeout,
+                    max_connections,
+                    idle_timeout_secs,
+                    Some(db),
                     &extra_setup_queries,
                 )
                 .await?;
@@ -411,7 +470,7 @@ async fn connect_bare_mysql_pool_with_setup(
 ) -> Result<db::mysql::MySqlPool, String> {
     if db_config.bare_mysql_uses_tls() {
         let idle_timeout_secs = Some(db_config.idle_timeout_secs);
-        db::mysql::connect_with_ca_cert_pool_limit_idle_and_setup(
+        db::mysql::connect_compatible_with_ca_cert_pool_limit_idle_and_setup(
             url,
             Some(&db_config.ca_cert_path),
             connect_timeout,
@@ -423,6 +482,40 @@ async fn connect_bare_mysql_pool_with_setup(
     } else {
         db::mysql::connect_bare_with_pool_limit_and_setup(url, connect_timeout, max_connections, extra_setup_queries)
             .await
+    }
+}
+
+async fn connect_bare_mysql_pool_with_setup_database(
+    db_config: &ConnectionConfig,
+    url: &str,
+    connect_timeout: std::time::Duration,
+    max_connections: usize,
+    setup_database: &str,
+    extra_setup_queries: &[String],
+) -> Result<db::mysql::MySqlPool, String> {
+    // Some MySQL proxies reject the default database in the handshake; pass it
+    // separately so DB-layer setup keeps the normal charset/catalog/USE order.
+    if db_config.bare_mysql_uses_tls() {
+        let idle_timeout_secs = Some(db_config.idle_timeout_secs);
+        db::mysql::connect_compatible_with_ca_cert_pool_limit_idle_and_setup_database(
+            url,
+            Some(&db_config.ca_cert_path),
+            connect_timeout,
+            max_connections,
+            idle_timeout_secs,
+            Some(setup_database),
+            extra_setup_queries,
+        )
+        .await
+    } else {
+        db::mysql::connect_bare_with_pool_limit_and_setup_database(
+            url,
+            connect_timeout,
+            max_connections,
+            Some(setup_database),
+            extra_setup_queries,
+        )
+        .await
     }
 }
 
@@ -534,6 +627,95 @@ impl AppState {
             .invoke_with_timeout::<serde_json::Value>("connect", params, Some(external_driver_connect_timeout(config)))
             .await?;
         Ok(PoolKind::ExternalDriver { driver_id: driver_id.to_string(), config: Arc::new(config.clone()), session })
+    }
+
+    pub async fn test_sqlserver_connection_with_legacy_fallback(
+        &self,
+        config: &ConnectionConfig,
+        host: &str,
+        port: u16,
+        connect_timeout: Duration,
+    ) -> Result<String, String> {
+        match db::sqlserver::connect(
+            host,
+            port,
+            &config.username,
+            &config.password,
+            config.database.as_deref(),
+            config.url_params.as_deref(),
+            connect_timeout,
+        )
+        .await
+        {
+            Ok(_) => Ok("Connection successful".to_string()),
+            Err(native_error)
+                if db::sqlserver::sqlserver_legacy_compatibility_enabled(config.url_params.as_deref()) =>
+            {
+                let legacy_config = sqlserver_legacy_agent_config(config);
+                let connect_params =
+                    agent_connect_params(&legacy_config, host, port, legacy_config.effective_database().unwrap_or(""));
+                let mut client = self
+                    .agent_manager
+                    .spawn(&legacy_config.db_type, legacy_config.driver_profile.as_deref())
+                    .await
+                    .map_err(|err| sqlserver_legacy_agent_error(&native_error, &err))?;
+                client
+                    .call_method_with_timeout::<serde_json::Value>(
+                        AgentMethod::TestConnection,
+                        connect_params,
+                        Some(agent_connect_timeout(&legacy_config)),
+                    )
+                    .await
+                    .map_err(|err| sqlserver_legacy_agent_error(&native_error, &err))?;
+                client.disconnect().await.ok();
+                Ok("Connection successful (via SQL Server legacy compatibility driver)".to_string())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub async fn connect_sqlserver_pool_with_legacy_fallback(
+        &self,
+        config: &ConnectionConfig,
+        host: &str,
+        port: u16,
+        connect_timeout: Duration,
+    ) -> Result<PoolKind, String> {
+        match db::sqlserver::connect(
+            host,
+            port,
+            &config.username,
+            &config.password,
+            config.database.as_deref(),
+            config.url_params.as_deref(),
+            connect_timeout,
+        )
+        .await
+        {
+            Ok(client) => Ok(PoolKind::SqlServer(Arc::new(tokio::sync::Mutex::new(client)))),
+            Err(native_error)
+                if db::sqlserver::sqlserver_legacy_compatibility_enabled(config.url_params.as_deref()) =>
+            {
+                let legacy_config = sqlserver_legacy_agent_config(config);
+                let connect_params =
+                    agent_connect_params(&legacy_config, host, port, legacy_config.effective_database().unwrap_or(""));
+                let mut client = self
+                    .agent_manager
+                    .spawn(&legacy_config.db_type, legacy_config.driver_profile.as_deref())
+                    .await
+                    .map_err(|err| sqlserver_legacy_agent_error(&native_error, &err))?;
+                client
+                    .call_method_with_timeout::<serde_json::Value>(
+                        AgentMethod::Connect,
+                        connect_params,
+                        Some(agent_connect_timeout(&legacy_config)),
+                    )
+                    .await
+                    .map_err(|err| sqlserver_legacy_agent_error(&native_error, &err))?;
+                Ok(PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client))))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub fn external_driver_runtime_env(&self, driver_id: &str) -> Result<PluginRuntimeEnv, String> {
@@ -651,61 +833,31 @@ impl AppState {
 
     async fn start_keepalive_task(&self, pool_key: &str, pool: &PoolKind, config: &ConnectionConfig) {
         let interval_secs = config.keepalive_interval_secs;
-        let idle_timeout_secs = config.idle_timeout_secs;
-        let idle_cleanup_enabled = is_session_scoped_pool_key(pool_key) && idle_timeout_secs > 0;
         let mut target = keepalive_target_from_pool(pool, config);
-        if interval_secs == 0 && !idle_cleanup_enabled {
+        if interval_secs == 0 {
             return;
         }
         if interval_secs > 0 && target.is_none() {
             log::debug!(
                 "Connection keepalive requested for '{pool_key}', but this database driver does not keep a pingable client handle."
             );
-            if !idle_cleanup_enabled {
-                return;
-            }
+            return;
         };
 
         let key = pool_key.to_string();
-        let interval = if interval_secs > 0 {
-            Duration::from_secs(interval_secs.max(1))
-        } else {
-            Duration::from_secs(idle_timeout_secs.min(60).max(1))
-        };
+        let interval = Duration::from_secs(interval_secs.max(1));
         let timeout = Duration::from_secs(config.effective_connect_timeout_secs().max(1));
         let connections = self.connections.clone();
         let keepalive_tasks = self.keepalive_tasks.clone();
         let pool_activity = self.pool_activity.clone();
         let cancel_contexts = self.postgres_cancel_contexts.clone();
         let running_queries = self.running_queries.clone();
-        let idle_timeout = Duration::from_secs(idle_timeout_secs.max(1));
         let handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
 
                 if running_queries.is_pool_active(&key) {
                     continue;
-                }
-
-                if idle_cleanup_enabled {
-                    let idle_for = {
-                        let activity = pool_activity.read().await;
-                        activity.get(&key).map(|activity| activity.last_used_at.elapsed())
-                    };
-                    if idle_for.is_some_and(|elapsed| elapsed >= idle_timeout) {
-                        log::info!(
-                            "Closing idle session-scoped connection pool '{key}' after {}s",
-                            idle_timeout.as_secs()
-                        );
-                        keepalive_tasks.write().await.remove(&key);
-                        pool_activity.write().await.remove(&key);
-                        cancel_contexts.write().await.remove(&key);
-                        let removed = connections.write().await.remove(&key);
-                        if let Some(pool) = removed {
-                            close_pool_kind_with_timeout(key, pool).await;
-                        }
-                        break;
-                    }
                 }
 
                 if let Some(target) = target.as_mut() {
@@ -903,7 +1055,12 @@ impl AppState {
                     })
                     .collect();
                 PoolKind::Sqlite(
-                    db::sqlite::connect_path_with_extensions(&expand_tilde(&db_config.host), extensions).await?,
+                    db::sqlite::connect_path_with_cipher_key_and_extensions(
+                        &expand_tilde(&db_config.host),
+                        &db_config.password,
+                        extensions,
+                    )
+                    .await?,
                 )
             }
             DatabaseType::Rqlite => {
@@ -1054,17 +1211,7 @@ impl AppState {
                 PoolKind::ClickHouse(client)
             }
             DatabaseType::SqlServer => {
-                let client = db::sqlserver::connect(
-                    &host,
-                    port,
-                    &db_config.username,
-                    &db_config.password,
-                    db_config.database.as_deref(),
-                    db_config.url_params.as_deref(),
-                    connect_timeout,
-                )
-                .await?;
-                PoolKind::SqlServer(Arc::new(tokio::sync::Mutex::new(client)))
+                self.connect_sqlserver_pool_with_legacy_fallback(&db_config, &host, port, connect_timeout).await?
             }
             DatabaseType::Elasticsearch => {
                 let mut client = db::elasticsearch_driver::EsClient::from_config(
@@ -1098,16 +1245,7 @@ impl AppState {
                 PoolKind::VectorDb(client)
             }
             DatabaseType::InfluxDb => {
-                let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
-                let password = if db_config.password.is_empty() { None } else { Some(db_config.password.clone()) };
-                let client = db::influxdb_driver::InfluxdbClient::new_with_ca_cert(
-                    &url,
-                    username,
-                    password,
-                    db_config.url_params.clone(),
-                    Some(&db_config.ca_cert_path),
-                    connect_timeout,
-                )?;
+                let client = db::influxdb_driver::InfluxdbClient::new_for_config(&url, &db_config, connect_timeout)?;
                 db::influxdb_driver::test_connection(&client, connect_timeout).await?;
                 PoolKind::InfluxDb(client)
             }
@@ -1120,8 +1258,15 @@ impl AppState {
             agent_connection_pool_database_type!() => {
                 let connect_params =
                     agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or(""));
-                let mut client =
-                    self.agent_manager.spawn(&db_config.db_type, db_config.driver_profile.as_deref()).await?;
+                // Kerberos JVM properties are connection-scoped; shared agent daemons must not inherit them.
+                let mut client = self
+                    .agent_manager
+                    .spawn_with_extra_java_args(
+                        &db_config.db_type,
+                        db_config.driver_profile.as_deref(),
+                        &db_config.agent_java_options,
+                    )
+                    .await?;
                 let connect_result = client
                     .call_method_with_timeout::<serde_json::Value>(
                         AgentMethod::Connect,
@@ -1491,11 +1636,30 @@ impl AppState {
                 PoolKind::Mysql(pool, _) => {
                     let pool = pool.clone();
                     drop(connections);
-                    match db::mysql::get_conn_with_health_check(&pool).await {
-                        Ok(_) => false,
-                        Err(err) => {
+                    match tokio::time::timeout(HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT, pool.get_conn()).await {
+                        // Pool saturation means active work, not a dead connection. Removing this pool would
+                        // start a competing reconnect while foreground queries and metadata are still running.
+                        Err(_) => {
+                            log::debug!("MySQL connection pool '{pool_key}' is busy; skipping health probe");
+                            false
+                        }
+                        Ok(Err(err)) => {
                             log::warn!("MySQL connection pool '{pool_key}' is stale: {err}");
                             true
+                        }
+                        Ok(Ok(mut conn)) => {
+                            let timeout = crate::db::connection_timeout();
+                            match tokio::time::timeout(timeout, conn.ping()).await {
+                                Ok(Ok(())) => false,
+                                Ok(Err(err)) => {
+                                    log::warn!("MySQL connection pool '{pool_key}' is stale: {err}");
+                                    true
+                                }
+                                Err(_) => {
+                                    log::warn!("MySQL connection pool '{pool_key}' is stale: health check timed out");
+                                    true
+                                }
+                            }
                         }
                     }
                 }
@@ -1503,7 +1667,7 @@ impl AppState {
                     let pool = pool.clone();
                     drop(connections);
                     let timeout = crate::db::connection_timeout();
-                    match tokio::time::timeout(timeout, pool.get()).await {
+                    match tokio::time::timeout(HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT, pool.get()).await {
                         Ok(Ok(client)) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
                             Ok(Ok(_)) => false,
                             Ok(Err(err)) => {
@@ -1520,8 +1684,8 @@ impl AppState {
                             true
                         }
                         Err(_) => {
-                            log::warn!("PostgreSQL connection pool '{pool_key}' is stale: get connection timed out");
-                            true
+                            log::debug!("PostgreSQL connection pool '{pool_key}' is busy; skipping health probe");
+                            false
                         }
                     }
                 }
@@ -2528,6 +2692,7 @@ fn session_scoped_pool_key(base_pool_key: String, client_session_id: Option<&str
         .unwrap_or(base_pool_key)
 }
 
+#[cfg(test)]
 fn is_session_scoped_pool_key(pool_key: &str) -> bool {
     pool_key.contains(":session:")
 }
@@ -2910,10 +3075,11 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
 mod tests {
     use super::{
         agent_connect_timeout, connection_remote_endpoint, connection_url_for_endpoint, database_connection_config,
-        metadata_connection_config, mysql_metadata_fallback_url, oceanbase_mysql_setup_queries,
-        prestosql_jdbc_config_for_endpoint, redacted_connection_url_for_endpoint, redis_sentinel_transport_id,
-        redis_sentinel_transport_prefix, uses_bare_mysql_pool, uses_tcp_probe, validate_h2_database_path, AppState,
-        PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
+        metadata_connection_config, mysql_metadata_fallback_url, oceanbase_mysql_query_timeout_sql,
+        oceanbase_mysql_setup_queries, prestosql_jdbc_config_for_endpoint, redacted_connection_url_for_endpoint,
+        redis_sentinel_transport_id, redis_sentinel_transport_prefix, sqlserver_legacy_agent_config,
+        sqlserver_legacy_agent_error, uses_bare_mysql_pool, uses_tcp_probe, validate_h2_database_path, AppState,
+        MysqlMode, PoolKind, PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
@@ -2929,6 +3095,7 @@ mod tests {
     use crate::query;
     use crate::schema;
     use crate::storage::Storage;
+    use std::time::{Duration, Instant};
 
     fn mysql_config(database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
@@ -2938,6 +3105,7 @@ mod tests {
             driver_profile: None,
             driver_label: None,
             url_params: None,
+            agent_java_options: Vec::new(),
             host: "127.0.0.1".to_string(),
             port: 3306,
             username: "root".to_string(),
@@ -3025,6 +3193,31 @@ mod tests {
 
         assert_eq!(jdbc_config.jdbc_driver_class.as_deref(), Some("custom.PrestoDriver"));
         assert_eq!(jdbc_config.jdbc_driver_paths, vec!["D:\\software\\jar\\presto-jdbc-350.jar"]);
+    }
+
+    #[test]
+    fn sqlserver_legacy_agent_config_marks_hidden_profile() {
+        let mut config = mysql_config(Some("master"));
+        config.db_type = DatabaseType::SqlServer;
+
+        let legacy = sqlserver_legacy_agent_config(&config);
+
+        assert_eq!(legacy.db_type, DatabaseType::SqlServer);
+        assert_eq!(legacy.driver_profile.as_deref(), Some(crate::db::sqlserver::SQLSERVER_LEGACY_DRIVER_PROFILE));
+        assert_eq!(legacy.driver_label.as_deref(), Some(crate::db::sqlserver::SQLSERVER_LEGACY_DRIVER_LABEL));
+    }
+
+    #[test]
+    fn sqlserver_legacy_agent_error_mentions_driver_manager_when_missing() {
+        let message = sqlserver_legacy_agent_error(
+            "native failed",
+            "sqlserver-legacy driver is not installed. Please install it from the Driver Manager.",
+        );
+
+        assert!(message.contains("native failed"));
+        assert!(message.contains("Fallback with SQL Server legacy compatibility component failed"));
+        assert!(message.contains("Driver Manager"));
+        assert!(message.contains("enable SQL Server legacy compatibility mode again"));
     }
 
     #[test]
@@ -3122,6 +3315,17 @@ mod tests {
         config.query_timeout_secs = 30;
 
         assert_eq!(oceanbase_mysql_setup_queries(&config), vec!["SET ob_query_timeout = 30000000"]);
+    }
+
+    #[test]
+    fn oceanbase_mysql_query_timeout_sql_accepts_large_timeout() {
+        let mut config = mysql_config(Some("dbx"));
+        config.driver_profile = Some("oceanbase".to_string());
+
+        assert_eq!(
+            oceanbase_mysql_query_timeout_sql(&config, 300_000),
+            Some("SET ob_query_timeout = 300000000000".to_string())
+        );
     }
 
     #[test]
@@ -3378,6 +3582,28 @@ mod tests {
         let conns = state.connections.read().await;
         assert!(matches!(conns.get("conn"), Some(PoolKind::Sqlite(_))));
         assert_eq!(conns.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_MYSQL_URL"]
+    async fn live_mysql_health_check_keeps_saturated_pool() {
+        let url = std::env::var("DBX_TEST_MYSQL_URL").expect("DBX_TEST_MYSQL_URL is required");
+        let (state, dir) = test_app_state().await;
+        let config = mysql_config(Some("testdb"));
+        let pool = db::mysql::connect_bare_with_pool_limit(&url, Duration::from_secs(5), 1).await.unwrap();
+        state
+            .insert_connection_pool("conn".to_string(), PoolKind::Mysql(pool.clone(), MysqlMode::Normal), &config)
+            .await;
+        let held_connection = pool.get_conn().await.unwrap();
+
+        let started = Instant::now();
+        state.check_connection_health("conn").await.unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(state.connections.read().await.contains_key("conn"));
+        drop(held_connection);
+        state.remove_connection_pools_detached("conn").await;
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3927,6 +4153,51 @@ mod tests {
             state.pool_activity.write().await.remove(pool_key);
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!state.pool_activity.read().await.contains_key(pool_key));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn session_scoped_pool_is_not_closed_by_idle_timeout() {
+        let (state, dir) = test_app_state().await;
+        let pool_key = "conn:session:tab-1";
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        let mut config = mysql_config(None);
+        config.idle_timeout_secs = 1;
+        config.keepalive_interval_secs = 0;
+
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Sqlite(pool));
+        state.pool_activity.write().await.insert(
+            pool_key.to_string(),
+            super::PoolActivity { last_used_at: std::time::Instant::now() - std::time::Duration::from_secs(10) },
+        );
+        let pool = super::clone_pool_kind(state.connections.read().await.get(pool_key).unwrap());
+        state.start_keepalive_task(pool_key, &pool, &config).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(state.connections.read().await.contains_key(pool_key));
+        assert!(!state.keepalive_tasks.read().await.contains_key(pool_key));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn close_client_session_pool_releases_session_scoped_pool() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Sqlite;
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        let pool_key = "conn:session:tab-1";
+        let pool = crate::db::sqlite::connect_path(":memory:").await.unwrap();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Sqlite(pool));
+        state.pool_activity.write().await.insert(pool_key.to_string(), super::PoolActivity::now());
+
+        assert!(state.close_client_session_pool("conn", None, "tab-1").await.unwrap());
+        assert!(!state.connections.read().await.contains_key(pool_key));
         assert!(!state.pool_activity.read().await.contains_key(pool_key));
 
         let _ = std::fs::remove_dir_all(dir);

@@ -32,6 +32,7 @@ import { useCloseActionPrompt, type AppCloseAction, type AppCloseRequestOptions 
 import { useVisibilityChange } from "@/composables/useVisibilityChange";
 import { useWebDavAutoUpload } from "@/composables/useWebDavAutoUpload";
 import { useAutomationScheduler } from "@/composables/useAutomationScheduler";
+import { shouldDrawDesktopWindowFrame } from "@/composables/useWindowControls";
 import "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/backend/api";
@@ -39,7 +40,7 @@ import { connectionRedactedNameLabel } from "@/lib/connection/connectionPresenta
 import { quickConnectionOpenTarget } from "@/lib/connection/connectionOpenTarget";
 import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { findTreeNodeById, resolveNewQueryTarget } from "@/lib/sql/newQueryContext";
-import { buildExecutableObjectSourceStatements, objectSourceSaveExecutionMode } from "@/lib/table/objectSourceEditor";
+import { buildExecutableObjectSourceStatements, executeObjectSourceSave } from "@/lib/table/objectSourceEditor";
 import { resolveExecutableSql, resolveExecutableSqlWithBackend, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
 import { uuid } from "@/lib/common/utils";
 import { isMacOS } from "@/lib/backend/platform";
@@ -61,6 +62,7 @@ import {
   isResetZoomShortcut,
   isRefreshDataShortcut,
   isSaveShortcut,
+  isSendSelectionToAiShortcut,
   isSwitchToNextTabShortcut,
   isSwitchToPreviousTabShortcut,
   isToggleSidebarShortcut,
@@ -71,6 +73,7 @@ import {
 import { isPreviewTab } from "@/lib/tabs/tabPresentation";
 import { supportsSqlFileExecution } from "@/lib/database/databaseCapabilities";
 import { classifyAiSqlExecution } from "@/lib/ai/aiSqlExecutionPolicy";
+import { buildAppendedEditorSql } from "@/lib/ai/aiSqlAppend";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/history/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/connection/agentDriverUpdateBadge";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
@@ -91,6 +94,7 @@ import type { AiAction } from "@/lib/ai/ai";
 const AiAssistant = defineAsyncComponent(() => import("@/components/editor/AiAssistant.vue"));
 const QueryHistory = defineAsyncComponent(() => import("@/components/editor/QueryHistory.vue"));
 const SqlLibraryPanel = defineAsyncComponent(() => import("@/components/layout/SqlLibraryPanel.vue"));
+const SqlFilePanel = defineAsyncComponent(() => import("@/components/layout/SqlFilePanel.vue"));
 const DriverStorePage = defineAsyncComponent(() => import("@/components/config/DriverStoreDialog.vue"));
 const EditorSettingsPage = defineAsyncComponent(() => import("@/components/editor/EditorSettingsDialog.vue"));
 const GovernanceCenterDialog = defineAsyncComponent(() => import("@/components/config/GovernanceCenterDialog.vue"));
@@ -102,6 +106,7 @@ const QuickOpenDialog = defineAsyncComponent(() => import("@/components/quick-op
 
 type AiAssistantHandle = {
   triggerAction: (action: AiAction, instruction?: string) => void;
+  setPrompt: (text: string) => void;
 };
 
 const { t } = useI18n();
@@ -111,10 +116,11 @@ const settingsStore = useSettingsStore();
 const savedSqlStore = useSavedSqlStore();
 const { message: toastMessage, visible: toastVisible, toast } = useToast();
 const { isDark, themeMode, applyTheme, setThemeMode } = useTheme();
-const { checkingUpdates, updateInfo, updateCheckMessage, showUpdateDialog, isDownloadingUpdate, downloadProgress, updateReady, hasUpdateAvailable, openUrl, checkUpdates, openLatestRelease, downloadAndInstallUpdate, restartApp } = useAppUpdater();
+const { checkingUpdates, updateInfo, updateCheckMessage, showUpdateDialog, isDownloadingUpdate, downloadProgress, updateReady, hasUpdateAvailable, openUrl, checkUpdates, openLatestRelease, downloadPortableUpdateZip, downloadAndInstallUpdate, restartApp } = useAppUpdater();
 const { setupFileDrop } = useFileDrop();
 
 const isDesktop = isTauriRuntime();
+const drawDesktopWindowFrame = shouldDrawDesktopWindowFrame(isMacOS(), isDesktop);
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 let updateCheckTimer: ReturnType<typeof setInterval> | undefined;
 const needsAuth = ref(!isDesktop);
@@ -125,7 +131,6 @@ const showConnectionDialog = ref(false);
 const connectionDialogPrefill = ref<ConnectionDeepLinkDraft | null>(null);
 const connectionDialogInitialTab = ref<ConfigTab | undefined>(undefined);
 const settingsPageTabOpen = ref(false);
-const settingsPageActive = ref(false);
 const showGovernanceCenter = ref(false);
 const showAutomationCenter = ref(false);
 const settingsInitialTab = ref("appearance");
@@ -135,15 +140,16 @@ const driverStoreTabOpen = ref(false);
 const driverStoreActive = ref(false);
 const settingsReturnSurface = ref<"query" | "driverStore" | "welcome">("welcome");
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
-const showSettingsPage = computed(() => settingsPageTabOpen.value && settingsPageActive.value);
+const showSettingsPage = computed(() => settingsPageTabOpen.value && settingsStore.settingsPageActive);
 const showQuickOpen = ref(false);
 const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
 const showAiPanel = ref(safeLocalStorageGet("dbx-ai-panel-open") === "true");
 const showSqlLibraryPanel = ref(safeLocalStorageGet("dbx-sql-library-open") === "true");
+const showSqlFilePanel = ref(safeLocalStorageGet("dbx-sql-file-panel-open") === "true");
 const sidebarOpen = ref(safeLocalStorageGet("dbx-sidebar-open") !== "false");
 const aiPanelReady = ref(false);
-const { sidebarWidth, aiPanelWidth, historyWidth, sqlLibraryWidth, startSidebarResize, startAiPanelResize, startHistoryResize, startSqlLibraryResize } = usePanelResize();
+const { sidebarWidth, aiPanelWidth, historyWidth, sqlLibraryWidth, sqlFilePanelWidth, startSidebarResize, startAiPanelResize, startHistoryResize, startSqlLibraryResize, startSqlFilePanelResize } = usePanelResize();
 const aiAssistantRef = ref<AiAssistantHandle | null>(null);
 const appSidebarRef = ref<InstanceType<typeof AppSidebar> | null>(null);
 const contentAreaRef = ref<InstanceType<typeof ContentArea> | null>(null);
@@ -238,7 +244,24 @@ function promptActiveDatabaseSelection() {
   toast(t("editor.selectDatabaseRequired"), 2500);
 }
 
-const { dangerSql, pendingDangerSql, showDangerDialog, suppressDangerConfirm, tryExecute, doExecute, cancelActiveExecution, tryExplain, onDangerConfirm, showSqlParameterDialog, sqlParameterSourceSql, sqlParameterNames, onSqlParametersConfirm, explainMode } = useSqlExecution({
+const {
+  dangerSql,
+  pendingDangerSql,
+  showDangerDialog,
+  suppressDangerConfirm,
+  tryExecute,
+  doExecute,
+  cancelActiveExecution,
+  tryExplain,
+  onDangerConfirm,
+  showSqlParameterDialog,
+  sqlParameterSourceSql,
+  sqlParameterNames,
+  sqlParameterDatabaseType,
+  sqlParameterEnabledSyntaxes,
+  onSqlParametersConfirm,
+  explainMode,
+} = useSqlExecution({
   activeTab,
   activeConnection,
   executableSql,
@@ -255,8 +278,9 @@ function requestActiveEditorExecute() {
 
 const dialogs = useDialogSources();
 const { getDatabaseOptions } = useDatabaseOptions();
-const { openLineageTarget, openDatabaseSearchTarget, onStructureEditorSaved, openTableTarget } = useNavigationTargets(dialogs);
+const { openLineageTarget, openDatabaseSearchTarget, openDiagramTarget, onStructureEditorSaved, openTableTarget } = useNavigationTargets(dialogs);
 const { onExecuteSql, onReloadData, onPaginate, onSort } = useDataGridActions(activeTab);
+const automationScheduler = useAutomationScheduler({ autoStart: false });
 const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
   openTableTarget,
   openSqlFilePath,
@@ -266,7 +290,6 @@ const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
 const { showCloseActionPrompt, chooseQuit, chooseMinimize, cancelCloseActionPrompt, performCloseAction, setupCloseActionPromptListener, cleanupCloseActionPromptListener } = useCloseActionPrompt({ requestClose: requestAppClose });
 useVisibilityChange();
 useWebDavAutoUpload();
-const automationScheduler = useAutomationScheduler({ autoStart: false });
 
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
@@ -275,7 +298,7 @@ const updateNotificationsEnabled = computed(() => settingsStore.editorSettings.u
 function openSettings(initialTab = "appearance", initialSection?: string) {
   settingsInitialTab.value = initialTab;
   settingsInitialSection.value = initialSection;
-  if (!settingsPageActive.value) {
+  if (!settingsStore.settingsPageActive) {
     settingsReturnSurface.value = showDriverStore.value ? "driverStore" : activeTab.value ? "query" : "welcome";
   }
   activateSettingsPage();
@@ -283,13 +306,13 @@ function openSettings(initialTab = "appearance", initialSection?: string) {
 
 function activateSettingsPage() {
   settingsPageTabOpen.value = true;
-  settingsPageActive.value = true;
+  settingsStore.settingsPageActive = true;
   driverStoreActive.value = false;
 }
 
 function closeSettingsPage() {
   settingsPageTabOpen.value = false;
-  settingsPageActive.value = false;
+  settingsStore.settingsPageActive = false;
   if (settingsReturnSurface.value === "driverStore" && driverStoreTabOpen.value) {
     driverStoreActive.value = true;
     return;
@@ -300,7 +323,7 @@ function closeSettingsPage() {
 function openDriverStorePage() {
   driverStoreTabOpen.value = true;
   driverStoreActive.value = true;
-  settingsPageActive.value = false;
+  settingsStore.settingsPageActive = false;
 }
 
 function closeDriverStorePage() {
@@ -431,7 +454,7 @@ watch(
     }
     if (id) newQueryContextSource.value = "tab";
     if (id && driverStoreActive.value) driverStoreActive.value = false;
-    if (id && settingsPageActive.value) settingsPageActive.value = false;
+    if (id && settingsStore.settingsPageActive) settingsStore.settingsPageActive = false;
     selectedSql.value = "";
     activeOutputView.value = "result";
     if (id) queryStore.reloadEvictedTab(id);
@@ -471,12 +494,40 @@ function toggleSqlLibrary() {
   safeLocalStorageSet("dbx-sql-library-open", String(showSqlLibraryPanel.value));
 }
 
+function toggleSqlFilePanel() {
+  showSqlFilePanel.value = !showSqlFilePanel.value;
+  safeLocalStorageSet("dbx-sql-file-panel-open", String(showSqlFilePanel.value));
+}
+
+function invokeWhenAiReady(invoke: (handle: AiAssistantHandle) => void) {
+  if (aiAssistantRef.value) {
+    invoke(aiAssistantRef.value);
+    return;
+  }
+  // AiAssistant 是异步组件，首次打开面板时单个 nextTick 不足以等待挂载完成，
+  // 因此监听 ref，待其从 null 变为组件实例后再调用。
+  const stop = watch(aiAssistantRef, (handle) => {
+    if (handle) {
+      stop();
+      invoke(handle);
+    }
+  });
+}
+
 function fixWithAi(errorMessage: string) {
   if (!showAiPanel.value) {
     showAiPanel.value = true;
     safeLocalStorageSet("dbx-ai-panel-open", "true");
   }
-  nextTick(() => aiAssistantRef.value?.triggerAction("fix", errorMessage));
+  invokeWhenAiReady((handle) => handle.triggerAction("fix", errorMessage));
+}
+
+function sendSelectionToAi(sql: string) {
+  if (!showAiPanel.value) {
+    showAiPanel.value = true;
+    safeLocalStorageSet("dbx-ai-panel-open", "true");
+  }
+  invokeWhenAiReady((handle) => handle.setPrompt(sql));
 }
 
 function openAiPanel() {
@@ -504,7 +555,7 @@ function analyzeHistoryWithAi(entry: HistoryEntry) {
   const title = t("history.aiAnalysisTab");
   const tabId = queryStore.createTab(connectionId, database || "", title, "query");
   queryStore.updateSql(tabId, entry.sql);
-  nextTick(() => aiAssistantRef.value?.triggerAction("explain", buildHistoryAiAnalysisPrompt(entry)));
+  invokeWhenAiReady((handle) => handle.triggerAction("explain", buildHistoryAiAnalysisPrompt(entry)));
 }
 
 function formatActiveSql() {
@@ -761,20 +812,15 @@ async function saveActiveObjectSource(tab: QueryTab): Promise<boolean> {
   if (!connection || !source) return false;
 
   try {
+    const databaseType = effectiveDatabaseTypeForConnection(connection) ?? connection.db_type;
     const statements = await buildExecutableObjectSourceStatements({
-      databaseType: connection.db_type,
+      databaseType,
       objectType: source.objectType,
       schema: source.schema || tab.schema || tab.database,
       name: source.name,
       source: tab.sql,
     });
-    for (const sql of statements) {
-      if (objectSourceSaveExecutionMode(connection.db_type) === "single") {
-        await api.executeQuery(tab.connectionId, tab.database, sql, source.schema || tab.schema);
-      } else {
-        await api.executeScript(tab.connectionId, tab.database, sql, source.schema || tab.schema);
-      }
-    }
+    await executeObjectSourceSave(tab.connectionId, tab.database, databaseType, statements, source.schema || tab.schema);
     queryStore.markTabClean(tab);
     toast(t("objects.sourceSaved"), 2000);
     return true;
@@ -882,6 +928,10 @@ async function importResultArchive() {
   }
 }
 
+function pasteClipboardAsSqlInCondition() {
+  void contentAreaRef.value?.pasteClipboardAsSqlInCondition?.();
+}
+
 async function openSqlFilePath(path: string) {
   if (!isTauriRuntime()) return;
   try {
@@ -889,9 +939,7 @@ async function openSqlFilePath(path: string) {
     const connectionId = connectionStore.activeConnectionId || activeTab.value?.connectionId || connectionStore.connections[0]?.id || "";
     const connection = connectionId ? connectionStore.getConfig(connectionId) : undefined;
     const database = activeTab.value?.database || (connection ? resolveDefaultDatabase(connection, []) : "");
-    const tabId = queryStore.createTab(connectionId, database, sqlFileTitleFromPath(path), "query");
-    queryStore.updateSql(tabId, content);
-    queryStore.linkExternalSqlPath(tabId, path, sqlFileTitleFromPath(path));
+    queryStore.openExternalSqlFile(connectionId, database, path, content);
   } catch (e: any) {
     toast(t("toolbar.sqlOpenFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -1220,16 +1268,25 @@ function onAiReplaceSql(sql: string) {
   queryStore.updateSql(tabId, sql);
 }
 
-function onAiExecuteSql(sql: string) {
-  const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, sql);
+function runAiGeneratedSql(sql: string) {
   selectedSql.value = "";
   nextTick(() => tryExecute(sql));
 }
 
+function onAiExecuteSql(sql: string) {
+  const tabId = ensureQueryTab();
+  queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
+  runAiGeneratedSql(sql);
+}
+
+function onAiTempRunSql(sql: string) {
+  ensureQueryTab();
+  runAiGeneratedSql(sql);
+}
+
 function onAiRequestAutoExecuteSql(sql: string) {
   const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, sql);
+  queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
   selectedSql.value = "";
 
   const decision = classifyAiSqlExecution(sql, activeConnection.value);
@@ -1251,7 +1308,7 @@ function onAiRequestAutoExecuteSql(sql: string) {
 
 function onAiOpenExplainPlan(sql: string) {
   const tabId = ensureQueryTab();
-  queryStore.updateSql(tabId, sql);
+  queryStore.updateSql(tabId, buildAppendedEditorSql(activeTab.value?.sql || "", sql));
   selectedSql.value = "";
   nextTick(() => {
     void tryExplain(sql);
@@ -1340,6 +1397,12 @@ async function handleQuickOpenSelect(item: any) {
       }
     }
     return;
+  } else if (item.type === "schema") {
+    const dbNode = findTreeNodeById(connectionStore.treeNodes, `${item.connectionId}:${item.database}`);
+    if (dbNode && !dbNode.isExpanded) await connectionStore.loadSchemas(item.connectionId, item.database);
+    const schemaNode = findTreeNodeById(connectionStore.treeNodes, `${item.connectionId}:${item.database}:${item.schema}`);
+    if (schemaNode && !schemaNode.isExpanded) await connectionStore.loadTables(item.connectionId, item.database, item.schema);
+    return;
   } else if (item.type === "table" || item.type === "view" || item.type === "materialized_view") {
     // Open the table/view in a data tab
     await openTableTarget({
@@ -1391,7 +1454,7 @@ function activateQueryTab(tabId: string): boolean {
   dispatchBeforeTabSwitch(tabId);
   queryStore.activeTabId = tabId;
   driverStoreActive.value = false;
-  settingsPageActive.value = false;
+  settingsStore.settingsPageActive = false;
   return true;
 }
 
@@ -1499,6 +1562,12 @@ function handleKeydown(e: KeyboardEvent) {
     requestActiveEditorExecute();
     return;
   }
+  if (activeTab.value?.mode === "query" && isSendSelectionToAiShortcut(e, shortcuts) && e.target instanceof Element && e.target.closest("[data-query-editor-root]")) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (selectedSql.value.trim()) sendSelectionToAi(selectedSql.value);
+    return;
+  }
   if (isModRShortcut(e) && e.target instanceof Element && contentAreaRef.value?.handleModRTarget(e.target)) {
     e.preventDefault();
     e.stopPropagation();
@@ -1559,9 +1628,9 @@ async function initApp() {
       });
 
     await connectionStore.initFromDisk();
+    automationScheduler.start();
     console.log(`[STARTUP]   connectionStore.initFromDisk: ${(performance.now() - t0).toFixed(0)}ms`);
     restoreActiveConnectionContext();
-    automationScheduler.start();
   } catch (e: any) {
     toast(t("connection.loadFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -1716,13 +1785,14 @@ onUnmounted(() => {
   <LoginPage v-if="setupRequired || (needsAuth && !authenticated)" :setup-mode="setupRequired" @authenticated="onLoginSuccess" />
   <div v-show="!setupRequired && (!needsAuth || authenticated)" class="fixed inset-0 h-screen w-screen overflow-hidden">
     <TooltipProvider :delay-duration="300">
-      <div class="h-screen w-screen max-w-full min-w-[760px] min-h-[600px] flex flex-col bg-background text-foreground overflow-hidden" :style="appUiFontFamilyStyle">
+      <div class="h-screen w-screen max-w-full min-w-[760px] min-h-[600px] flex flex-col bg-background text-foreground overflow-hidden" :class="{ 'dbx-desktop-window-frame': drawDesktopWindowFrame }" :style="appUiFontFamilyStyle">
         <AppToolbar
           :is-dark="isDark"
           :theme-mode="themeMode"
           :show-ai-panel="showAiPanel"
           :show-history="showHistory"
           :show-sql-library="showSqlLibraryPanel"
+          :show-sql-file-panel="showSqlFilePanel"
           :show-driver-store="showDriverStore"
           :show-settings-page="showSettingsPage"
           :checking-updates="checkingUpdates"
@@ -1736,6 +1806,7 @@ onUnmounted(() => {
           @toggle-ai="toggleAiPanel"
           @toggle-history="showHistory = !showHistory"
           @toggle-sql-library="toggleSqlLibrary"
+          @toggle-sql-file-panel="toggleSqlFilePanel"
           @open-settings="openSettings()"
           @open-automation="showAutomationCenter = true"
           @open-governance="showGovernanceCenter = true"
@@ -1761,13 +1832,13 @@ onUnmounted(() => {
                 :driver-store-open="driverStoreTabOpen"
                 :driver-store-active="driverStoreActive"
                 :settings-page-open="settingsPageTabOpen"
-                :settings-page-active="settingsPageActive"
+                :settings-page-active="settingsStore.settingsPageActive"
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
                 @activate-driver-store="openDriverStorePage"
                 @activate-settings-page="activateSettingsPage"
                 @activate-tab="
                   driverStoreActive = false;
-                  settingsPageActive = false;
+                  settingsStore.settingsPageActive = false;
                 "
                 @close-driver-store="closeDriverStorePage"
                 @close-settings-page="closeSettingsPage"
@@ -1780,7 +1851,7 @@ onUnmounted(() => {
               <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" @update-count-change="updateAgentDriverUpdateCount" />
               <EditorSettingsPage
                 v-if="settingsPageTabOpen"
-                v-show="settingsPageActive"
+                v-show="settingsStore.settingsPageActive"
                 variant="page"
                 :open="settingsPageTabOpen"
                 :initial-tab="settingsInitialTab"
@@ -1789,7 +1860,7 @@ onUnmounted(() => {
                 class="flex-1 min-h-0"
                 @update:open="(open: boolean) => (open ? activateSettingsPage() : closeSettingsPage())"
               />
-              <div v-if="activeTab" v-show="!driverStoreActive && !settingsPageActive" class="flex flex-col flex-1 min-h-0">
+              <div v-if="activeTab" v-show="!driverStoreActive && !settingsStore.settingsPageActive" class="flex flex-col flex-1 min-h-0">
                 <EditorToolbar
                   v-if="activeTab.mode === 'query' && !isPreviewTab(activeTab)"
                   :active-tab="activeTab"
@@ -1820,6 +1891,7 @@ onUnmounted(() => {
                   @save-sql="void openSaveSqlDialog()"
                   @open-sql="openSqlFile"
                   @import-result-archive="importResultArchive"
+                  @paste-sql-in-condition="pasteClipboardAsSqlInCondition"
                   @change-connection="changeActiveConnection"
                   @change-database="changeActiveDatabase"
                   @change-schema="changeActiveSchema"
@@ -1840,6 +1912,7 @@ onUnmounted(() => {
                     :block-dangerous-redis-commands="blockDangerousRedisCommands"
                     @update:active-output-view="activeOutputView = $event"
                     @fix-with-ai="fixWithAi"
+                    @send-selection-to-ai="sendSelectionToAi"
                     @execute="tryExecute($event)"
                     @cancel="cancelActiveExecution()"
                     @explain="tryExplain()"
@@ -1850,7 +1923,7 @@ onUnmounted(() => {
                     @editor-selection-state-change="(tabId: string, selection: { anchor: number; head: number }) => queryStore.updateEditorSelection(tabId, selection)"
                     @format-error="toast(t('toolbar.formatSqlFailed'))"
                     @save-sql="void openSaveSqlDialog()"
-                    @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => onReloadData(sql, searchText, whereInput, orderBy, limit, offset)"
+                    @reload="(sql, searchText, whereInput, orderBy, limit, offset, intent) => onReloadData(sql, searchText, whereInput, orderBy, limit, offset, intent)"
                     @paginate="onPaginate"
                     @sort="onSort"
                     @execute-sql="onExecuteSql"
@@ -1865,11 +1938,13 @@ onUnmounted(() => {
                           connectionId: activeTab.connectionId,
                           database: activeTab.database,
                           schema: target.schema,
+                          catalog: target.catalog,
                           tableName: target.tableName,
                           tableType: target.tableType,
                         })
                     "
                     @object-schema-change="(schema) => activeTab && queryStore.updateSchema(activeTab.id, schema)"
+                    @object-browser-viewport-change="(tabId, viewport) => queryStore.updateObjectBrowserViewport(tabId, viewport)"
                     @structure-editor-saved="
                       (commentChanged) =>
                         activeTab &&
@@ -1892,7 +1967,7 @@ onUnmounted(() => {
                 </KeepAlive>
               </div>
               <WelcomeScreen
-                v-else-if="!driverStoreActive && !settingsPageActive"
+                v-else-if="!driverStoreActive && !settingsStore.settingsPageActive"
                 :connection-stats="connectionStats"
                 :recent-connections="recentConnections"
                 :saved-sql-history-items="savedSqlHistoryItems"
@@ -1912,7 +1987,18 @@ onUnmounted(() => {
           <div v-if="showAiPanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: aiPanelWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startAiPanelResize" />
             <div class="h-full min-h-0 overflow-hidden">
-              <AiAssistant v-if="aiPanelReady" ref="aiAssistantRef" :tab="activeTab" :connection="activeConnection" @replace-sql="onAiReplaceSql" @execute-sql="onAiExecuteSql" @request-auto-execute-sql="onAiRequestAutoExecuteSql" @open-explain-plan="onAiOpenExplainPlan" @close="toggleAiPanel" />
+              <AiAssistant
+                v-if="aiPanelReady"
+                ref="aiAssistantRef"
+                :tab="activeTab"
+                :connection="activeConnection"
+                @replace-sql="onAiReplaceSql"
+                @execute-sql="onAiExecuteSql"
+                @temp-run-sql="onAiTempRunSql"
+                @request-auto-execute-sql="onAiRequestAutoExecuteSql"
+                @open-explain-plan="onAiOpenExplainPlan"
+                @close="toggleAiPanel"
+              />
             </div>
           </div>
 
@@ -1927,6 +2013,13 @@ onUnmounted(() => {
               <SqlLibraryPanel @close="toggleSqlLibrary" />
             </div>
           </div>
+
+          <div v-if="showSqlFilePanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: sqlFilePanelWidth + 'px' }">
+            <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startSqlFilePanelResize" />
+            <div class="h-full min-h-0 overflow-hidden">
+              <SqlFilePanel @close="toggleSqlFilePanel" />
+            </div>
+          </div>
         </div>
 
         <AppDialogs
@@ -1939,6 +2032,8 @@ onUnmounted(() => {
           :show-sql-parameter-dialog="showSqlParameterDialog"
           :sql-parameter-source-sql="sqlParameterSourceSql"
           :sql-parameter-names="sqlParameterNames"
+          :sql-parameter-database-type="sqlParameterDatabaseType"
+          :sql-parameter-enabled-syntaxes="sqlParameterEnabledSyntaxes"
           @update:show-connection-dialog="setConnectionDialogOpen"
           @update:show-danger-dialog="showDangerDialog = $event"
           @update:suppress-danger-confirm="suppressDangerConfirm = $event"
@@ -1962,6 +2057,7 @@ onUnmounted(() => {
           "
           @open-lineage-target="openLineageTarget"
           @open-database-search-target="openDatabaseSearchTarget"
+          @open-diagram-target="openDiagramTarget"
         />
         <UpdateDialog
           v-if="showUpdateDialog"
@@ -1972,6 +2068,7 @@ onUnmounted(() => {
           :download-progress="downloadProgress"
           :update-ready="updateReady"
           @open-latest-release="openLatestRelease"
+          @download-portable-zip="downloadPortableUpdateZip"
           @download-and-install="downloadAndInstallUpdate"
           @restart="restartApp"
         />

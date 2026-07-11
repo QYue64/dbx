@@ -6,6 +6,7 @@ import { normalizeShortcutSettings, type ShortcutSettings } from "@/lib/editor/s
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { DEFAULT_SQL_FORMATTER_SETTINGS, normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
+import { normalizeSqlVariableSyntaxOverrides, type SqlVariableSyntaxOverrides } from "@/lib/sql/sqlVariableSyntax";
 import type { SidebarActivation } from "@/lib/sidebar/treeNodeClick";
 import type { SqlSnippet } from "@/types/database";
 import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlCompletion";
@@ -292,13 +293,15 @@ export type EditorTheme =
 
 const STRUCTURE_EDITOR_DENSITIES = ["compact", "standard", "comfortable"] as const;
 export type StructureEditorDensity = (typeof STRUCTURE_EDITOR_DENSITIES)[number];
+const COLUMN_WIDTH_DENSITIES = ["compact", "standard", "comfortable"] as const;
+export type ColumnWidthDensity = (typeof COLUMN_WIDTH_DENSITIES)[number];
 const CELL_DETAIL_PANEL_LAYOUTS = ["bottom", "right"] as const;
 export type CellDetailPanelLayout = (typeof CELL_DETAIL_PANEL_LAYOUTS)[number];
 const DATA_GRID_RENDER_MODES = ["dom", "canvas"] as const;
 export type DataGridRenderMode = (typeof DATA_GRID_RENDER_MODES)[number];
 const DATA_GRID_SEARCH_MODES = ["filter", "highlight"] as const;
 export type DataGridSearchMode = (typeof DATA_GRID_SEARCH_MODES)[number];
-export const TABLE_FONT_SIZE_MIN = 12;
+export const TABLE_FONT_SIZE_MIN = 8;
 export const TABLE_FONT_SIZE_MAX = 16;
 export const TABLE_FONT_SIZE_DEFAULT = 13;
 const DISCONNECT_TAB_HANDLING_MODES = ["close-tabs", "keep-tabs-clear-results", "keep-tabs-keep-results"] as const;
@@ -374,9 +377,12 @@ export interface EditorSettings {
   activeCustomThemeId: string;
   executeMode: "all" | "current";
   showExecutionTargetPicker: boolean;
+  showStatementRunButtons: boolean;
+  showCurrentStatementFrame: boolean;
   autoAliasTables: boolean;
   wordWrap: boolean;
   vimModeEnabled: boolean;
+  autoCloseBrackets: boolean;
   sqlSemanticDiagnosticsMode: SqlSemanticDiagnosticsMode;
   sqlSemanticDiagnosticsEnabled: boolean;
   confirmDangerousSqlExecution: boolean;
@@ -390,6 +396,7 @@ export interface EditorSettings {
   showColumnCommentsInHeader: boolean;
   showColumnTypesInHeader: boolean;
   compactColumnHeaderActions: boolean;
+  columnWidthDensity: ColumnWidthDensity;
   dataGridQuickEntry: boolean;
   dataGridRenderMode: DataGridRenderMode;
   dataGridSearchMode: DataGridSearchMode;
@@ -403,6 +410,7 @@ export interface EditorSettings {
   sqlFormatter: SqlFormatterSettings;
   sidebarActivation: SidebarActivation;
   sidebarObjectDisplay: "grouped" | "simple";
+  sidebarTableSearchEnabled: boolean;
   autoSelectActiveSidebarNode: boolean;
   openTabsRestoreMode: OpenTabsRestoreMode;
   disconnectTabHandlingMode: DisconnectTabHandlingMode;
@@ -421,6 +429,9 @@ export interface EditorSettings {
   queryExportKeysetOptimizationEnabled: boolean;
   updateDownloadSource: UpdateDownloadSource;
   toolbarItems: ToolbarItems;
+  objectBrowserShowCheckbox: boolean;
+  objectBrowserViewMode: "list" | "grid";
+  sqlVariableSyntaxOverrides: SqlVariableSyntaxOverrides;
 }
 
 export interface ToolbarItems {
@@ -431,6 +442,7 @@ export interface ToolbarItems {
   dataCompare: boolean;
   checkUpdates: boolean;
   sqlLibrary: boolean;
+  sqlFileTree: boolean;
   history: boolean;
   ai: boolean;
   theme: boolean;
@@ -446,6 +458,7 @@ export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   dataCompare: true,
   checkUpdates: true,
   sqlLibrary: true,
+  sqlFileTree: true,
   history: true,
   ai: true,
   theme: true,
@@ -479,9 +492,9 @@ export const EDITOR_THEMES: { value: EditorTheme; label: string; dark: boolean }
 const EDITOR_THEME_VALUES = new Set<EditorTheme>(EDITOR_THEMES.map((theme) => theme.value));
 
 export const FONT_FAMILIES: { value: string; label: string }[] = [
+  { value: "'Fira Code', 'Cascadia Code', 'Cascadia Mono', 'JetBrains Mono', monospace", label: "Fira Code" },
   { value: "'JetBrains Mono', 'Fira Code', monospace", label: "JetBrains Mono" },
-  { value: "'Fira Code', monospace", label: "Fira Code" },
-  { value: "'Cascadia Code', monospace", label: "Cascadia Code" },
+  { value: "'Cascadia Code', 'Cascadia Mono', monospace", label: "Cascadia Code" },
   { value: "'Source Code Pro', monospace", label: "Source Code Pro" },
   { value: "'SF Mono', 'Menlo', monospace", label: "SF Mono / Menlo" },
   { value: "'Consolas', 'Courier New', monospace", label: "Consolas" },
@@ -489,7 +502,7 @@ export const FONT_FAMILIES: { value: string; label: string }[] = [
 ];
 
 export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
-  fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+  fontFamily: "'Fira Code', 'Cascadia Code', 'Cascadia Mono', 'JetBrains Mono', monospace",
   fontSize: 13,
   uiFontFamily: DEFAULT_UI_FONT_FAMILY,
   uiScale: 1,
@@ -499,9 +512,12 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   activeCustomThemeId: "default",
   executeMode: "all",
   showExecutionTargetPicker: false,
+  showStatementRunButtons: true,
+  showCurrentStatementFrame: true,
   autoAliasTables: true,
   wordWrap: false,
   vimModeEnabled: false,
+  autoCloseBrackets: true,
   sqlSemanticDiagnosticsMode: "auto",
   sqlSemanticDiagnosticsEnabled: SQL_SEMANTIC_DIAGNOSTICS_AUTO_ENABLED,
   confirmDangerousSqlExecution: true,
@@ -515,6 +531,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   showColumnCommentsInHeader: true,
   showColumnTypesInHeader: true,
   compactColumnHeaderActions: true,
+  columnWidthDensity: "standard",
   dataGridQuickEntry: false,
   dataGridRenderMode: "canvas",
   dataGridSearchMode: "filter",
@@ -528,6 +545,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   sqlFormatter: normalizeSqlFormatterSettings(DEFAULT_SQL_FORMATTER_SETTINGS),
   sidebarActivation: "single",
   sidebarObjectDisplay: "grouped",
+  sidebarTableSearchEnabled: false,
   autoSelectActiveSidebarNode: false,
   openTabsRestoreMode: "all",
   disconnectTabHandlingMode: "close-tabs",
@@ -546,6 +564,9 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   queryExportKeysetOptimizationEnabled: true,
   updateDownloadSource: "official",
   toolbarItems: { ...DEFAULT_TOOLBAR_ITEMS },
+  objectBrowserShowCheckbox: false,
+  objectBrowserViewMode: "list",
+  sqlVariableSyntaxOverrides: {},
 };
 
 export const STORAGE_KEY = "dbx-editor-settings";
@@ -573,6 +594,9 @@ function normalizeDrawerWidth(value: unknown, min: number, fallback: number): nu
 
 function normalizeStructureEditorDensity(value: unknown): StructureEditorDensity {
   return STRUCTURE_EDITOR_DENSITIES.includes(value as StructureEditorDensity) ? (value as StructureEditorDensity) : DEFAULT_EDITOR_SETTINGS.structureEditorDensity;
+}
+function normalizeColumnWidthDensity(value: unknown): ColumnWidthDensity {
+  return COLUMN_WIDTH_DENSITIES.includes(value as ColumnWidthDensity) ? (value as ColumnWidthDensity) : DEFAULT_EDITOR_SETTINGS.columnWidthDensity;
 }
 
 function normalizeCellDetailPanelLayout(value: unknown): CellDetailPanelLayout {
@@ -658,7 +682,8 @@ function normalizeSqlSnippets(value: unknown, existing?: SqlSnippet[]): SqlSnipp
     }
     if (seenPrefixes.has(item.prefix)) continue;
     seenPrefixes.add(item.prefix);
-    valid.push({ id: item.id, label: item.label, prefix: item.prefix, body: item.body });
+    // Older settings do not have this field; only an explicit false disables a snippet.
+    valid.push({ id: item.id, label: item.label, prefix: item.prefix, body: item.body, enabled: item.enabled !== false });
   }
   if (valid.length === 0) return existing ?? DEFAULT_SQL_SNIPPETS;
   return valid;
@@ -675,6 +700,7 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
     dataCompare: items.dataCompare ?? defaults.dataCompare,
     checkUpdates: items.checkUpdates ?? defaults.checkUpdates,
     sqlLibrary: items.sqlLibrary ?? defaults.sqlLibrary,
+    sqlFileTree: items.sqlFileTree ?? defaults.sqlFileTree,
     history: items.history ?? defaults.history,
     ai: items.ai ?? defaults.ai,
     theme: items.theme ?? defaults.theme,
@@ -720,9 +746,12 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     activeCustomThemeId: settings.activeCustomThemeId ?? "default",
     executeMode: settings.executeMode ?? DEFAULT_EDITOR_SETTINGS.executeMode,
     showExecutionTargetPicker: settings.showExecutionTargetPicker ?? DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker,
+    showStatementRunButtons: typeof settings.showStatementRunButtons === "boolean" ? settings.showStatementRunButtons : DEFAULT_EDITOR_SETTINGS.showStatementRunButtons,
+    showCurrentStatementFrame: typeof settings.showCurrentStatementFrame === "boolean" ? settings.showCurrentStatementFrame : DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame,
     autoAliasTables: settings.autoAliasTables ?? DEFAULT_EDITOR_SETTINGS.autoAliasTables,
     wordWrap: settings.wordWrap ?? DEFAULT_EDITOR_SETTINGS.wordWrap,
     vimModeEnabled: typeof settings.vimModeEnabled === "boolean" ? settings.vimModeEnabled : DEFAULT_EDITOR_SETTINGS.vimModeEnabled,
+    autoCloseBrackets: typeof settings.autoCloseBrackets === "boolean" ? settings.autoCloseBrackets : DEFAULT_EDITOR_SETTINGS.autoCloseBrackets,
     sqlSemanticDiagnosticsMode,
     sqlSemanticDiagnosticsEnabled: sqlSemanticDiagnosticsEnabledForMode(sqlSemanticDiagnosticsMode),
     confirmDangerousSqlExecution: settings.confirmDangerousSqlExecution ?? DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution,
@@ -736,6 +765,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     showColumnCommentsInHeader: settings.showColumnCommentsInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader,
     showColumnTypesInHeader: settings.showColumnTypesInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader,
     compactColumnHeaderActions: settings.compactColumnHeaderActions ?? DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions,
+    columnWidthDensity: normalizeColumnWidthDensity(settings.columnWidthDensity),
     dataGridQuickEntry: settings.dataGridQuickEntry ?? DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry,
     dataGridRenderMode: normalizeDataGridRenderMode(settings.dataGridRenderMode),
     dataGridSearchMode: normalizeDataGridSearchMode(settings.dataGridSearchMode),
@@ -749,6 +779,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     sqlFormatter: normalizeSqlFormatterSettings(settings.sqlFormatter),
     sidebarActivation: settings.sidebarActivation === "single" || settings.sidebarActivation === "double" ? settings.sidebarActivation : DEFAULT_EDITOR_SETTINGS.sidebarActivation,
     sidebarObjectDisplay: settings.sidebarObjectDisplay === "simple" || settings.sidebarObjectDisplay === "grouped" ? settings.sidebarObjectDisplay : DEFAULT_EDITOR_SETTINGS.sidebarObjectDisplay,
+    sidebarTableSearchEnabled: typeof settings.sidebarTableSearchEnabled === "boolean" ? settings.sidebarTableSearchEnabled : DEFAULT_EDITOR_SETTINGS.sidebarTableSearchEnabled,
     autoSelectActiveSidebarNode: settings.autoSelectActiveSidebarNode ?? DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode,
     openTabsRestoreMode: normalizeOpenTabsRestoreMode((settings as Partial<EditorSettings>).openTabsRestoreMode, (settings as Partial<EditorSettings> & { restoreOpenTabsOnLaunch?: boolean }).restoreOpenTabsOnLaunch),
     disconnectTabHandlingMode: normalizeDisconnectTabHandlingMode((settings as Partial<EditorSettings>).disconnectTabHandlingMode, (settings as Partial<EditorSettings> & { closeQueryTabsOnDisconnect?: boolean }).closeQueryTabsOnDisconnect),
@@ -767,6 +798,9 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     queryExportKeysetOptimizationEnabled: typeof settings.queryExportKeysetOptimizationEnabled === "boolean" ? settings.queryExportKeysetOptimizationEnabled : DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled,
     updateDownloadSource: normalizeUpdateDownloadSource(settings.updateDownloadSource),
     toolbarItems: normalizeToolbarItems(settings.toolbarItems),
+    objectBrowserShowCheckbox: typeof settings.objectBrowserShowCheckbox === "boolean" ? settings.objectBrowserShowCheckbox : DEFAULT_EDITOR_SETTINGS.objectBrowserShowCheckbox,
+    objectBrowserViewMode: settings.objectBrowserViewMode === "grid" ? "grid" : DEFAULT_EDITOR_SETTINGS.objectBrowserViewMode,
+    sqlVariableSyntaxOverrides: normalizeSqlVariableSyntaxOverrides(settings.sqlVariableSyntaxOverrides),
   };
 }
 
@@ -801,6 +835,7 @@ function saveEditorSettings(settings: EditorSettings) {
 }
 
 export const useSettingsStore = defineStore("settings", () => {
+  const settingsPageActive = ref(false);
   const aiConfig = ref<AiConfig>(normalizeAiConfig({ provider: "claude" }));
   const isAiConfigLoaded = ref(false);
   const aiProviderConfigs = ref<Partial<Record<AiProvider, AiConfig>>>({});
@@ -952,9 +987,12 @@ export const useSettingsStore = defineStore("settings", () => {
     }
     if (partial.executeMode !== undefined) editorSettings.value.executeMode = partial.executeMode;
     if (partial.showExecutionTargetPicker !== undefined) editorSettings.value.showExecutionTargetPicker = partial.showExecutionTargetPicker;
+    if (partial.showStatementRunButtons !== undefined) editorSettings.value.showStatementRunButtons = partial.showStatementRunButtons === true;
+    if (partial.showCurrentStatementFrame !== undefined) editorSettings.value.showCurrentStatementFrame = partial.showCurrentStatementFrame === true;
     if (partial.autoAliasTables !== undefined) editorSettings.value.autoAliasTables = partial.autoAliasTables;
     if (partial.wordWrap !== undefined) editorSettings.value.wordWrap = partial.wordWrap;
     if (partial.vimModeEnabled !== undefined) editorSettings.value.vimModeEnabled = partial.vimModeEnabled === true;
+    if (partial.autoCloseBrackets !== undefined) editorSettings.value.autoCloseBrackets = partial.autoCloseBrackets === true;
     if (partial.sqlSemanticDiagnosticsMode !== undefined || partial.sqlSemanticDiagnosticsEnabled !== undefined) {
       const nextMode = normalizeSqlSemanticDiagnosticsMode(partial.sqlSemanticDiagnosticsMode, partial.sqlSemanticDiagnosticsEnabled);
       editorSettings.value.sqlSemanticDiagnosticsMode = nextMode;
@@ -972,6 +1010,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.showColumnCommentsInHeader !== undefined) editorSettings.value.showColumnCommentsInHeader = partial.showColumnCommentsInHeader;
     if (partial.showColumnTypesInHeader !== undefined) editorSettings.value.showColumnTypesInHeader = partial.showColumnTypesInHeader;
     if (partial.compactColumnHeaderActions !== undefined) editorSettings.value.compactColumnHeaderActions = partial.compactColumnHeaderActions;
+    if (partial.columnWidthDensity !== undefined) editorSettings.value.columnWidthDensity = normalizeColumnWidthDensity(partial.columnWidthDensity);
     if (partial.dataGridQuickEntry !== undefined) editorSettings.value.dataGridQuickEntry = partial.dataGridQuickEntry;
     if (partial.dataGridRenderMode !== undefined) editorSettings.value.dataGridRenderMode = normalizeDataGridRenderMode(partial.dataGridRenderMode);
     if (partial.dataGridSearchMode !== undefined) editorSettings.value.dataGridSearchMode = normalizeDataGridSearchMode(partial.dataGridSearchMode);
@@ -985,6 +1024,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.sqlFormatter !== undefined) editorSettings.value.sqlFormatter = normalizeSqlFormatterSettings(partial.sqlFormatter);
     if (partial.sidebarActivation !== undefined) editorSettings.value.sidebarActivation = partial.sidebarActivation;
     if (partial.sidebarObjectDisplay !== undefined) editorSettings.value.sidebarObjectDisplay = partial.sidebarObjectDisplay;
+    if (partial.sidebarTableSearchEnabled !== undefined) editorSettings.value.sidebarTableSearchEnabled = partial.sidebarTableSearchEnabled;
     if (partial.autoSelectActiveSidebarNode !== undefined) editorSettings.value.autoSelectActiveSidebarNode = partial.autoSelectActiveSidebarNode;
     if (partial.openTabsRestoreMode !== undefined) editorSettings.value.openTabsRestoreMode = normalizeOpenTabsRestoreMode(partial.openTabsRestoreMode);
     if (partial.disconnectTabHandlingMode !== undefined) editorSettings.value.disconnectTabHandlingMode = normalizeDisconnectTabHandlingMode(partial.disconnectTabHandlingMode);
@@ -1003,6 +1043,9 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.queryExportKeysetOptimizationEnabled !== undefined) editorSettings.value.queryExportKeysetOptimizationEnabled = partial.queryExportKeysetOptimizationEnabled;
     if (partial.updateDownloadSource !== undefined) editorSettings.value.updateDownloadSource = normalizeUpdateDownloadSource(partial.updateDownloadSource);
     if (partial.toolbarItems !== undefined) editorSettings.value.toolbarItems = normalizeToolbarItems(partial.toolbarItems);
+    if (partial.objectBrowserShowCheckbox !== undefined) editorSettings.value.objectBrowserShowCheckbox = partial.objectBrowserShowCheckbox === true;
+    if (partial.objectBrowserViewMode !== undefined) editorSettings.value.objectBrowserViewMode = partial.objectBrowserViewMode === "grid" ? "grid" : "list";
+    if (partial.sqlVariableSyntaxOverrides !== undefined) editorSettings.value.sqlVariableSyntaxOverrides = normalizeSqlVariableSyntaxOverrides(partial.sqlVariableSyntaxOverrides);
     saveEditorSettings(editorSettings.value);
   }
 
@@ -1041,6 +1084,7 @@ export const useSettingsStore = defineStore("settings", () => {
   }
 
   return {
+    settingsPageActive,
     aiConfig,
     isAiConfigLoaded,
     aiProviderConfigs,

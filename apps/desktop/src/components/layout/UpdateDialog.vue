@@ -19,8 +19,9 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  "download-and-install": [];
+  "open-latest-release": [];
   "download-portable-zip": [];
+  "download-and-install": [];
   restart: [];
 }>();
 
@@ -76,8 +77,8 @@ watch(
       <DialogHeader>
         <DialogTitle>{{ updateInfo?.update_available ? t("updates.availableTitle") : t("updates.title") }}</DialogTitle>
       </DialogHeader>
-      <div class="min-w-0 space-y-3 text-sm">
-        <p v-if="updateInfo?.update_available" class="break-words">
+      <div class="space-y-3 text-sm">
+        <p v-if="updateInfo?.update_available">
           {{
             t("updates.availableMessage", {
               current: updateInfo.current_version,
@@ -85,7 +86,7 @@ watch(
             })
           }}
         </p>
-        <p v-else class="max-h-40 overflow-auto whitespace-pre-wrap break-words text-muted-foreground">
+        <p v-else class="text-muted-foreground">
           {{ updateCheckMessage || t("updates.upToDate", { version: updateInfo?.current_version || "" }) }}
         </p>
         <div
@@ -103,9 +104,10 @@ watch(
           {{ t("updates.portableManualUpdate") }}
         </p>
       </div>
-      <DialogFooter class="gap-2 sm:flex-wrap">
+      <DialogFooter>
         <Button v-if="!isDownloadingUpdate && !updateReady" variant="outline" @click="open = false">{{ t("dangerDialog.cancel") }}</Button>
         <template v-if="updateInfo?.update_available">
+          <Button variant="outline" @click="emit('open-latest-release')">{{ t("updates.openRelease") }}</Button>
           <template v-if="isDesktop && updateInfo.portable_mode">
             <Button v-if="isDownloadingUpdate" disabled>
               <Loader2 class="h-4 w-4 animate-spin" />
@@ -113,11 +115,8 @@ watch(
             </Button>
             <Button v-else @click="emit('download-portable-zip')">{{ t("updates.downloadPortableZip") }}</Button>
           </template>
-          <template v-else-if="canDownloadAndInstallUpdate(updateInfo, isDesktop)">
-            <div v-if="updateReady" class="flex flex-col items-end gap-1">
-              <Button @click="emit('restart')">{{ t("updates.restart") }}</Button>
-              <span class="text-xs text-muted-foreground">{{ t("updates.reopenHint") }}</span>
-            </div>
+          <template v-if="canDownloadAndInstallUpdate(updateInfo, isDesktop)">
+            <Button v-if="updateReady" @click="emit('restart')">{{ t("updates.restart") }}</Button>
             <Button v-else-if="isDownloadingUpdate" disabled>
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("updates.downloading", { progress: downloadProgress }) }}
@@ -125,6 +124,7 @@ watch(
             <Button v-else @click="emit('download-and-install')">{{ t("updates.downloadAndInstall") }}</Button>
           </template>
         </template>
+        <Button v-else-if="updateCheckMessage" @click="emit('open-latest-release')">{{ t("updates.openRelease") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

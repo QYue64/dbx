@@ -88,6 +88,8 @@ pub struct TableAdminSqlOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     pub table_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -249,6 +251,7 @@ pub fn supports_create_schema_target(database_type: Option<DatabaseType>) -> boo
                 | DatabaseType::Highgo
                 | DatabaseType::Vastbase
                 | DatabaseType::Yashandb
+                | DatabaseType::Dameng
                 | DatabaseType::Databricks
                 | DatabaseType::SapHana
                 | DatabaseType::Teradata
@@ -322,7 +325,29 @@ pub fn build_drop_table_sql(options: TableAdminSqlOptions) -> String {
     } else if matches!(options.database_type, Some(DatabaseType::InfluxDb)) {
         return format!("DROP MEASUREMENT {};", table);
     }
-    format!("DROP TABLE {table};")
+    // CASCADE is valid for PostgreSQL-family dialects; keep default RESTRICT behavior elsewhere.
+    let cascade = if options.cascade.unwrap_or(false) && supports_drop_table_cascade(options.database_type) {
+        " CASCADE"
+    } else {
+        ""
+    };
+    format!("DROP TABLE {table}{cascade};")
+}
+
+fn supports_drop_table_cascade(database_type: Option<DatabaseType>) -> bool {
+    matches!(
+        database_type,
+        Some(
+            DatabaseType::Postgres
+                | DatabaseType::Redshift
+                | DatabaseType::Gaussdb
+                | DatabaseType::Kwdb
+                | DatabaseType::Kingbase
+                | DatabaseType::Highgo
+                | DatabaseType::Vastbase
+                | DatabaseType::OpenGauss
+        )
+    )
 }
 
 pub fn build_drop_table_child_object_sql(options: DropTableChildObjectSqlOptions) -> Result<String, String> {
@@ -418,8 +443,29 @@ pub fn build_truncate_table_sql(options: TableAdminSqlOptions) -> String {
     } else if matches!(options.database_type, Some(DatabaseType::Sqlite | DatabaseType::DuckDb)) {
         format!("DELETE FROM {table};")
     } else {
-        format!("TRUNCATE TABLE {table};")
+        // TRUNCATE CASCADE is PostgreSQL-family syntax; other dialects keep their existing default.
+        let cascade = if options.cascade.unwrap_or(false) && supports_truncate_table_cascade(options.database_type) {
+            " CASCADE"
+        } else {
+            ""
+        };
+        format!("TRUNCATE TABLE {table}{cascade};")
     }
+}
+
+fn supports_truncate_table_cascade(database_type: Option<DatabaseType>) -> bool {
+    matches!(
+        database_type,
+        Some(
+            DatabaseType::Postgres
+                | DatabaseType::Gaussdb
+                | DatabaseType::Kwdb
+                | DatabaseType::Kingbase
+                | DatabaseType::Highgo
+                | DatabaseType::Vastbase
+                | DatabaseType::OpenGauss
+        )
+    )
 }
 
 pub fn build_drop_database_sql(options: DatabaseNameSqlOptions) -> String {
@@ -1018,15 +1064,53 @@ mod tests {
             database_type: Some(DatabaseType::Postgres),
             schema: Some("public".to_string()),
             table_name: "events".to_string(),
+            cascade: None,
         };
         assert_eq!(build_drop_table_sql(options.clone()), "DROP TABLE \"public\".\"events\";");
+        assert_eq!(
+            build_drop_table_sql(TableAdminSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                schema: Some("public".to_string()),
+                table_name: "events".to_string(),
+                cascade: Some(true),
+            }),
+            "DROP TABLE \"public\".\"events\" CASCADE;"
+        );
+        assert_eq!(
+            build_drop_table_sql(TableAdminSqlOptions {
+                database_type: Some(DatabaseType::Mysql),
+                schema: None,
+                table_name: "events".to_string(),
+                cascade: Some(true),
+            }),
+            "DROP TABLE `events`;"
+        );
         assert_eq!(build_empty_table_sql(options.clone()), "DELETE FROM \"public\".\"events\";");
-        assert_eq!(build_truncate_table_sql(options), "TRUNCATE TABLE \"public\".\"events\";");
+        assert_eq!(build_truncate_table_sql(options.clone()), "TRUNCATE TABLE \"public\".\"events\";");
+        assert_eq!(
+            build_truncate_table_sql(TableAdminSqlOptions {
+                database_type: Some(DatabaseType::Postgres),
+                schema: Some("public".to_string()),
+                table_name: "events".to_string(),
+                cascade: Some(true),
+            }),
+            "TRUNCATE TABLE \"public\".\"events\" CASCADE;"
+        );
+        assert_eq!(
+            build_truncate_table_sql(TableAdminSqlOptions {
+                database_type: Some(DatabaseType::Mysql),
+                schema: None,
+                table_name: "events".to_string(),
+                cascade: Some(true),
+            }),
+            "TRUNCATE TABLE `events`;"
+        );
         assert_eq!(
             build_empty_table_sql(TableAdminSqlOptions {
                 database_type: Some(DatabaseType::ClickHouse),
                 schema: None,
                 table_name: "PresetSubjectInfo".to_string(),
+                cascade: None,
             }),
             "ALTER TABLE `PresetSubjectInfo` DELETE WHERE 1 = 1;"
         );
@@ -1035,6 +1119,7 @@ mod tests {
                 database_type: Some(DatabaseType::ClickHouse),
                 schema: None,
                 table_name: "PresetSubjectInfo".to_string(),
+                cascade: None,
             }),
             "TRUNCATE TABLE `PresetSubjectInfo`;"
         );
@@ -1043,6 +1128,7 @@ mod tests {
                 database_type: Some(DatabaseType::Bigquery),
                 schema: None,
                 table_name: "events".to_string(),
+                cascade: None,
             }),
             "DELETE FROM `events` WHERE TRUE;"
         );
@@ -1051,6 +1137,7 @@ mod tests {
                 database_type: Some(DatabaseType::Cassandra),
                 schema: None,
                 table_name: "events".to_string(),
+                cascade: None,
             }),
             "TRUNCATE TABLE \"events\";"
         );
@@ -1059,6 +1146,7 @@ mod tests {
                 database_type: Some(DatabaseType::DuckDb),
                 schema: None,
                 table_name: "events".to_string(),
+                cascade: None,
             }),
             "DELETE FROM \"events\";"
         );
@@ -1067,6 +1155,7 @@ mod tests {
                 database_type: Some(DatabaseType::Iotdb),
                 schema: Some("root.test".to_string()),
                 table_name: "DCU_101".to_string(),
+                cascade: None,
             }),
             "DELETE TIMESERIES root.test.DCU_101.*;"
         );
@@ -1075,6 +1164,7 @@ mod tests {
                 database_type: Some(DatabaseType::Iotdb),
                 schema: Some("root.test".to_string()),
                 table_name: "root.test.DCU_101".to_string(),
+                cascade: None,
             }),
             "DELETE FROM root.test.DCU_101.*;"
         );
@@ -1083,6 +1173,7 @@ mod tests {
                 database_type: Some(DatabaseType::Iotdb),
                 schema: Some("root.test".to_string()),
                 table_name: "DCU_101".to_string(),
+                cascade: None,
             }),
             "DELETE FROM root.test.DCU_101.*;"
         );
@@ -1092,6 +1183,7 @@ mod tests {
                 database_type: Some(DatabaseType::Questdb),
                 schema: None,
                 table_name: "table_sample".to_string(),
+                cascade: None,
             }),
             "TRUNCATE TABLE `table_sample`;"
         );
@@ -1100,6 +1192,7 @@ mod tests {
                 database_type: Some(DatabaseType::Questdb),
                 schema: None,
                 table_name: "table_sample".to_string(),
+                cascade: None,
             }),
             "TRUNCATE TABLE `table_sample`;"
         );
@@ -1138,6 +1231,14 @@ mod tests {
             })
             .unwrap(),
             "CREATE SCHEMA [analytics];"
+        );
+        assert_eq!(
+            build_create_schema_sql(SchemaNameSqlOptions {
+                database_type: Some(DatabaseType::Dameng),
+                name: "analytics".to_string(),
+            })
+            .unwrap(),
+            "CREATE SCHEMA \"analytics\";"
         );
         assert_eq!(
             build_create_schema_sql(SchemaNameSqlOptions {

@@ -2,7 +2,7 @@
   <p style="font-size: 18px; white-space: nowrap;"><strong>20 MB 驾驭 60+ 种数据库。桌面端 & Docker 自托管，内置 AI 助手。</strong></p>
 
   <p>
-    <img src="https://dl.dbxio.com/assets/readme-hero-20260517.png" alt="DBX 截图" width="820" />
+    <img src="https://dl.dbxio.com/assets/readme-hero-20260707.png" alt="DBX 截图" width="820" />
   </p>
 
   <p>
@@ -46,7 +46,7 @@
     <img src="https://img.shields.io/badge/JDBC-4B5563?logoColor=white" />
     <img src="https://img.shields.io/badge/and%20more...-555555?logoColor=white" />
     <a href="https://atomgit.com/t8y2/dbx"><img src="https://atomgit.com/t8y2/dbx/star/badge.svg" alt="AtomGit Stars" /></a>
-    <a href="https://atomgit.com/t8y2/dbx"><img src="https://atomgit.com/t8y2/dbx/star/badge.svg" alt="AtomGit Stars" /></a>
+    <a href="https://cnb.cool/dbxio.com/dbx"><img src="https://img.shields.io/badge/CNB-dbx-F76945?logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAppJREFUOE9tk01rE1EUhs+5H5lJ0iQT3FRX2Yi4avoLkv4CWxBcNt11oZiuFKGmXQhFN6kuRESSgitXKf6A5g+I6cqFLiKCiptOkraZ5H4cuZOkH9oLw+UO8z7nvGfei3DFohoEQLAKCGWyGJCSbQZsD3ei7r+f45WATV6xmjdISyAlYLaDliveux+ti5ozwLAaFPhIlk6G6f18sxuO7l9bBiWbVoncDGCMWMl++PI/gJ7IohkmD0zkBxT5oRn5LTpN7ULqBByEtFywWvRyHz8Fx3dvN0UwuMPyR0uJFycddH7tKPHZRn7BjnwwkQcUud0HO/K7oOENcTYPRCEAFERmsCpyfZDZfpdnBosOUKGx13BC60QTIdjpmSzrEWDR+UagjsgMciLXAwfhc4MNpKfQtOPE6mVh0gEOaeTXtWXXEdADpJAR/GaZ/rrM9Us82wORPd5zHbRp7JVcyxR5PRP5LTPy6uo0HXIlG9awMgLuEUABkBYI7VLyxs+yyPW3+Nyg4zqoG+UV7TDRlMBbWA/D43u3qlbLGmgRWM2BjFxjQjWQGQBuu4bYYvrm14JMnQSXcjBcny9A5DXIiDJp9/8FWCXAAOaFUEfILTgIcttOvf+2NJnLdI0fBFUyskZKBGTEJEAmBuzr9LCSUDwGQAwwgMzu+m9/VWOAeZSsk+YP48C4li/sRok1nlBd5PogBjgxNw70PfHyqBADyEVXicasZXCVpxYiLfO+HxVZDHCVYwvu2ebPT7fOLNAm65AWLnEAzvsEcOi9/lPU1aACXDfOLdhD9kxNszGdweQGYstqXgItJwDFNxKvwrp57G8h0zVwldHuA0IFt8El83yIs2FSDcpgxDJpUUTwK7gTduN3AK5iG7ehc/E2/gUPD3q3eY4awwAAAABJRU5ErkJggg==" alt="CNB" /></a>
   </p>
 	  <p>
     <a href="README.md">English</a> | 简体中文
@@ -159,6 +159,23 @@ npx @dbx-app/mcp-server
 
 Windows 便携版需要在 MCP 配置中设置 `DBX_DATA_DIR`，指向 `DBX.exe` 同级的 `data` 目录（即包含 `dbx.db` 的文件夹）。
 
+如果连接的是 DBX Web 或 Docker 部署，请让 MCP Server 指向 Web 后端 API。如果 Web 登录页需要密码，`DBX_WEB_PASSWORD` 填写同一个 Web 登录密码：
+
+```json
+{
+  "mcpServers": {
+    "dbx": {
+      "command": "npx",
+      "args": ["-y", "@dbx-app/mcp-server"],
+      "env": {
+        "DBX_WEB_URL": "http://localhost:4224",
+        "DBX_WEB_PASSWORD": "你的 Web 登录密码"
+      }
+    }
+  }
+}
+```
+
 支持 Claude Code、Cursor、Windsurf 等 MCP 兼容的 AI 助手。可列出连接、浏览表、执行 SQL，还能直接在 DBX 界面中打开表。
 
 DBX 也提供独立 CLI 包，适合终端、脚本和 Codex 工作流：
@@ -198,18 +215,29 @@ winget install t8y2.dbx
 
 ## 自托管 (Docker)
 
-DBX 提供 Web 版本，可通过 Docker 部署。
+DBX 提供 Web 版本，可通过 Docker 部署。示例使用 `latest` 标签以拉取当前发布版本。
 
 ```bash
-docker run -d --name dbx -p 4224:4224 -v dbx-data:/app/data t8y2/dbx
+docker run -d --pull=always --name dbx -p 4224:4224 -v dbx-data:/app/data t8y2/dbx:latest
 ```
 
-或使用 Docker Compose，示例文件位于 `deploy/docker-compose.yml`：
+这里使用跨平台的 `dbx-data` 命名卷。中国大陆用户可选用 CNB 镜像
+`docker.cnb.cool/dbxio.com/dbx:latest`，以获得更快的拉取速度。
+
+使用 Docker Compose 时，`deploy/docker-compose.yml` 保留为源码构建配置。
+如需部署已发布的镜像，请使用 `deploy/docker-compose.release.yml`：
+
+```bash
+docker compose -f deploy/docker-compose.release.yml up -d
+```
 
 ```yaml
 services:
   dbx:
-    image: t8y2/dbx
+    image: t8y2/dbx:latest
+    # 中国大陆用户可改用 CNB 镜像，以加快拉取速度：
+    # image: docker.cnb.cool/dbxio.com/dbx:latest
+    pull_policy: always
     ports:
       - "4224:4224"
     volumes:
@@ -322,6 +350,13 @@ make package
 | UI     | [shadcn-vue](https://www.shadcn-vue.com/) + Tailwind CSS                                                                                                                                                         |
 | 编辑器 | [CodeMirror 6](https://codemirror.net/)                                                                                                                                                                          |
 | 后端   | Rust + [sqlx](https://github.com/launchbadge/sqlx) / [tiberius](https://github.com/prisma/tiberius) / [redis-rs](https://github.com/redis-rs/redis-rs) / [mongodb](https://github.com/mongodb/mongo-rust-driver) |
+
+## 文档
+
+- [官方文档](https://dbxio.com/cn/docs/what-is-dbx) — 功能说明与使用教程
+- [贡献指南](CONTRIBUTING.zh-CN.md) — 如何认领 Issue 并提交 PR
+- [Web API 参考](docs/content/docs/web-api.cn.mdx) — Docker/Web 部署的 HTTP API
+- [示例代码](examples/) — CLI、MCP、Docker 与 API 示例
 
 ## 社区
 

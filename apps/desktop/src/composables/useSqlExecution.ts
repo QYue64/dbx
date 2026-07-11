@@ -1,19 +1,21 @@
-import { ref, type Ref, type ComputedRef } from "vue";
+import { ref, watch, type Ref, type ComputedRef } from "vue";
 import { useI18n } from "vue-i18n";
 import { useQueryStore } from "@/stores/queryStore";
 import { useHistoryStore } from "@/stores/historyStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
-import { isSingleDatabase } from "@/lib/database/databaseCapabilities";
+import { isSingleDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
 import { canExecuteWithoutSelectedDatabase } from "@/lib/connection/connectionLevelDatabaseBootstrap";
 import { classifySqlActivityKind } from "@/lib/history/historyActivityKind";
 import { sqlMetadataRefreshTarget } from "@/lib/sql/sqlMetadataRefresh";
 import { classifyRedisCommandSafety, firstRedisCommandToken } from "@/lib/redis/redisCommandSafety";
 import { isSqlExecutionSnapshot, resolveExecutableSql, type SqlExecutionOverride, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
-import { extractSqlParameters } from "@/lib/sql/sqlParameters";
+import { extractSqlParameterDescriptors, type SqlParameterDescriptor, type SqlParameterSyntax } from "@/lib/sql/sqlParameters";
+import { expandSqlVariables } from "@/lib/sql/sqlVariables";
+import { enabledSqlParameterSyntaxes, resolveSqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
 import { appendGovernanceAuditRecord, createQueryAuditRecord, evaluateSqlGovernance, findConnectionSharePolicy, readGovernancePolicy, type QueryAuditRecord, type WorkspacePrincipal } from "@/lib/workspaceGovernance";
-import type { ConnectionConfig, QueryTab } from "@/types/database";
+import type { ConnectionConfig, DatabaseType, QueryTab } from "@/types/database";
 
 const DANGER_RE = /^\s*(DROP|DELETE|TRUNCATE|ALTER|UPDATE|MERGE|REPLACE)\b/i;
 const LOCAL_PRINCIPAL_ID = "local-user";
@@ -62,13 +64,17 @@ export function useSqlExecution(deps: {
   const explainMode = ref<"explain" | "autotrace">("explain");
   const showSqlParameterDialog = ref(false);
   const sqlParameterSourceSql = ref("");
-  const sqlParameterNames = ref<string[]>([]);
+  const sqlParameterNames = ref<SqlParameterDescriptor[]>([]);
+  const sqlParameterDatabaseType = ref<DatabaseType | undefined>();
+  const sqlParameterEnabledSyntaxes = ref<SqlParameterSyntax[]>([]);
 
   async function resolvedExecutableSql(source?: SqlExecutionOverride): Promise<string> {
-    if (typeof source === "string") return source;
-    if (deps.resolveExecutableSql) return await deps.resolveExecutableSql(source);
-    if (isSqlExecutionSnapshot(source)) return resolveExecutableSql(source.fullSql, source.selectedSql, { cursorPos: source.cursorPos });
-    return deps.executableSql.value;
+    const atSetEnabled = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, deps.activeConnection.value?.db_type).atSet;
+    const expand = (sql: string) => (atSetEnabled ? expandSqlVariables(sql).sql : sql);
+    if (typeof source === "string") return expand(source);
+    if (deps.resolveExecutableSql) return expand(await deps.resolveExecutableSql(source));
+    if (isSqlExecutionSnapshot(source)) return expand(resolveExecutableSql(source.fullSql, source.selectedSql, { cursorPos: source.cursorPos }));
+    return expand(deps.executableSql.value);
   }
 
   async function tryExecute(sqlOverride?: SqlExecutionOverride) {
@@ -109,10 +115,15 @@ export function useSqlExecution(deps: {
   }
 
   function prepareSqlParameterDialog(sql: string): boolean {
-    const parameters = extractSqlParameters(sql);
+    const databaseType = deps.activeConnection.value?.db_type;
+    const toggles = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, databaseType);
+    const enabledSyntaxes = enabledSqlParameterSyntaxes(toggles);
+    const parameters = extractSqlParameterDescriptors(sql, { databaseType, enabledSyntaxes });
     if (!parameters.length) return false;
     sqlParameterSourceSql.value = sql;
     sqlParameterNames.value = parameters;
+    sqlParameterDatabaseType.value = databaseType;
+    sqlParameterEnabledSyntaxes.value = enabledSyntaxes;
     showSqlParameterDialog.value = true;
     return true;
   }
@@ -241,8 +252,18 @@ export function useSqlExecution(deps: {
     showSqlParameterDialog.value = false;
     sqlParameterSourceSql.value = "";
     sqlParameterNames.value = [];
+    sqlParameterDatabaseType.value = undefined;
+    sqlParameterEnabledSyntaxes.value = [];
     await continueExecute(sql);
   }
+
+  watch(showSqlParameterDialog, (open) => {
+    if (open) return;
+    sqlParameterSourceSql.value = "";
+    sqlParameterNames.value = [];
+    sqlParameterDatabaseType.value = undefined;
+    sqlParameterEnabledSyntaxes.value = [];
+  });
 
   return {
     dangerSql,
@@ -257,6 +278,8 @@ export function useSqlExecution(deps: {
     showSqlParameterDialog,
     sqlParameterSourceSql,
     sqlParameterNames,
+    sqlParameterDatabaseType,
+    sqlParameterEnabledSyntaxes,
     onSqlParametersConfirm,
     explainMode,
   };
@@ -269,7 +292,9 @@ function supportsSqlTemplateParameters(connection: ConnectionConfig | undefined)
 
 export function requiresDatabaseSelection(tab: QueryTab, connection: ConnectionConfig | undefined, sql = ""): boolean {
   if (tab.mode !== "query") return false;
-  if (!connection || tab.database) return false;
+  if (!connection) return false;
+  if (tab.database) return false;
+  if (tab.database === "" && usesTreeSchemaMode(connection.db_type)) return false;
   if (isSingleDatabase(connection.db_type)) return false;
   if (canExecuteWithoutSelectedDatabase(connection, sql)) return false;
   return !["elasticsearch", "qdrant", "milvus", "weaviate", "chromadb", "zookeeper"].includes(connection.db_type);

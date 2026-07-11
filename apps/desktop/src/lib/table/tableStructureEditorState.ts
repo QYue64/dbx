@@ -1,6 +1,10 @@
 import type { ColumnInfo, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo } from "@/types/database.ts";
 import type { ColumnExtra, EditableStructureColumn, EditableStructureForeignKey, EditableStructureIndex, EditableStructureTrigger } from "@/lib/table/tableStructureEditorSql.ts";
 
+export function hasExistingColumnTypeChange(columns: readonly EditableStructureColumn[]): boolean {
+  return columns.some((column) => !!column.original && !column.markedForDrop && column.dataType !== column.original.data_type);
+}
+
 export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
   mysql: [
     "tinyint",
@@ -296,6 +300,16 @@ export function getDataTypeOptions(dbType: DatabaseType | undefined): string[] {
   return DATA_TYPE_OPTIONS[key] ?? [];
 }
 
+export function isMysqlEnumDataType(dbType: DatabaseType | undefined, dataType: string): boolean {
+  return dbType === "mysql" && splitDataType(dataType).baseType.trim().toLowerCase() === "enum";
+}
+
+export function mysqlEnumDataType(values: readonly string[]): string {
+  // Match MySQL's canonical ENUM literal escaping, including values returned by SHOW CREATE TABLE.
+  const literals = values.map((value) => `'${value.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`);
+  return `enum(${literals.join(",")})`;
+}
+
 export interface ColumnEditorControls {
   length: boolean;
   nullable: boolean;
@@ -374,6 +388,18 @@ export const QUESTDB_TYPE_LENGTHS: Record<string, string> = {
   decimal: "10,2",
 };
 
+export const SQLSERVER_TYPE_LENGTHS: Record<string, string> = {
+  decimal: "10,0",
+  numeric: "10,0",
+  float: "53",
+  char: "1",
+  nchar: "1",
+  varchar: "255",
+  nvarchar: "255",
+  binary: "1",
+  varbinary: "255",
+};
+
 export const DEFAULT_TYPE_LENGTH_DISABLES: string[] = [];
 
 export const POSTGRES_TYPE_LENGTH_DISABLES: string[] = [
@@ -425,6 +451,8 @@ export const POSTGRES_TYPE_LENGTH_DISABLES: string[] = [
 
 export const ORACLE_LIKE_TYPE_LENGTH_DISABLES: string[] = ["binary_double", "binary_float", "bigint", "boolean", "bool", "byte", "date", "double", "double precision", "float", "integer", "int", "long", "long raw", "nclob", "real", "smallint", "text", "tinyint"];
 
+export const SQLSERVER_TYPE_LENGTH_DISABLES: string[] = ["bigint", "bit", "date", "datetime", "image", "int", "integer", "money", "ntext", "real", "smalldatetime", "smallint", "smallmoney", "sql_variant", "text", "timestamp", "tinyint", "uniqueidentifier", "xml"];
+
 export function parseExtraToColumnExtra(extra: string | null | undefined, databaseType?: DatabaseType): ColumnExtra {
   const result: ColumnExtra = {};
   if (!extra) return result;
@@ -451,6 +479,17 @@ export function parseExtraToColumnExtra(extra: string | null | undefined, databa
       }
     }
   } else if (databaseType === "sqlserver") {
+    if (lower.includes("identity")) {
+      result.autoIncrement = true;
+      const identityMatch = lower.match(/identity\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)/i);
+      if (identityMatch) {
+        result.identity = {
+          seed: Number(identityMatch[1]),
+          increment: Number(identityMatch[2]),
+        };
+      }
+    }
+  } else if (databaseType === "dameng") {
     if (lower.includes("identity")) {
       result.autoIncrement = true;
       const identityMatch = lower.match(/identity\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)/i);
@@ -592,16 +631,21 @@ function columnDefaultForEditor(column: ColumnInfo, databaseType?: DatabaseType)
 export function createColumnDrafts(columns: ColumnInfo[], databaseType?: DatabaseType): EditableStructureColumn[] {
   return columns.map((column, index) => {
     const defaultValue = columnDefaultForEditor(column, databaseType);
+    const enumValues = isMysqlEnumDataType(databaseType, column.data_type) ? [...(column.enum_values ?? [])] : undefined;
+    const dataType = enumValues?.length ? mysqlEnumDataType(enumValues) : column.data_type;
     return {
       id: `existing:${column.name}`,
       name: column.name,
-      dataType: column.data_type,
+      dataType,
+      enumValues,
       isNullable: column.is_nullable,
       defaultValue,
       comment: column.comment ?? "",
       isPrimaryKey: column.is_primary_key,
+      characterSet: column.character_set ?? "",
+      collation: column.collation ?? "",
       extra: parseExtraToColumnExtra(column.extra, databaseType),
-      original: { ...column, column_default: column.column_default === null ? null : defaultValue },
+      original: { ...column, data_type: dataType, column_default: column.column_default === null ? null : defaultValue },
       originalPosition: index,
       markedForDrop: false,
     };
@@ -658,12 +702,15 @@ export function rehydrateColumnDraftsFromMetadata(draftColumns: EditableStructur
     const metadataIndex = findColumnDraftByName(metadataDrafts, candidates, usedMetadataIndexes);
     if (metadataIndex === undefined) return column;
     usedMetadataIndexes.add(metadataIndex);
-    if (!needsHydration) return column;
-
     const metadataDraft = metadataDrafts[metadataIndex]!;
+    const shouldHydrateEnum = isMysqlEnumDataType(databaseType, column.dataType) && column.enumValues === undefined && metadataDraft.enumValues !== undefined;
+    if (!needsHydration && !shouldHydrateEnum) return column;
+
     return {
       ...column,
-      original: column.original ?? metadataDraft.original,
+      dataType: shouldHydrateEnum ? metadataDraft.dataType : column.dataType,
+      enumValues: column.enumValues ?? metadataDraft.enumValues,
+      original: shouldHydrateEnum ? metadataDraft.original : (column.original ?? metadataDraft.original),
       originalPosition: column.originalPosition ?? metadataDraft.originalPosition,
     };
   });
@@ -795,11 +842,33 @@ export function splitDataType(raw: string): { baseType: string; params: string }
   return { baseType, params };
 }
 
+/** MySQL character/text types that accept `CHARACTER SET` and `COLLATE`. */
+const MYSQL_CHARACTER_DATA_TYPES = new Set(["char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set"]);
+
+export function isMysqlCharacterDataType(dataType: string): boolean {
+  const { baseType } = splitDataType(dataType);
+  return MYSQL_CHARACTER_DATA_TYPES.has(baseType.trim().replace(/\s+/g, " ").toLowerCase());
+}
+
 export function isSqlServerIdentityCompatibleDataType(rawDataType: string): boolean {
   const { baseType, params } = splitDataType(rawDataType);
   const normalized = baseType.trim().replace(/\s+/g, " ").toLowerCase();
   if (["tinyint", "smallint", "int", "integer", "bigint"].includes(normalized)) return true;
   if (normalized !== "decimal" && normalized !== "numeric") return false;
+  const normalizedParams = params.replace(/\s+/g, "");
+  if (!normalizedParams) return true;
+  const parts = normalizedParams.split(",");
+  if (parts.length === 1) return /^\d+$/.test(parts[0] ?? "");
+  if (parts.length !== 2) return false;
+  const [precision, scale] = parts;
+  return /^\d+$/.test(precision ?? "") && scale === "0";
+}
+
+export function isDamengIdentityCompatibleDataType(rawDataType: string): boolean {
+  const { baseType, params } = splitDataType(rawDataType);
+  const normalized = baseType.trim().replace(/\s+/g, " ").toLowerCase();
+  if (["tinyint", "smallint", "int", "integer", "bigint"].includes(normalized)) return true;
+  if (!["number", "numeric", "decimal", "dec"].includes(normalized)) return false;
   const normalizedParams = params.replace(/\s+/g, "");
   if (!normalizedParams) return true;
   const parts = normalizedParams.split(",");
@@ -898,8 +967,12 @@ function isValidTemporalPrecision(dbType: DatabaseType | undefined, params: stri
 
 export function getDefaultLengthForType(_dbType: DatabaseType | undefined, baseType: string): string {
   const key = baseType.trim().toLowerCase();
-  if (_dbType === "questdb") {
+  if (_dbType === "sqlite" || _dbType === "rqlite" || _dbType === "turso") {
+    return "";
+  } else if (_dbType === "questdb") {
     return QUESTDB_TYPE_LENGTHS[key] ?? "";
+  } else if (_dbType === "sqlserver") {
+    return SQLSERVER_TYPE_LENGTHS[key] ?? "";
   } else {
     return DEFAULT_TYPE_LENGTHS[key] ?? "";
   }
@@ -916,6 +989,9 @@ export function isDataTypeLengthDisabled(_dbType: DatabaseType | undefined, base
   } else if (isOracleLikeStructureType(_dbType)) {
     // Dameng/Oracle integer aliases have fixed precision; MySQL-style display widths generate invalid DDL.
     return ORACLE_LIKE_TYPE_LENGTH_DISABLES.includes(key);
+  } else if (_dbType === "sqlserver") {
+    // SQL Server exact integer and legacy LOB types do not accept MySQL-style display widths.
+    return SQLSERVER_TYPE_LENGTH_DISABLES.includes(key);
   } else if (isMysqlLikeStructureType(_dbType)) {
     return key === "enum" || key === "set";
   } else {

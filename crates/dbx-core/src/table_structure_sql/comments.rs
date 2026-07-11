@@ -2,6 +2,76 @@ use super::dialect::{capabilities_for, dialect_label, StructureDialect};
 use super::types::TableStructureSqlOptions;
 use super::util::{clean, qualified_table, quote_string};
 
+pub(super) fn build_table_charset_sql(options: &TableStructureSqlOptions, warnings: &mut Vec<String>) -> Vec<String> {
+    let capabilities = capabilities_for(options.database_type);
+    let dialect = capabilities.dialect;
+    let new_charset = clean(options.table_charset.as_deref().unwrap_or(""));
+    let original_charset = clean(options.original_table_charset.as_deref().unwrap_or(""));
+    let new_collation = clean(options.table_collation.as_deref().unwrap_or(""));
+    let original_collation = clean(options.original_table_collation.as_deref().unwrap_or(""));
+    if new_charset == original_charset && new_collation == original_collation {
+        return Vec::new();
+    }
+    if new_charset.is_empty() && new_collation.is_empty() {
+        return Vec::new();
+    }
+    if dialect != StructureDialect::Mysql {
+        warnings
+            .push(format!("Table charset/collation is not supported for {} from this editor.", dialect_label(dialect)));
+        return Vec::new();
+    }
+    let Some(charset) = clean_mysql_option_name(&new_charset) else {
+        warnings.push("Table character set contains unsupported characters.".to_string());
+        return Vec::new();
+    };
+    let collation = if new_collation.is_empty() {
+        None
+    } else {
+        match clean_mysql_option_name(&new_collation) {
+            Some(value) => Some(value),
+            None => {
+                warnings.push("Table collation contains unsupported characters.".to_string());
+                return Vec::new();
+            }
+        }
+    };
+    let table = qualified_table(dialect, options.schema.as_deref(), &options.table_name);
+    let collate_clause = collation.map(|value| format!(" COLLATE {value}")).unwrap_or_default();
+    vec![format!("ALTER TABLE {table} CONVERT TO CHARACTER SET {charset}{collate_clause};")]
+}
+
+pub(super) fn mysql_create_table_charset_clause(
+    options: &TableStructureSqlOptions,
+    warnings: &mut Vec<String>,
+) -> String {
+    let charset = clean(options.table_charset.as_deref().unwrap_or(""));
+    let collation = clean(options.table_collation.as_deref().unwrap_or(""));
+    if charset.is_empty() && collation.is_empty() {
+        return String::new();
+    }
+    let Some(charset) = clean_mysql_option_name(&charset) else {
+        warnings.push("Table character set contains unsupported characters.".to_string());
+        return String::new();
+    };
+    let mut clause = format!(" DEFAULT CHARACTER SET {charset}");
+    if !collation.is_empty() {
+        let Some(collation) = clean_mysql_option_name(&collation) else {
+            warnings.push("Table collation contains unsupported characters.".to_string());
+            return String::new();
+        };
+        clause.push_str(&format!(" COLLATE {collation}"));
+    }
+    clause
+}
+
+fn clean_mysql_option_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_').then(|| trimmed.to_string())
+}
+
 pub(super) fn build_table_comment_sql(options: &TableStructureSqlOptions, warnings: &mut Vec<String>) -> Vec<String> {
     let capabilities = capabilities_for(options.database_type);
     if !capabilities.comment {
@@ -19,7 +89,7 @@ pub(super) fn build_table_comment_sql(options: &TableStructureSqlOptions, warnin
         StructureDialect::Mysql => {
             vec![format!("ALTER TABLE {table} COMMENT = {quoted};")]
         }
-        StructureDialect::Postgres | StructureDialect::Oracle | StructureDialect::H2 => {
+        StructureDialect::Postgres | StructureDialect::Oracle | StructureDialect::Dameng | StructureDialect::H2 => {
             vec![format!("COMMENT ON TABLE {table} IS {quoted};")]
         }
         StructureDialect::ClickHouse => {

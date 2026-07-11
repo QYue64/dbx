@@ -40,6 +40,35 @@ describe("queryStore database open state", () => {
     expect(store.isDatabaseOpen("pg-1", "analytics")).toBe(false);
   });
 
+  it("keeps object browser viewport per tab and clears it on schema change", async () => {
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+
+    const tabId = store.openObjectBrowser("pg-1", "app", "public");
+    store.updateObjectBrowserViewport(tabId, { scrollTop: 340, viewMode: "list" });
+
+    const tab = store.tabs.find((item) => item.id === tabId);
+    expect(tab?.objectBrowser?.viewport).toEqual({ scrollTop: 340, viewMode: "list" });
+
+    store.updateSchema(tabId, "archive");
+
+    expect(tab?.objectBrowser?.schema).toBe("archive");
+    expect(tab?.objectBrowser?.viewport).toBeUndefined();
+  });
+
+  it("keeps external catalog object browsers isolated", async () => {
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+
+    const icebergTabId = store.openObjectBrowser("doris-1", "default", undefined, "iceberg_catalog");
+    const hiveTabId = store.openObjectBrowser("doris-1", "default", undefined, "hive_catalog");
+
+    expect(hiveTabId).not.toBe(icebergTabId);
+    expect(store.tabs.find((tab) => tab.id === icebergTabId)?.objectBrowser?.catalog).toBe("iceberg_catalog");
+    expect(store.tabs.find((tab) => tab.id === hiveTabId)?.objectBrowser?.catalog).toBe("hive_catalog");
+    expect(store.openObjectBrowser("doris-1", "default", undefined, "iceberg_catalog")).toBe(icebergTabId);
+  });
+
   it("closes data and structure tabs for a dropped table object", async () => {
     const { useQueryStore } = await import("@/stores/queryStore");
     const store = useQueryStore();
@@ -156,6 +185,7 @@ describe("queryStore database open state", () => {
     vi.unstubAllGlobals();
     const storage = installLocalStorage();
     storage.set("dbx-editor-settings", JSON.stringify({ openTabsRestoreMode: "none" }));
+    storage.set("dbx-app-state:open_tabs", JSON.stringify({ tabs: JSON.parse(persistedTabs), activeTabId: "tab-1" }));
     storage.set(OPEN_TABS_STORAGE_KEY, persistedTabs);
     storage.set(ACTIVE_TAB_STORAGE_KEY, "tab-1");
     setActivePinia(createPinia());
@@ -170,6 +200,7 @@ describe("queryStore database open state", () => {
     expect(store.activeTabId).toBeNull();
     expect(storage.get(OPEN_TABS_STORAGE_KEY)).toBeUndefined();
     expect(storage.get(ACTIVE_TAB_STORAGE_KEY)).toBeUndefined();
+    expect(JSON.parse(storage.get("dbx-app-state:open_tabs") ?? "{}")).toEqual({ tabs: [], activeTabId: null });
   });
 
   it("restores only pinned tabs when launch restore mode is pinned", async () => {

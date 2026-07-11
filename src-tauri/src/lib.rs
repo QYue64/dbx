@@ -21,6 +21,8 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri::{Emitter, Manager};
+#[cfg(target_os = "macos")]
+use tauri_plugin_clipboard_manager::ClipboardExt;
 #[cfg(any(windows, target_os = "linux"))]
 use tauri_plugin_deep_link::DeepLinkExt;
 
@@ -28,6 +30,8 @@ const DESKTOP_TRAY_ID: &str = "main-tray";
 const APP_CLOSE_REQUESTED_EVENT: &str = "dbx-app-close-requested";
 #[cfg(target_os = "macos")]
 const APP_MENU_QUIT_ID: &str = "app-menu-quit";
+#[cfg(target_os = "macos")]
+const APP_MENU_COPY_SUPPORT_INFO_ID: &str = "app-menu-copy-support-info";
 
 pub struct CloseBehaviorState {
     confirmed_exit: AtomicBool,
@@ -48,7 +52,14 @@ impl CloseBehaviorState {
 }
 #[cfg(target_os = "macos")]
 const MACOS_TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-macos-template.png");
+#[cfg(target_os = "macos")]
+const ABOUT_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon.png");
+#[cfg(not(target_os = "macos"))]
 const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/icon-black.png");
+#[cfg(target_os = "macos")]
+const MACOS_DEFAULT_APP_ICON: &[u8] = include_bytes!("../icons/icon.icns");
+#[cfg(target_os = "macos")]
+const MACOS_DARK_APP_ICON: &[u8] = include_bytes!("../icons/icon-macos-dark.icns");
 
 pub(crate) fn apply_debug_log_level(debug_logging_enabled: bool) {
     log::set_max_level(if debug_logging_enabled { log::LevelFilter::Debug } else { log::LevelFilter::Off });
@@ -60,6 +71,11 @@ fn should_hide_window_on_close(target_os: &str) -> bool {
 
 fn should_setup_desktop_tray(target_os: &str, show_tray_icon: bool) -> bool {
     show_tray_icon && matches!(target_os, "macos" | "windows")
+}
+
+#[cfg(test)]
+fn uses_application_level_icon(target_os: &str) -> bool {
+    target_os == "macos"
 }
 
 fn should_show_main_window_after_setup() -> bool {
@@ -80,15 +96,16 @@ fn native_window_decorations_override(target_os: &str) -> Option<bool> {
 #[cfg(target_os = "macos")]
 fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
     let pkg_info = app_handle.package_info();
-    let config = app_handle.config();
     let app_name = pkg_info.name.clone();
     let about_metadata = AboutMetadata {
         name: Some(app_name.clone()),
         version: Some(pkg_info.version.to_string()),
-        copyright: config.bundle.copyright.clone(),
-        authors: config.bundle.publisher.clone().map(|p| vec![p]),
+        copyright: Some(commands::support_info::format_support_info_for_native_about()),
+        icon: Some(ABOUT_APP_ICON),
         ..Default::default()
     };
+    let copy_support_info_item =
+        MenuItem::with_id(app_handle, APP_MENU_COPY_SUPPORT_INFO_ID, "Copy Support Info", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app_handle, APP_MENU_QUIT_ID, format!("Quit {app_name}"), true, Some("Cmd+Q"))?;
 
     Menu::with_items(
@@ -100,6 +117,7 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
                 true,
                 &[
                     &PredefinedMenuItem::about(app_handle, None, Some(about_metadata))?,
+                    &copy_support_info_item,
                     &PredefinedMenuItem::separator(app_handle)?,
                     &PredefinedMenuItem::services(app_handle, None)?,
                     &PredefinedMenuItem::separator(app_handle)?,
@@ -142,15 +160,27 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_webkit_rendering_workarounds() -> &'static [(&'static str, &'static str)] {
-    &[
-        // WebKitGTK's DMABUF renderer can produce a blank AppImage window or
-        // Wayland protocol errors on Fedora/Wayland/NVIDIA systems.
-        ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
-        // Tauri's Linux graphics guidance recommends this for Wayland explicit
-        // sync issues that can prevent WebKitGTK from creating a usable surface.
-        ("__NV_DISABLE_EXPLICIT_SYNC", "1"),
-    ]
+fn linux_has_nvidia_gpu() -> bool {
+    // Detect the proprietary NVIDIA driver by checking for its kernel device
+    // node / proc entry. This is more reliable than parsing lspci output and
+    // has no external deps. Nouveau (open-source) does not create these nodes
+    // and falls through to the Mesa / DMABuf path, which is the desired behavior.
+    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/proc/driver/nvidia/version").exists()
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_webkit_rendering_workarounds(has_nvidia: bool) -> &'static [(&'static str, &'static str)] {
+    if has_nvidia {
+        // NVIDIA + Wayland: the DMABuf renderer triggers blank-window / Wayland
+        // protocol errors (EGL_EXT_image_dma_buf_import mismatch). Disable it
+        // and suppress explicit-sync to avoid a compositor crash.
+        &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1"), ("__NV_DISABLE_EXPLICIT_SYNC", "1")]
+    } else {
+        // AMD / Intel / other Mesa drivers support DMABuf natively.
+        // Keeping DMABUF enabled lets WebKitGTK use GPU compositing, which
+        // dramatically reduces CPU usage and eliminates UI lag on Wayland.
+        &[]
+    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -211,7 +241,8 @@ fn linux_appimage_system_gtk_immodules_cache(
 
 #[cfg(target_os = "linux")]
 fn apply_linux_webkit_rendering_workarounds() {
-    for (key, value) in linux_webkit_rendering_workarounds() {
+    let has_nvidia = linux_has_nvidia_gpu();
+    for (key, value) in linux_webkit_rendering_workarounds(has_nvidia) {
         if std::env::var_os(key).is_none() {
             std::env::set_var(key, value);
         }
@@ -363,7 +394,37 @@ fn setup_desktop_tray<R: tauri::Runtime, M: Manager<R>>(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn apply_macos_app_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconTheme) -> tauri::Result<()> {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let icon_bytes = match icon_theme {
+        DesktopIconTheme::Default => MACOS_DEFAULT_APP_ICON,
+        DesktopIconTheme::Black => MACOS_DARK_APP_ICON,
+    };
+    app.run_on_main_thread(move || {
+        // macOS has no per-window icon. Update NSApplication so the Dock and
+        // app switcher reflect the selected theme immediately.
+        let marker = unsafe { MainThreadMarker::new_unchecked() };
+        let application = NSApplication::sharedApplication(marker);
+        let data = NSData::with_bytes(icon_bytes);
+        if let Some(icon) = NSImage::initWithData(NSImage::alloc(), &data) {
+            unsafe { application.setApplicationIconImage(Some(&icon)) };
+        } else {
+            log::warn!("Failed to decode the selected macOS application icon");
+        }
+    })
+}
+
 fn apply_desktop_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconTheme) -> tauri::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return apply_macos_app_icon_theme(app, icon_theme);
+    }
+
+    #[cfg(not(target_os = "macos"))]
     if let Some(window) = app.get_webview_window("main") {
         match icon_theme {
             DesktopIconTheme::Default => {
@@ -374,6 +435,7 @@ fn apply_desktop_icon_theme(app: &tauri::AppHandle, icon_theme: DesktopIconTheme
             DesktopIconTheme::Black => window.set_icon(BLACK_APP_ICON)?,
         }
     }
+    #[cfg(not(target_os = "macos"))]
     Ok(())
 }
 
@@ -416,6 +478,7 @@ mod tests {
         linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
         linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
         should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
+        uses_application_level_icon,
     };
     use std::ffi::OsStr;
 
@@ -441,6 +504,37 @@ mod tests {
         assert!(!should_setup_desktop_tray("linux", true));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_tray_icon_remains_a_system_template() {
+        // Menu bar template images are intentionally independent from the app
+        // icon theme so macOS can recolor them for light and dark menu bars.
+        assert_eq!(super::MACOS_TRAY_ICON.width(), 36);
+        assert_eq!(super::MACOS_TRAY_ICON.height(), 36);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_icon_themes_use_packaged_dock_assets() {
+        use objc2::AllocAnyThread;
+        use objc2_app_kit::NSImage;
+        use objc2_foundation::NSData;
+
+        assert!(super::MACOS_DEFAULT_APP_ICON.starts_with(b"icns"));
+        assert!(super::MACOS_DARK_APP_ICON.starts_with(b"icns"));
+        for bytes in [super::MACOS_DEFAULT_APP_ICON, super::MACOS_DARK_APP_ICON] {
+            let data = NSData::with_bytes(bytes);
+            assert!(NSImage::initWithData(NSImage::alloc(), &data).is_some());
+        }
+    }
+
+    #[test]
+    fn macos_icon_theme_targets_the_application_instead_of_a_window() {
+        assert!(uses_application_level_icon("macos"));
+        assert!(!uses_application_level_icon("windows"));
+        assert!(!uses_application_level_icon("linux"));
+    }
+
     #[test]
     fn shows_main_window_after_regular_startup_setup() {
         assert!(should_show_main_window_after_setup());
@@ -464,10 +558,13 @@ mod tests {
 
     #[test]
     fn applies_linux_webkit_rendering_workarounds_before_webkit_starts() {
+        // NVIDIA: DMABuf must be disabled to avoid blank window / Wayland protocol errors.
         assert_eq!(
-            linux_webkit_rendering_workarounds(),
+            linux_webkit_rendering_workarounds(true),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1"), ("__NV_DISABLE_EXPLICIT_SYNC", "1")]
         );
+        // AMD / Intel / Mesa: DMABuf is supported — no workarounds needed.
+        assert_eq!(linux_webkit_rendering_workarounds(false), &[]);
     }
 
     #[test]
@@ -610,6 +707,10 @@ pub fn run() {
     let builder = builder.menu(build_app_menu).on_menu_event(|app, event| {
         if event.id() == APP_MENU_QUIT_ID {
             request_app_close(app, "quit");
+        } else if event.id() == APP_MENU_COPY_SUPPORT_INFO_ID {
+            if let Err(err) = app.clipboard().write_text(commands::support_info::format_support_info_for_clipboard()) {
+                log::warn!("Failed to copy support info from app menu: {err}");
+            }
         }
     });
 
@@ -640,7 +741,21 @@ pub fn run() {
                 s
             });
             let desktop_settings = tauri::async_runtime::block_on(storage.load_desktop_settings()).unwrap_or_default();
-            app.handle().plugin(tauri_plugin_log::Builder::default().level(log::LevelFilter::Debug).build())?;
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                    .format(|out, message, record| {
+                        out.finish(format_args!(
+                            "[{}][{}][{}] {}",
+                            chrono::Local::now().format("%Y-%m-%d][%H:%M:%S%.3f"),
+                            record.level(),
+                            record.target(),
+                            message
+                        ));
+                    })
+                    .level(log::LevelFilter::Debug)
+                    .build(),
+            )?;
             apply_debug_log_level(desktop_settings.debug_logging_enabled);
             eprintln!("[STARTUP] storage ready in {:?}", t.elapsed());
 
@@ -744,6 +859,7 @@ pub fn run() {
             commands::app_settings::load_saved_sql_editor_positions,
             commands::app_settings::save_saved_sql_editor_positions,
             commands::app_settings::load_native_debug_logs,
+            commands::support_info::get_app_support_info,
             commands::cloud_sync::webdav_sync_test,
             commands::cloud_sync::webdav_password_status,
             commands::cloud_sync::save_webdav_saved_password,
@@ -753,6 +869,12 @@ pub fn run() {
             commands::cloud_sync::forget_webdav_sync_secrets_passphrase,
             commands::cloud_sync::webdav_sync_upload,
             commands::cloud_sync::webdav_sync_download,
+            commands::cloud_sync::snippet_sync_test,
+            commands::cloud_sync::snippet_token_status,
+            commands::cloud_sync::save_snippet_saved_token,
+            commands::cloud_sync::forget_snippet_saved_token,
+            commands::cloud_sync::snippet_sync_upload,
+            commands::cloud_sync::snippet_sync_download,
             commands::connection::test_connection,
             commands::connection::connect_db,
             commands::connection::connection_final_proxy_port,
@@ -767,16 +889,20 @@ pub fn run() {
             commands::plugins::list_plugins,
             commands::plugins::list_jdbc_drivers,
             commands::plugins::list_jdbc_maven_bundles,
+            commands::plugins::list_jdbc_local_bundles,
             commands::plugins::import_jdbc_drivers,
             commands::plugins::install_jdbc_driver_from_maven,
             commands::plugins::install_prestosql_jdbc_driver,
             commands::plugins::delete_jdbc_driver,
             commands::plugins::delete_jdbc_maven_bundle,
+            commands::plugins::delete_jdbc_local_bundle,
             commands::plugins::jdbc_plugin_status,
             commands::plugins::install_jdbc_plugin,
             commands::plugins::install_jdbc_plugin_local,
             commands::plugins::uninstall_jdbc_plugin,
             commands::schema::list_databases,
+            commands::schema::list_doris_catalogs,
+            commands::schema::list_doris_catalog_databases,
             commands::schema::list_sqlserver_linked_servers,
             commands::schema::list_sqlserver_linked_server_catalogs,
             commands::schema::list_sqlserver_linked_server_schemas,
@@ -854,6 +980,8 @@ pub fn run() {
             commands::query::build_routine_rename_object_source_statements,
             commands::query::build_view_ddl_sql,
             commands::query::build_table_structure_change_sql,
+            commands::query::preview_sqlite_table_structure_change,
+            commands::query::apply_sqlite_table_structure_change,
             commands::query::build_create_table_sql,
             commands::query::build_single_column_alter_sql,
             commands::query::analyze_editable_query_editability,
@@ -879,6 +1007,7 @@ pub fn run() {
             commands::external_sql::pending_open_sql_files,
             commands::external_sql::read_external_sql_file,
             commands::external_sql::write_external_sql_file,
+            commands::list_sql_files::list_sql_files_in_folder,
             commands::external_db::pending_open_db_files,
             commands::keychain::read_keychain_password,
             commands::keychain::read_keychain_passwords,
@@ -1075,6 +1204,7 @@ pub fn run() {
             commands::update::get_system_proxy_url,
             commands::update::download_and_install_update,
             commands::transfer::start_transfer,
+            commands::transfer::preview_transfer_ownership,
             commands::transfer::cancel_transfer,
             commands::database_export::export_database_sql,
             commands::database_export::cancel_database_export,
@@ -1090,7 +1220,9 @@ pub fn run() {
             commands::text_export::export_query_result_markdown,
             commands::agents::list_installed_agents,
             commands::agents::list_installed_agents_local,
+            commands::agents::is_agent_installed,
             commands::agents::get_driver_store_usage,
+            commands::agents::clear_driver_download_cache,
             commands::agents::get_driver_runtime_summary,
             commands::agents::stop_driver_runtime,
             commands::agents::restart_driver_runtime,

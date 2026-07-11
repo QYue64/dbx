@@ -44,6 +44,7 @@ export type DatabaseType =
   | "trino"
   | "prestosql"
   | "hive"
+  | "spark"
   | "db2"
   | "informix"
   | "neo4j"
@@ -68,6 +69,7 @@ export interface SqlSnippet {
   label: string;
   prefix: string;
   body: string;
+  enabled?: boolean;
 }
 
 export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column";
@@ -116,6 +118,7 @@ export interface ConnectionConfig {
   driver_profile?: string;
   driver_label?: string;
   url_params?: string;
+  agent_java_options?: string[];
   host: string;
   port: number;
   username: string;
@@ -269,6 +272,21 @@ export interface JdbcMavenBundleInfo {
   artifacts: JdbcMavenArtifactInfo[];
 }
 
+export interface JdbcLocalArtifactInfo {
+  file_name: string;
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+export interface JdbcLocalBundleInfo {
+  id: string;
+  name: string;
+  installed_at: string;
+  path: string;
+  artifacts: JdbcLocalArtifactInfo[];
+}
+
 export interface JdbcPluginStatus {
   installed: boolean;
   version?: string | null;
@@ -294,6 +312,14 @@ export interface LinkedServerInfo {
   product?: string | null;
   provider?: string | null;
   data_source?: string | null;
+}
+
+/** A catalog exposed by a multi-catalog engine (Doris / StarRocks). */
+export interface CatalogInfo {
+  name: string;
+  catalog_type: string;
+  is_current: boolean;
+  comment?: string | null;
 }
 
 export interface TableInfo {
@@ -332,6 +358,7 @@ export interface ObjectSource {
   object_type: ObjectSourceKind;
   schema?: string | null;
   source: string;
+  editable?: boolean;
 }
 
 export interface ColumnInfo {
@@ -345,6 +372,9 @@ export interface ColumnInfo {
   numeric_precision?: number | null;
   numeric_scale?: number | null;
   character_maximum_length?: number | null;
+  enum_values?: string[] | null;
+  character_set?: string | null;
+  collation?: string | null;
 }
 
 export interface IndexInfo {
@@ -415,6 +445,8 @@ export interface OwnerInfo {
 
 export interface QueryResult {
   columns: string[];
+  /** Internal row identifiers appended to editable query results. */
+  hidden_column_indexes?: number[];
   /**
    * Database type name for each column, parallel to `columns`. Optional and may
    * be shorter/empty when a driver cannot supply types (schemaless stores,
@@ -427,6 +459,11 @@ export interface QueryResult {
    */
   column_sortables?: boolean[];
   rows: (string | number | boolean | null)[][];
+  /**
+   * Original MongoDB documents, kept in lockstep with `rows` for document
+   * preview. This is populated only for MongoDB document query results.
+   */
+  mongo_documents?: unknown[];
   affected_rows: number;
   execution_time_ms: number;
   truncated?: boolean;
@@ -452,6 +489,7 @@ export interface QueryResultRun {
   resultSortDirection?: "asc" | "desc";
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
+  resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   orderByInput?: string;
   resultPageSql?: string;
   resultPageLimit?: number;
@@ -508,6 +546,7 @@ export type TreeNodeType =
   | "connection"
   | "connection-group"
   | "database"
+  | "doris-catalog"
   | "linked-server-root"
   | "linked-server"
   | "linked-server-catalog"
@@ -537,6 +576,7 @@ export type TreeNodeType =
   | "extension"
   | "object-browser"
   | "user-admin"
+  | "dameng-job-admin"
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
@@ -556,6 +596,7 @@ export type TreeNodeType =
   | "mongo-buckets"
   | "mongo-bucket"
   | "mongo-collection"
+  | "vector-database"
   | "vector-collection"
   | "elasticsearch-index";
 
@@ -582,6 +623,8 @@ export interface TreeNode {
   pinned?: boolean;
   connectionId?: string;
   database?: string;
+  catalog?: string;
+  catalogType?: string;
   linkedServer?: string;
   linkedCatalog?: string;
   linkedSchema?: string;
@@ -612,16 +655,38 @@ export interface TreeNode {
 
 export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
 
+export interface TableStructureEditorTarget {
+  kind: "column" | "index";
+  name: string;
+}
+
 export interface TableStructureEditorDraft {
   activeTab: TableInfoTab;
   newTableName: string;
   tableComment: string;
   originalTableComment: string;
+  tableCharset?: string;
+  originalTableCharset?: string;
+  tableCollation?: string;
+  originalTableCollation?: string;
   columns: import("@/lib/table/tableStructureEditorSql").EditableStructureColumn[];
   indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
   foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
   triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
+  scrollPositions?: Partial<Record<TableInfoTab, TableStructureEditorViewport>>;
   initialized: boolean;
+}
+
+export interface TableStructureEditorViewport {
+  scrollTop: number;
+  scrollLeft: number;
+}
+
+export type ObjectBrowserViewMode = "list" | "grid";
+
+export interface ObjectBrowserViewport {
+  scrollTop: number;
+  viewMode: ObjectBrowserViewMode;
 }
 
 export interface QueryTab {
@@ -643,6 +708,7 @@ export interface QueryTab {
   resultSortDirection?: "asc" | "desc";
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
+  resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   orderByInput?: string;
   resultPageSql?: string;
   resultPageLimit?: number;
@@ -662,8 +728,12 @@ export interface QueryTab {
   activeResultRunId?: string;
   resultAutoSave?: boolean;
   explainPlan?: import("@/lib/diagram/explainPlan").ParsedExplainPlan;
+  /** MySQL's regular EXPLAIN result, kept alongside its JSON visual plan. */
+  explainTableResult?: QueryResult;
   explainError?: string;
+  explainTableError?: string;
   explainSql?: string;
+  explainTableSql?: string;
   lastExplainedSql?: string;
   isExecuting: boolean;
   isCancelling?: boolean;
@@ -679,7 +749,9 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users";
+  /** Per-run connection session for sequential MySQL explain formats. */
+  explainClientSessionId?: string;
+  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users" | "dameng-jobs";
   mqTenant?: string;
   mqInitialTab?: "topics";
   nacosNamespace?: string;
@@ -687,10 +759,13 @@ export interface QueryTab {
   structureTableName?: string;
   structureInitialTab?: TableInfoTab;
   structureInitialTabRequestId?: number;
+  structureInitialTarget?: TableStructureEditorTarget;
   structureDraft?: TableStructureEditorDraft;
   objectBrowser?: {
+    catalog?: string;
     schema?: string;
     objectType?: "tables";
+    viewport?: ObjectBrowserViewport;
   };
   objectSource?: {
     schema?: string;
@@ -701,21 +776,41 @@ export interface QueryTab {
     schema?: string;
     tableName: string;
     tableType?: string;
+    catalog?: string;
     columns: ColumnInfo[];
     primaryKeys: string[];
   };
   tableMetaUpdatedAt?: number;
   tableInfoTab?: TableInfoTab;
   queryAnalysis?: {
+    catalog?: string;
+    catalogQuoted?: boolean;
     schema?: string;
     schemaQuoted?: boolean;
     tableName: string;
     tableNameQuoted?: boolean;
     tableAlias?: string;
     selectStar: boolean;
+    editableSourceKey?: string;
+    multiSource?: boolean;
+    allowInsert?: boolean;
+    allowInsertDelete?: boolean;
+    sources?: {
+      key: string;
+      catalog?: string;
+      catalogQuoted?: boolean;
+      schema?: string;
+      schemaQuoted?: boolean;
+      tableName: string;
+      tableNameQuoted?: boolean;
+      alias?: string;
+    }[];
     columns: {
       sourceName?: string;
       sourceNameQuoted?: boolean;
+      sourceQualifier?: string;
+      sourceKey?: string;
+      star?: boolean;
       resultName: string;
       expression: string;
     }[];
@@ -774,6 +869,7 @@ export interface SavedSqlLibrary {
 
 export interface VectorCollectionMeta {
   dimension?: number;
+  collectionId?: string;
 }
 
 export interface CollectionInfo {

@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import { uuid } from "@/lib/common/utils";
 import { ref, computed, watch } from "vue";
-import type { ColumnInfo, CompletionAssistantCandidate, CompletionAssistantObjectKind, CompletionAssistantRequest, ConnectionConfig, ForeignKeyInfo, ObjectInfo, SchemaInfo, SidebarLayout, TableInfo, TreeNode } from "@/types/database";
+import type { ColumnInfo, CompletionAssistantCandidate, CompletionAssistantObjectKind, CompletionAssistantRequest, ConnectionConfig, CatalogInfo, ForeignKeyInfo, ObjectInfo, SchemaInfo, SidebarLayout, TableInfo, TreeNode, VectorCollectionMeta } from "@/types/database";
 import { applyPinnedTreeNodeState, updatePinnedTreeNodeInPlace } from "@/lib/app/pinnedItems";
 import {
   reconcileLayout,
@@ -23,20 +23,22 @@ import {
 import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionObject, SqlCompletionTable } from "@/lib/sql/sqlCompletion";
 import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
-import { isSchemaAware, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
+import { connectionIsDorisFamilyCatalogCapable, isInternalDorisCatalog, isSchemaAware, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, usesTreeSchemaMode } from "@/lib/database/databaseCapabilities";
 import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, sortSidebarNames, shouldIncludeDefaultDatabaseNode } from "@/lib/database/databaseTree";
+import { buildDatabaseTreeNodes, buildDuckDbConnectionTreeNodes, sortSidebarDatabases, sortSidebarNames, shouldIncludeDefaultDatabaseNode } from "@/lib/database/databaseTree";
 import { buildSqlServerDatabaseTreeNodes } from "@/lib/database/sqlServerTree";
 import { collapseExpandedTreeNodes } from "@/lib/sidebar/sidebarTreeCollapse";
 import { findDatabaseTreeNode } from "@/lib/sidebar/treeRefreshTarget";
 import { shouldMarkDisconnected } from "@/lib/connection/connectionHealth";
 import { connectionAttemptOriginalErrorMessage, connectionAttemptTimeoutMessage, connectionAttemptTimeoutMs } from "@/lib/connection/connectionAttemptTimeout";
+import { requiresSqlServerLegacyCompatibilityComponent, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
 import { connectionUsesVisibleSchemaFilter, filterDatabaseNamesForConnection, filterSchemaNamesForConnection, filterVisibleDatabaseNames, normalizeVisibleDatabaseSelection } from "@/lib/database/visibleDatabases";
 import {
   buildObjectGroupPlaceholderNodes,
   buildGroupedObjectTreeNodes,
   buildSimpleObjectTreeNodes,
   buildTableTreeNodes,
+  appendTableTreeLoadMoreNode,
   expandCachedObjectBrowserNodes,
   filterSimpleSidebarSupplementalObjects,
   mergeTableInfosIntoObjects,
@@ -45,6 +47,8 @@ import {
   objectTypesForGroupNode,
   sortDatabaseObjectsByName,
   tablePartitionGroups,
+  withoutTableTreeLoadMoreNodes,
+  type TableTreeLoadMoreParent,
   type DatabaseObjectTreeKind,
 } from "@/lib/table/tableTree";
 import { hasTreeNodeDatabaseContext, normalizeCataloglessDatabaseNodes, treeNodeSchemaCachePrefix } from "@/lib/sidebar/treeNodeContext";
@@ -61,6 +65,7 @@ import { kvRootNodeLabel } from "@/lib/kv/kvRootPresentation";
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT } from "@/lib/redis/redisKeyPattern";
 import { appendAgentDriverUpdateHint, hasAgentDriverUpdate, type AgentDriverInstallState } from "@/lib/connection/agentDriverInstallHint";
 import { appendConnectionErrorHints } from "@/lib/connection/connectionErrorHints";
+import { appendVisibleDatabaseSelection } from "@/lib/connection/connectionVisibleDatabases";
 import { createMetadataLoadTrace, logMetadataLoadTrace, MetadataLoadCoordinator, type MetadataLoadTraceLogger } from "@/lib/metadata/metadataLoadCoordinator";
 import type { MetadataScopeInput } from "@/lib/metadata/metadataLoadScope";
 import { MetadataResultCache, type MetadataCacheInvalidation } from "@/lib/metadata/metadataResultCache";
@@ -118,6 +123,14 @@ function sqlServerLinkedServerId(connectionId: string, server: string): string {
 
 function sqlServerLinkedCatalogId(connectionId: string, server: string, catalog: string): string {
   return `${sqlServerLinkedServerId(connectionId, server)}:${nodeIdPart(catalog)}`;
+}
+
+function dorisCatalogId(connectionId: string, catalog: string): string {
+  return `${connectionId}:doris-catalog:${nodeIdPart(catalog)}`;
+}
+
+function dorisCatalogDatabaseId(connectionId: string, catalog: string, database: string): string {
+  return `${dorisCatalogId(connectionId, catalog)}:${nodeIdPart(database)}`;
 }
 
 function sqlServerLinkedRuntimeDatabase(config?: ConnectionConfig): string {
@@ -251,7 +264,7 @@ export const useConnectionStore = defineStore("connection", () => {
     schema?: string;
     tableName?: string;
   } | null>(null);
-  const sqlFileSource = ref<{ connectionId: string; database: string } | null>(null);
+  const sqlFileSource = ref<{ connectionId: string; database: string; filePath?: string } | null>(null);
   const diagramSource = ref<{
     connectionId: string;
     database: string;
@@ -262,7 +275,7 @@ export const useConnectionStore = defineStore("connection", () => {
     connectionId: string;
     database: string;
     schema?: string;
-    tableName: string;
+    tableName?: string;
   } | null>(null);
   const tableDataGenerateSource = ref<{
     connectionId: string;
@@ -305,9 +318,12 @@ export const useConnectionStore = defineStore("connection", () => {
   };
   const connectInFlight = new Map<string, Promise<void>>();
   const disconnectInFlight = new Map<string, Promise<void>>();
+  const disconnectInFlightScoped = new Map<string, boolean>();
   const cancelDisconnectInFlight = new Map<string, Promise<void>>();
   const activeLocalConnectionAttempts = new Map<string, number>();
   const cancelledLocalConnectionAttempts = new Map<string, Set<number>>();
+  const successfulLocalConnectionAttempts = new Map<string, number>();
+  const connectionStateRevisions = new Map<string, number>();
   let nextLocalConnectionAttempt = 0;
   let beforeConnectHandler: BeforeConnectHandler | null = null;
   let initFromDiskPromise: Promise<void> | null = null;
@@ -379,11 +395,30 @@ export const useConnectionStore = defineStore("connection", () => {
 
   function beginLocalConnectionAttempt(connectionId: string): number {
     const attempt = ++nextLocalConnectionAttempt;
+    bumpConnectionStateRevision(connectionId);
     activeLocalConnectionAttempts.set(connectionId, attempt);
     connectingIds.value.add(connectionId);
     const node = findNode(treeNodes.value, connectionId);
     if (node) node.isLoading = true;
     return attempt;
+  }
+
+  function markSuccessfulLocalConnectionAttempt(connectionId: string, attempt: number) {
+    successfulLocalConnectionAttempts.set(connectionId, attempt);
+  }
+
+  function forgetSuccessfulLocalConnectionAttempt(connectionId: string) {
+    successfulLocalConnectionAttempts.delete(connectionId);
+  }
+
+  function bumpConnectionStateRevision(connectionId: string): number {
+    const revision = (connectionStateRevisions.get(connectionId) ?? 0) + 1;
+    connectionStateRevisions.set(connectionId, revision);
+    return revision;
+  }
+
+  function isCurrentConnectionStateRevision(connectionId: string, revision: number): boolean {
+    return connectionStateRevisions.get(connectionId) === revision;
   }
 
   function isCurrentLocalConnectionAttempt(connectionId: string, attempt: number): boolean {
@@ -421,41 +456,54 @@ export const useConnectionStore = defineStore("connection", () => {
     activeLocalConnectionAttempts.delete(connectionId);
     connectingIds.value.delete(connectionId);
     clearConnectionNodeLoading(connectionId);
+    clearConnectionRootMetadataLoad(connectionId);
     connectInFlight.delete(connectionId);
     return true;
   }
 
-  function getDisconnectInFlight(connectionId: string): Promise<void> | undefined {
-    return disconnectInFlight.get(connectionId);
+  function clearConnectionRootMetadataLoad(connectionId: string) {
+    metadataLoadCoordinator.clear({
+      kind: "connection-databases",
+      connectionId,
+      driverProfile: metadataDriverProfile(getConfig(connectionId)),
+    });
   }
 
-  async function waitForDisconnectInFlight(connectionId: string): Promise<void> {
-    const pending = getDisconnectInFlight(connectionId);
+  function getBlockingDisconnectInFlight(connectionId: string): Promise<void> | undefined {
+    return disconnectInFlightScoped.get(connectionId) ? undefined : disconnectInFlight.get(connectionId);
+  }
+
+  async function waitForBlockingDisconnectInFlight(connectionId: string): Promise<void> {
+    const pending = getBlockingDisconnectInFlight(connectionId);
     if (pending) await pending;
   }
 
-  function trackDisconnectRequest(connectionId: string, request: Promise<void>): Promise<void> {
-    const tracked = request
+  function trackDisconnectRequest(connectionId: string, request: Promise<void>, scoped: boolean): Promise<void> {
+    const bounded = withDisconnectRequestTimeout(connectionId, request);
+    const tracked = bounded
       .catch((error) => {
         console.warn("[DBX][connection:disconnect-error]", { connectionId, error });
       })
       .finally(() => {
         if (disconnectInFlight.get(connectionId) === tracked) {
           disconnectInFlight.delete(connectionId);
+          disconnectInFlightScoped.delete(connectionId);
         }
       });
     disconnectInFlight.set(connectionId, tracked);
-    return withDisconnectRequestTimeout(connectionId, request);
+    disconnectInFlightScoped.set(connectionId, scoped);
+    return bounded;
   }
 
   function startDisconnectRequest(connectionId: string): Promise<void> {
+    const clientAttempt = activeLocalConnectionAttempts.get(connectionId) ?? successfulLocalConnectionAttempts.get(connectionId);
     let request: Promise<void>;
     try {
-      request = api.disconnectDb(connectionId);
+      request = api.disconnectDb(connectionId, clientAttempt);
     } catch (error) {
       request = Promise.reject(error);
     }
-    return trackDisconnectRequest(connectionId, request);
+    return trackDisconnectRequest(connectionId, request, clientAttempt != null);
   }
 
   function cancelDisconnectKey(connectionId: string, attempt: number): string {
@@ -752,6 +800,7 @@ export const useConnectionStore = defineStore("connection", () => {
       trino: "Trino",
       prestosql: "PrestoSQL",
       hive: "Hive",
+      spark: "Apache Spark",
       db2: "DB2",
       informix: "Informix",
       neo4j: "Neo4j",
@@ -789,6 +838,7 @@ export const useConnectionStore = defineStore("connection", () => {
       driver_profile: profile,
       driver_label: config.driver_label || labelMap[profile] || config.db_type,
       url_params: config.url_params || "",
+      agent_java_options: Array.isArray(config.agent_java_options) ? config.agent_java_options : [],
       attached_databases: Array.isArray(config.attached_databases) ? config.attached_databases.filter((database) => database.name?.trim() && database.path?.trim()) : [],
       transport_layers: Array.isArray(config.transport_layers) ? config.transport_layers : [],
       connect_timeout_secs: config.connect_timeout_secs || 10,
@@ -840,7 +890,7 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   function isConnectionUtilityNode(node: TreeNode): boolean {
-    return node.type === "user-admin";
+    return node.type === "user-admin" || node.type === "dameng-job-admin";
   }
 
   function connectionMetadataChildren(children: TreeNode[] | undefined): TreeNode[] {
@@ -901,10 +951,25 @@ export const useConnectionStore = defineStore("connection", () => {
     };
   }
 
+  function buildDamengJobAdminNode(connectionId: string, existingConnectionNode?: TreeNode): TreeNode | undefined {
+    const config = getConfig(connectionId);
+    if (effectiveDatabaseTypeForConnection(config) !== "dameng") return undefined;
+    const existing = existingConnectionNode?.children?.find((child) => child.type === "dameng-job-admin");
+    return {
+      id: `${connectionId}:__dameng_jobs`,
+      label: "tree.damengJobAdmin",
+      type: "dameng-job-admin",
+      connectionId,
+      database: "",
+      isExpanded: existing?.isExpanded ?? false,
+    };
+  }
+
   function withConnectionUtilityNodes(connectionId: string, children: TreeNode[], existingConnectionNode?: TreeNode): TreeNode[] {
     const nonUtilityChildren = connectionMetadataChildren(children);
     const userAdminNode = buildUserAdminNode(connectionId, existingConnectionNode);
-    return [...nonUtilityChildren, userAdminNode].filter(Boolean) as TreeNode[];
+    const damengJobAdminNode = buildDamengJobAdminNode(connectionId, existingConnectionNode);
+    return [...nonUtilityChildren, userAdminNode, damengJobAdminNode].filter(Boolean) as TreeNode[];
   }
 
   function withSavedSqlRoot(connectionId: string, children: TreeNode[], existingConnectionNode?: TreeNode): TreeNode[] {
@@ -1097,7 +1162,7 @@ export const useConnectionStore = defineStore("connection", () => {
     pageSize: number;
     searchFilter?: string;
     force?: boolean;
-  }): Promise<{ children: TreeNode[]; objectCount: number; hasMore: boolean; nextOffset: number }> {
+  }): Promise<{ children: TreeNode[]; objectCount: number; hasMore: boolean; nextOffset: number; loadMoreParent?: TableTreeLoadMoreParent }> {
     if (!options.node.connectionId || !options.node.database) {
       return { children: [], objectCount: 0, hasMore: false, nextOffset: options.offset };
     }
@@ -1124,18 +1189,70 @@ export const useConnectionStore = defineStore("connection", () => {
     const pageTables = hasMore ? tables.slice(0, options.pageSize) : tables;
     indexCompletionTables(options.node.connectionId, options.node.database, options.effectiveSchema, tableInfosToCompletionTables(pageTables, options.effectiveSchema));
     const objects = mergeTableInfosIntoObjects([], pageTables, options.effectiveSchema);
-    const visibleObjectCount = objects.filter((object) => options.objectTypes.includes(normalizedObjectTreeKind(object.object_type))).length;
+    const children = objectGroupChildrenFromObjects({
+      node: options.node,
+      parentNodeId: options.parentNodeId,
+      effectiveSchema: options.effectiveSchema,
+      objectTypes: options.objectTypes,
+      objects,
+    });
+    const lastTable = pageTables[pageTables.length - 1];
     return {
-      children: objectGroupChildrenFromObjects({
-        node: options.node,
-        parentNodeId: options.parentNodeId,
-        effectiveSchema: options.effectiveSchema,
-        objectTypes: options.objectTypes,
-        objects,
-      }),
-      objectCount: visibleObjectCount,
+      children,
+      objectCount: children.length,
       hasMore,
       nextOffset: options.offset + pageTables.length,
+      loadMoreParent: lastTable?.parent_name ? { schema: lastTable.parent_schema, name: lastTable.parent_name } : undefined,
+    };
+  }
+
+  async function loadPagedObjectGroupChildren(options: {
+    node: TreeNode;
+    parentNodeId: string;
+    querySchema: string;
+    effectiveSchema?: string;
+    objectTypes: DatabaseObjectTreeKind[];
+    offset: number;
+    pageSize: number;
+    searchFilter?: string;
+    force?: boolean;
+  }): Promise<{ children: TreeNode[]; objectCount: number; hasMore: boolean; nextOffset: number }> {
+    if (!options.node.connectionId || !options.node.database) {
+      return { children: [], objectCount: 0, hasMore: false, nextOffset: options.offset };
+    }
+    const searchFilter = options.searchFilter || undefined;
+    const fetchLimit = searchFilter ? undefined : options.pageSize + 1;
+    const fetchOffset = searchFilter ? undefined : options.offset;
+    const objects = await loadCachedMetadataListPage<ObjectInfo[]>(
+      metadataListCacheScope({
+        kind: "object-list-page",
+        connectionId: options.node.connectionId,
+        database: options.node.database,
+        schema: options.querySchema,
+        nodeKind: options.node.type,
+        objectTypes: options.objectTypes,
+        searchFilter,
+        limit: fetchLimit,
+        offset: fetchOffset,
+        sidebarDisplayMode: useSettingsStore().editorSettings.sidebarObjectDisplay,
+      }),
+      () => api.listObjects(options.node.connectionId!, options.node.database!, options.querySchema, options.objectTypes, searchFilter, fetchLimit, fetchOffset),
+      { force: options.force },
+    );
+    const hasMore = searchFilter ? false : objects.length > options.pageSize;
+    const pageObjects = hasMore ? objects.slice(0, options.pageSize) : objects;
+    const children = objectGroupChildrenFromObjects({
+      node: options.node,
+      parentNodeId: options.parentNodeId,
+      effectiveSchema: options.effectiveSchema,
+      objectTypes: options.objectTypes,
+      objects: pageObjects,
+    });
+    return {
+      children,
+      objectCount: children.length,
+      hasMore,
+      nextOffset: options.offset + pageObjects.length,
     };
   }
 
@@ -1150,7 +1267,7 @@ export const useConnectionStore = defineStore("connection", () => {
     pageSize: number;
     searchFilter?: string;
     force?: boolean;
-  }): Promise<{ children: TreeNode[]; objectCount: number; hasMore: boolean; nextOffset: number }> {
+  }): Promise<{ children: TreeNode[]; objectCount: number; hasMore: boolean; nextOffset: number; loadMoreParent?: TableTreeLoadMoreParent }> {
     const searchFilter = (options.searchFilter ?? sidebarSearchQuery.value) || undefined;
     const fetchLimit = searchFilter ? options.pageSize : options.pageSize + 1;
     const fetchOffset = searchFilter ? undefined : options.offset;
@@ -1180,11 +1297,13 @@ export const useConnectionStore = defineStore("connection", () => {
       schema: options.effectiveSchema,
       tables: pageTables,
     });
+    const lastTable = pageTables[pageTables.length - 1];
     return {
       children,
       objectCount: children.length,
       hasMore,
       nextOffset: options.offset + pageTables.length,
+      loadMoreParent: lastTable?.parent_name ? { schema: lastTable.parent_schema, name: lastTable.parent_name } : undefined,
     };
   }
 
@@ -1564,6 +1683,12 @@ export const useConnectionStore = defineStore("connection", () => {
     rebuildTreeNodes();
   }
 
+  async function ensureSqlServerLegacyCompatibilityComponentInstalled(config: ConnectionConfig) {
+    if (!requiresSqlServerLegacyCompatibilityComponent(config)) return;
+    if (await api.isAgentInstalled(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY)) return;
+    await api.installAgent(SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY);
+  }
+
   async function setDefaultDatabase(connectionId: string, database: string) {
     const config = getConfig(connectionId);
     if (!config || config.database === database) return;
@@ -1598,6 +1723,14 @@ export const useConnectionStore = defineStore("connection", () => {
     if (!config || !Array.isArray(config.visible_databases)) return;
     await updateVisibleDatabasesConfig(connectionId, undefined);
     await reloadConnectionDatabaseChildren(connectionId);
+  }
+
+  async function ensureVisibleDatabase(connectionId: string, databaseName: string) {
+    const config = getConfig(connectionId);
+    if (!config) return;
+    const visibleDatabases = appendVisibleDatabaseSelection(config.visible_databases, databaseName);
+    if (visibleDatabases === config.visible_databases) return;
+    await updateVisibleDatabasesConfig(connectionId, visibleDatabases);
   }
 
   async function updateVisibleDatabasesConfig(connectionId: string, visibleDatabases: string[] | undefined) {
@@ -1683,7 +1816,9 @@ export const useConnectionStore = defineStore("connection", () => {
       await loadMongoDatabases(connectionId);
     } else if (config.db_type === "elasticsearch") {
       await loadElasticsearchIndices(connectionId);
-    } else if (config.db_type === "qdrant" || config.db_type === "milvus" || config.db_type === "weaviate" || config.db_type === "chromadb") {
+    } else if (config.db_type === "milvus") {
+      await loadMilvusDatabases(connectionId);
+    } else if (config.db_type === "qdrant" || config.db_type === "weaviate" || config.db_type === "chromadb") {
       await loadVectorCollections(connectionId);
     } else if (config.db_type === "mq") {
       await loadMqTenants(connectionId, { force: true });
@@ -1696,10 +1831,11 @@ export const useConnectionStore = defineStore("connection", () => {
 
   async function connect(config: ConnectionConfig) {
     config = normalizeConnection(config);
-    if (getDisconnectInFlight(config.id)) await waitForDisconnectInFlight(config.id);
+    if (getBlockingDisconnectInFlight(config.id)) await waitForBlockingDisconnectInFlight(config.id);
     const localAttempt = beginLocalConnectionAttempt(config.id);
     try {
       await beforeConnectHandler?.(config);
+      await ensureSqlServerLegacyCompatibilityComponentInstalled(config);
       ensureLocalConnectionAttemptActive(config.id, localAttempt);
       const id = await withConnectionAttemptTimeout(api.connectDb(config, localAttempt), config);
       await ensureLocalConnectionAttemptActiveAfterConnectResult(config.id, localAttempt, id);
@@ -1707,6 +1843,8 @@ export const useConnectionStore = defineStore("connection", () => {
       await ensureLocalConnectionAttemptActiveAfterConnectResult(config.id, localAttempt, id);
       activeConnectionId.value = id;
       connectedIds.value.add(id);
+      if (id !== config.id) markSuccessfulLocalConnectionAttempt(config.id, localAttempt);
+      markSuccessfulLocalConnectionAttempt(id, localAttempt);
       markConnectionHealthChecked(id);
       clearConnectionError(config.id);
       if (id !== config.id) clearConnectionError(id);
@@ -1760,11 +1898,26 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   async function disconnect(connectionId: string) {
+    const stateRevision = bumpConnectionStateRevision(connectionId);
     const disconnectRequest = startDisconnectRequest(connectionId);
     cancelLocalConnectionAttempt(connectionId);
     const shouldRemoveOneTimeConnection = getConfig(connectionId)?.one_time === true;
-    await disconnectRequest;
-    clearConnectionError(connectionId);
+
+    connectedIds.value.delete(connectionId);
+    forgetSuccessfulLocalConnectionAttempt(connectionId);
+    clearConnectionHealthCheck(connectionId);
+    const node = findNode(treeNodes.value, connectionId);
+    if (node) {
+      node.isLoading = false;
+      node.isExpanded = false;
+      node.children = [];
+    }
+    clearConnectionRootMetadataLoad(connectionId);
+    clearLoadedChildrenCache(connectionId);
+    if (activeConnectionId.value === connectionId) {
+      activeConnectionId.value = null;
+    }
+    invalidateCompletionCache(connectionId);
     const { useQueryStore } = await import("@/stores/queryStore");
     const queryStore = useQueryStore();
     switch (settingsStore.editorSettings.disconnectTabHandlingMode) {
@@ -1778,20 +1931,11 @@ export const useConnectionStore = defineStore("connection", () => {
         queryStore.rollbackConnectionTransactions(connectionId);
         break;
     }
-    connectedIds.value.delete(connectionId);
-    clearConnectionHealthCheck(connectionId);
-    const node = findNode(treeNodes.value, connectionId);
-    if (node) {
-      node.isLoading = false;
-      node.isExpanded = false;
-      node.children = [];
+    await disconnectRequest;
+    if (isCurrentConnectionStateRevision(connectionId, stateRevision)) {
+      clearConnectionError(connectionId);
     }
-    clearLoadedChildrenCache(connectionId);
-    if (activeConnectionId.value === connectionId) {
-      activeConnectionId.value = null;
-    }
-    invalidateCompletionCache(connectionId);
-    if (shouldRemoveOneTimeConnection) {
+    if (shouldRemoveOneTimeConnection && isCurrentConnectionStateRevision(connectionId, stateRevision)) {
       await removeConnection(connectionId);
     }
   }
@@ -1845,7 +1989,7 @@ export const useConnectionStore = defineStore("connection", () => {
       recordConnectionError(connectionId, error);
       throw error;
     }
-    if (getDisconnectInFlight(connectionId)) await waitForDisconnectInFlight(connectionId);
+    if (getBlockingDisconnectInFlight(connectionId)) await waitForBlockingDisconnectInFlight(connectionId);
     const existingConnect = connectInFlight.get(connectionId);
     if (existingConnect) {
       await existingConnect;
@@ -1860,6 +2004,7 @@ export const useConnectionStore = defineStore("connection", () => {
       await syncMongoLegacyDriverFallback(connectionId, config);
       await ensureLocalConnectionAttemptActiveAfterConnectResult(connectionId, localAttempt, id);
       connectedIds.value.add(connectionId);
+      markSuccessfulLocalConnectionAttempt(connectionId, localAttempt);
       markConnectionHealthChecked(connectionId);
       activeConnectionId.value = connectionId;
       clearConnectionError(connectionId);
@@ -1955,49 +2100,87 @@ export const useConnectionStore = defineStore("connection", () => {
             setChildren(node, withSavedSqlRoot(connectionId, schemaNodes, node));
             await savePersistedConnectionTreeChildren(cacheKey, node.children || schemaNodes);
           } else {
-            const cacheKey = schemaCacheKey(connectionId, "databases");
-            if (!options?.force) {
-              const cached = await loadPersistedTreeChildren(node, cacheKey);
-              if (cached.hit) {
-                if (cached.isStale) refreshStaleTreeNode(node);
-                return;
-              }
-            }
-            const databases = await withMetadataLoadTimeout(connectionId, api.listDatabases(connectionId), "databases");
-            const visibleNames = filterDatabaseNamesForConnection(
-              databases.map((database) => database.name),
-              config,
-            );
-            const visibleNameSet = new Set(visibleNames);
-            const visibleDatabases = databases.filter((database) => visibleNameSet.has(database.name));
-            const effectiveDbType = effectiveDatabaseTypeForConnection(config);
-            const databaseNodes = buildDatabaseTreeNodes(connectionId, visibleDatabases, {
-              includeDefaultWhenEmpty: usesTreeSchemaMode(effectiveDbType) || shouldIncludeDefaultDatabaseNode(config, visibleDatabases),
-            });
-            if (config?.db_type === "sqlserver") {
-              const linkedServers = await withMetadataLoadTimeout(connectionId, api.listSqlServerLinkedServers(connectionId), "linked servers").catch(() => []);
-              const linkedDatabase = sqlServerLinkedRuntimeDatabase(config);
-              databaseNodes.push({
-                ...sqlServerLinkedRootNode(connectionId, linkedDatabase),
-                children: linkedServers.map((server) => ({
-                  id: sqlServerLinkedServerId(connectionId, server.name),
-                  label: server.name,
-                  type: "linked-server",
-                  connectionId,
-                  database: linkedDatabase,
-                  linkedServer: server.name,
-                  comment: [server.product, server.provider, server.data_source].filter(Boolean).join(" / ") || null,
-                  isExpanded: false,
-                  children: [],
-                })),
+            // Doris / StarRocks multi-catalog: when external catalogs exist,
+            // render a catalog grouping layer (catalog → database → tables).
+            // When only `internal` is present, fall through to the flat database
+            // list (no regression for single-catalog deployments).
+            let dorisCatalogs: CatalogInfo[] | null = null;
+            if (connectionIsDorisFamilyCatalogCapable(config)) {
+              dorisCatalogs = await withMetadataLoadTimeout(connectionId, api.listDorisCatalogs(connectionId), "catalogs").catch((error: unknown) => {
+                recordMetadataLoadError(connectionId, error);
+                return null;
               });
-              if (linkedServers.length > 0) loadedTreeNodeChildrenIds.value.add(sqlServerLinkedRootId(connectionId));
             }
-            const children = withSavedSqlRoot(connectionId, databaseNodes, node);
-            if (isSidebarSearchQueryChanged(options)) return;
-            if (!canApplyTreeMetadataResult(node)) return;
-            setChildren(node, children);
-            await savePersistedConnectionTreeChildren(cacheKey, node.children || children);
+            if (dorisCatalogs && dorisCatalogs.length > 1) {
+              const cacheKey = schemaCacheKey(connectionId, "doris-catalogs");
+              if (!options?.force) {
+                const cached = await loadPersistedTreeChildren(node, cacheKey);
+                if (cached.hit) {
+                  if (cached.isStale) refreshStaleTreeNode(node);
+                  return;
+                }
+              }
+              const catalogNodes: TreeNode[] = dorisCatalogs.map((catalog) => ({
+                id: dorisCatalogId(connectionId, catalog.name),
+                label: catalog.name,
+                type: "doris-catalog" as const,
+                connectionId,
+                catalog: catalog.name,
+                catalogType: catalog.catalog_type,
+                comment: catalog.comment ?? null,
+                isExpanded: false,
+                children: [],
+              }));
+              const children = withSavedSqlRoot(connectionId, catalogNodes, node);
+              if (isSidebarSearchQueryChanged(options)) return;
+              if (!canApplyTreeMetadataResult(node)) return;
+              setChildren(node, children);
+              await savePersistedConnectionTreeChildren(cacheKey, node.children || children);
+            } else {
+              const cacheKey = schemaCacheKey(connectionId, "databases");
+              if (!options?.force) {
+                const cached = await loadPersistedTreeChildren(node, cacheKey);
+                if (cached.hit) {
+                  if (cached.isStale) refreshStaleTreeNode(node);
+                  return;
+                }
+              }
+              const databases = await withMetadataLoadTimeout(connectionId, api.listDatabases(connectionId), "databases");
+              const visibleNames = filterDatabaseNamesForConnection(
+                databases.map((database) => database.name),
+                config,
+              );
+              const visibleNameSet = new Set(visibleNames);
+              const visibleDatabases = databases.filter((database) => visibleNameSet.has(database.name));
+              const effectiveDbType = effectiveDatabaseTypeForConnection(config);
+              const databaseNodes = buildDatabaseTreeNodes(connectionId, visibleDatabases, {
+                includeDefaultWhenEmpty: usesTreeSchemaMode(effectiveDbType) || shouldIncludeDefaultDatabaseNode(config, visibleDatabases),
+              });
+              if (config?.db_type === "sqlserver") {
+                const linkedServers = await withMetadataLoadTimeout(connectionId, api.listSqlServerLinkedServers(connectionId), "linked servers").catch(() => []);
+                const linkedDatabase = sqlServerLinkedRuntimeDatabase(config);
+                databaseNodes.push({
+                  ...sqlServerLinkedRootNode(connectionId, linkedDatabase),
+                  children: linkedServers.map((server) => ({
+                    id: sqlServerLinkedServerId(connectionId, server.name),
+                    label: server.name,
+                    type: "linked-server",
+                    connectionId,
+                    database: linkedDatabase,
+                    linkedServer: server.name,
+                    comment: [server.product, server.provider, server.data_source].filter(Boolean).join(" / ") || null,
+                    isExpanded: false,
+                    children: [],
+                  })),
+                });
+                if (linkedServers.length > 0) loadedTreeNodeChildrenIds.value.add(sqlServerLinkedRootId(connectionId));
+              }
+              const children = withSavedSqlRoot(connectionId, databaseNodes, node);
+              if (isSidebarSearchQueryChanged(options)) return;
+              if (!canApplyTreeMetadataResult(node)) return;
+              setChildren(node, children);
+              await savePersistedConnectionTreeChildren(cacheKey, node.children || children);
+            }
           }
           node.isExpanded = true;
         } catch (e) {
@@ -2305,33 +2488,63 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
-  async function loadVectorCollections(connectionId: string) {
+  async function loadMilvusDatabases(connectionId: string) {
     const node = findNode(treeNodes.value, connectionId);
     if (!node) return;
 
-    const config = getConfig(connectionId);
-    const database = config?.database || "default";
     node.isLoading = true;
     try {
       await ensureConnected(connectionId);
-      const collections = await withMetadataLoadTimeout(connectionId, api.vectorListCollections(connectionId, database), "vector collections");
-      const sorted = [...collections].sort((a, b) => a.name.localeCompare(b.name));
+      const dbs = await withMetadataLoadTimeout(connectionId, api.documentListDatabases(connectionId), "Milvus databases");
       setChildren(
         node,
         withSavedSqlRoot(
           connectionId,
-          sorted.map((info) => ({
-            id: `${connectionId}:__vector_collection:${info.id}`,
-            label: info.name,
-            type: "vector-collection" as const,
+          sortSidebarNames(dbs).map((db) => ({
+            id: `${connectionId}:${db}`,
+            label: db,
+            type: "vector-database" as const,
             connectionId,
-            database,
+            database: db,
             isExpanded: false,
-            meta: info.dimension != null ? { dimension: info.dimension } : undefined,
+            children: [],
           })),
           node,
         ),
       );
+      node.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(connectionId, e);
+      throw e;
+    } finally {
+      node.isLoading = false;
+    }
+  }
+
+  async function loadVectorCollections(connectionId: string, database?: string) {
+    const config = getConfig(connectionId);
+    const isMilvus = config?.db_type === "milvus";
+    const effectiveDb = database || config?.database || "default";
+    // Milvus groups collections under a per-database node; other vector stores stay flat under the connection.
+    const node = isMilvus && database ? findNode(treeNodes.value, `${connectionId}:${database}`) : findNode(treeNodes.value, connectionId);
+    if (!node) return;
+
+    node.isLoading = true;
+    try {
+      await ensureConnected(connectionId);
+      const collections = await withMetadataLoadTimeout(connectionId, api.vectorListCollections(connectionId, effectiveDb), "vector collections");
+      const sorted = [...collections].sort((a, b) => a.name.localeCompare(b.name));
+      const collectionChildren = sorted.map((info) => ({
+        // Include the database for Milvus so same-named collections across databases don't collide.
+        id: `${connectionId}:__vector_collection:${isMilvus ? `${effectiveDb}:${info.id}` : info.id}`,
+        label: info.name,
+        type: "vector-collection" as const,
+        connectionId,
+        database: effectiveDb,
+        isExpanded: false,
+        meta: { dimension: info.dimension, collectionId: info.id } as VectorCollectionMeta,
+      }));
+      setChildren(node, isMilvus && database ? collectionChildren : withSavedSqlRoot(connectionId, collectionChildren, node));
       node.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e);
@@ -2593,6 +2806,136 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
+  // Doris / StarRocks multi-catalog: load the databases under a catalog node.
+  async function loadDorisCatalogDatabases(node: TreeNode, options?: LoadTreeOptions) {
+    if (!node.connectionId || !node.catalog) return;
+    const connectionId = node.connectionId;
+    const catalog = node.catalog;
+    node.isLoading = true;
+    try {
+      await ensureConnected(connectionId);
+      if (useCachedChildren(node, options)) return;
+      const config = getConfig(connectionId);
+      const databases = await withMetadataLoadTimeout(connectionId, api.listDorisCatalogDatabases(connectionId, catalog), "databases");
+      let databaseNodes: TreeNode[];
+      if (isInternalDorisCatalog(node.catalogType, catalog)) {
+        // The internal catalog's databases are rendered as standard database
+        // nodes so they reuse the existing table-loading / table-open paths.
+        // Detection is type-based (catalogType=`internal`), so StarRocks
+        // `default_catalog` routes here too — its tables carry no catalog.
+        const visibleNames = filterDatabaseNamesForConnection(
+          databases.map((database) => database.name),
+          config,
+        );
+        const visibleNameSet = new Set(visibleNames);
+        const visibleDatabases = databases.filter((database) => visibleNameSet.has(database.name));
+        databaseNodes = buildDatabaseTreeNodes(connectionId, visibleDatabases, { includeDefaultWhenEmpty: false });
+      } else {
+        databaseNodes = sortSidebarDatabases(databases).flatMap((database) => {
+          const name = database.name.trim();
+          if (!name) return [];
+          return [
+            {
+              id: dorisCatalogDatabaseId(connectionId, catalog, name),
+              label: name,
+              type: "database" as const,
+              connectionId,
+              database: name,
+              catalog,
+              isExpanded: false,
+              children: [],
+            },
+          ];
+        });
+      }
+      if (isSidebarSearchQueryChanged(options)) return;
+      if (!canApplyTreeMetadataResult(node)) return;
+      setChildren(node, databaseNodes);
+      node.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(connectionId, e);
+      throw e;
+    } finally {
+      node.isLoading = false;
+    }
+  }
+
+  // Doris / StarRocks multi-catalog: load tables under an external-catalog
+  // database node. External catalogs only expose tables/views, so a flat list
+  // (no routines/sequences/triggers) is rendered.
+  async function loadDorisCatalogTables(node: TreeNode, options?: LoadTreeOptions) {
+    if (!node.connectionId || !node.database || !node.catalog) return;
+    const connectionId = node.connectionId;
+    const { database, catalog } = node;
+    const configForScope = getConfig(connectionId);
+    const simpleObjectDisplayForScope = useSettingsStore().editorSettings.sidebarObjectDisplay === "simple";
+    const objectTypesForScope = simpleObjectDisplayForScope ? supportedSidebarObjectTypes(configForScope) : undefined;
+    return runTreeMetadataLoad(
+      {
+        kind: "schema-tables",
+        connectionId,
+        database,
+        schema: undefined,
+        nodeKind: "database",
+        objectTypes: objectTypesForScope,
+        searchFilter: activeTreeLoadSearchFilter(options),
+        limit: simpleObjectDisplayForScope ? sidebarObjectGroupPageSize() + 1 : undefined,
+        offset: 0,
+        sidebarDisplayMode: simpleObjectDisplayForScope ? "simple" : "grouped",
+        driverProfile: metadataDriverProfile(configForScope),
+        extra: options?.sidebarTableSearchParentId ? { sidebarTableSearchParentId: options.sidebarTableSearchParentId } : undefined,
+      },
+      async () => {
+        node.isLoading = true;
+        try {
+          await ensureConnected(connectionId);
+          if (useCachedChildren(node, options)) return;
+          const searchFilter = activeTreeLoadSearchFilter(options);
+          const cacheKey = schemaCacheKey(connectionId, `doris-catalog:${catalog}`, database, "objects-simple-v3");
+          if (!options?.force && !searchFilter) {
+            const cached = await loadPersistedTreeChildren(node, cacheKey);
+            if (cached.hit) {
+              if (cached.isStale) refreshStaleTreeNode(node);
+              return;
+            }
+          }
+          const pageSize = sidebarObjectGroupPageSize();
+          const fetchLimit = searchFilter ? pageSize : pageSize + 1;
+          const fetchOffset = searchFilter ? undefined : 0;
+          const tables = await withMetadataLoadTimeout(connectionId, api.listTables(connectionId, database, "", searchFilter, fetchLimit, fetchOffset, objectTypesForScope, catalog), "tables");
+          const hasMore = searchFilter ? false : tables.length > pageSize;
+          const pageTables = hasMore ? tables.slice(0, pageSize) : tables;
+          indexCompletionTables(connectionId, database, undefined, tableInfosToCompletionTables(pageTables, undefined));
+          let children = buildTableTreeNodes({
+            nodeId: node.id,
+            connectionId,
+            database,
+            schema: undefined,
+            tables: pageTables,
+            catalog,
+          });
+          if (hasMore && !searchFilter) {
+            children = [...children, buildLoadMoreNode(node, pageSize, pageSize)];
+          }
+          if (isTreeLoadSearchChanged(searchFilter, options)) return;
+          if (!canApplyTreeMetadataResult(node)) return;
+          node.objectCount = children.filter((child) => child.type !== "load-more").length;
+          setChildren(node, children);
+          if (!searchFilter && !options?.sidebarTableSearchParentId) {
+            await savePersistedTreeChildren(cacheKey, children);
+          }
+          node.isExpanded = true;
+        } catch (e) {
+          recordMetadataLoadError(connectionId, e);
+          throw e;
+        } finally {
+          node.isLoading = false;
+        }
+      },
+      options,
+    );
+  }
+
   async function loadTables(connectionId: string, database: string, schema?: string, options?: LoadTreeOptions) {
     const configForScope = getConfig(connectionId);
     const simpleObjectDisplayForScope = useSettingsStore().editorSettings.sidebarObjectDisplay === "simple";
@@ -2652,7 +2995,7 @@ export const useConnectionStore = defineStore("connection", () => {
               searchFilter: searchFilter || undefined,
               force: options?.force,
             });
-            children = page.hasMore && !searchFilter ? [...page.children, buildLoadMoreNode(node, page.nextOffset, pageSize)] : page.children;
+            children = page.hasMore && !searchFilter ? appendTableTreeLoadMoreNode(page.children, buildLoadMoreNode(node, page.nextOffset, pageSize), page.loadMoreParent) : page.children;
             nextObjectCount = page.objectCount;
           } else {
             children = buildObjectGroupPlaceholderNodes({
@@ -2710,6 +3053,7 @@ export const useConnectionStore = defineStore("connection", () => {
   async function loadObjectGroupChildren(node: TreeNode, options?: LoadTreeOptions) {
     const configForScope = node.connectionId ? getConfig(node.connectionId) : undefined;
     const objectTypesForScope = objectTypesForGroupNode(node.type);
+    const pageSizeForScope = sidebarObjectGroupPageSize();
     return runTreeMetadataLoad(
       {
         kind: "object-group",
@@ -2719,7 +3063,7 @@ export const useConnectionStore = defineStore("connection", () => {
         nodeKind: node.type,
         objectTypes: objectTypesForScope,
         searchFilter: activeTreeLoadSearchFilter(options),
-        limit: sidebarObjectGroupPageSize() + 1,
+        limit: pageSizeForScope + 1,
         offset: 0,
         sidebarDisplayMode: useSettingsStore().editorSettings.sidebarObjectDisplay,
         driverProfile: metadataDriverProfile(configForScope),
@@ -2764,31 +3108,23 @@ export const useConnectionStore = defineStore("connection", () => {
               searchFilter: searchFilter || undefined,
               force: options?.force,
             });
-            children = page.hasMore && !searchFilter ? [...page.children, buildLoadMoreNode(node, page.nextOffset, sidebarObjectGroupPageSize())] : page.children;
+            children = page.hasMore && !searchFilter ? appendTableTreeLoadMoreNode(page.children, buildLoadMoreNode(node, page.nextOffset, sidebarObjectGroupPageSize()), page.loadMoreParent) : page.children;
             nextObjectCount = page.objectCount;
           } else {
-            const objects = await loadCachedMetadataListPage<ObjectInfo[]>(
-              metadataListCacheScope({
-                kind: "object-list-page",
-                connectionId: node.connectionId,
-                database: node.database,
-                schema: querySchema,
-                nodeKind: node.type,
-                objectTypes,
-                searchFilter: searchFilter || undefined,
-                sidebarDisplayMode: useSettingsStore().editorSettings.sidebarObjectDisplay,
-              }),
-              () => api.listObjects(node.connectionId!, node.database!, querySchema, objectTypes, searchFilter || undefined),
-              { force: options?.force },
-            );
-            children = objectGroupChildrenFromObjects({
+            const pageSize = sidebarObjectGroupPageSize();
+            const page = await loadPagedObjectGroupChildren({
               node,
               parentNodeId,
+              querySchema,
               effectiveSchema,
               objectTypes,
-              objects,
+              offset: 0,
+              pageSize,
+              searchFilter: searchFilter || undefined,
+              force: options?.force,
             });
-            nextObjectCount = children.length;
+            children = page.hasMore && !searchFilter ? [...page.children, buildLoadMoreNode(node, page.nextOffset, pageSize)] : page.children;
+            nextObjectCount = page.objectCount;
           }
           if (isTreeLoadSearchChanged(searchFilter, options)) return;
           if (!canApplyTreeMetadataResult(node)) return;
@@ -2880,11 +3216,11 @@ export const useConnectionStore = defineStore("connection", () => {
               pageSize: loadMore.pageSize,
               force: false,
             });
-            const currentChildren = withoutLoadMoreNodes(parent.children);
+            const currentChildren = withoutTableTreeLoadMoreNodes(parent.children);
             const mergedChildren = mergeTableTreePageChildren(currentChildren, page.children, parentConnectionId, parentDatabase);
-            const nextChildren = page.hasMore ? [...mergedChildren, buildLoadMoreNode(parent, page.nextOffset, loadMore.pageSize)] : mergedChildren;
+            const nextChildren = page.hasMore ? appendTableTreeLoadMoreNode(mergedChildren, buildLoadMoreNode(parent, page.nextOffset, loadMore.pageSize), page.loadMoreParent) : mergedChildren;
             if (!canApplyTreeMetadataResult(parent)) return;
-            parent.objectCount = (parent.objectCount ?? currentChildren.length) + page.objectCount;
+            parent.objectCount = mergedChildren.length;
             setChildren(parent, nextChildren);
             await savePersistedTreeChildren(schemaCacheKey(parentConnectionId, parentDatabase, parent.schema || "", "objects-simple-v3"), nextChildren);
             parent.isExpanded = true;
@@ -2893,28 +3229,46 @@ export const useConnectionStore = defineStore("connection", () => {
           const objectTypes = objectTypesForGroupNode(parent.type);
           const parentNodeId = objectGroupRefreshParentId(parent);
           if (!objectTypes || !parentNodeId) return;
-          if (!objectTypes.every((objectType) => objectType === "TABLE" || objectType === "VIEW" || objectType === "MATERIALIZED_VIEW")) return;
 
           const config = getConfig(parentConnectionId);
           const parentDatabase = parent.database;
           if (!parentDatabase) return;
           const querySchema = connectionObjectTreeQuerySchema(config, parentDatabase, parent.schema);
           const effectiveSchema = connectionObjectTreeNodeSchema(config, parentDatabase, parent.schema);
-          const page = await loadPagedTableGroupChildren({
-            node: parent,
-            parentNodeId,
-            querySchema,
-            effectiveSchema,
-            objectTypes,
-            offset: loadMore.offset,
-            pageSize: loadMore.pageSize,
-            force: false,
-          });
-          const currentChildren = withoutLoadMoreNodes(parent.children);
-          const mergedChildren = mergeTableTreePageChildren(currentChildren, page.children, parentConnectionId, parentDatabase);
-          const nextChildren = page.hasMore ? [...mergedChildren, buildLoadMoreNode(parent, page.nextOffset, loadMore.pageSize)] : mergedChildren;
+          const wantsOnlyTablesOrViews = objectTypes.every((objectType) => objectType === "TABLE" || objectType === "VIEW" || objectType === "MATERIALIZED_VIEW");
+          let mergedChildren: TreeNode[];
+          let nextChildren: TreeNode[];
+          if (wantsOnlyTablesOrViews) {
+            const page = await loadPagedTableGroupChildren({
+              node: parent,
+              parentNodeId,
+              querySchema,
+              effectiveSchema,
+              objectTypes,
+              offset: loadMore.offset,
+              pageSize: loadMore.pageSize,
+              force: false,
+            });
+            const currentChildren = withoutTableTreeLoadMoreNodes(parent.children);
+            mergedChildren = mergeTableTreePageChildren(currentChildren, page.children, parentConnectionId, parentDatabase);
+            nextChildren = page.hasMore ? appendTableTreeLoadMoreNode(mergedChildren, buildLoadMoreNode(parent, page.nextOffset, loadMore.pageSize), page.loadMoreParent) : mergedChildren;
+          } else {
+            const page = await loadPagedObjectGroupChildren({
+              node: parent,
+              parentNodeId,
+              querySchema,
+              effectiveSchema,
+              objectTypes,
+              offset: loadMore.offset,
+              pageSize: loadMore.pageSize,
+              force: false,
+            });
+            const currentChildren = withoutLoadMoreNodes(parent.children);
+            mergedChildren = mergeLocatedTreeChildren(parent, currentChildren, page.children, parentConnectionId, parentDatabase);
+            nextChildren = page.hasMore ? [...mergedChildren, buildLoadMoreNode(parent, page.nextOffset, loadMore.pageSize)] : mergedChildren;
+          }
           if (!canApplyTreeMetadataResult(parent)) return;
-          parent.objectCount = (parent.objectCount ?? currentChildren.length) + page.objectCount;
+          parent.objectCount = mergedChildren.length;
           setChildren(parent, nextChildren);
           await savePersistedTreeChildren(objectGroupCacheKey(parent), nextChildren);
           parent.isExpanded = true;
@@ -3027,11 +3381,11 @@ export const useConnectionStore = defineStore("connection", () => {
         await loadObjectGroupChildren(parent);
       }
 
-      let loadMoreNode = parent.children?.find((child) => child.type === "load-more");
+      let loadMoreNode = findTreeNodes(parent.children ?? [], (child) => child.type === "load-more")[0];
       while (loadMoreNode?.loadMore) {
         loadMoreNode.isLoading = true;
         await loadMoreObjectGroupChildren(loadMoreNode);
-        loadMoreNode = parent.children?.find((child) => child.type === "load-more");
+        loadMoreNode = findTreeNodes(parent.children ?? [], (child) => child.type === "load-more")[0];
       }
       parent.isExpanded = true;
     } catch (e) {
@@ -3079,7 +3433,7 @@ export const useConnectionStore = defineStore("connection", () => {
     return normalizeSidebarObjectKind(type);
   }
 
-  async function loadTableGroups(connectionId: string, database: string, table: string, schema?: string, nodeId?: string) {
+  async function loadTableGroups(connectionId: string, database: string, table: string, schema?: string, nodeId?: string, catalog?: string) {
     const parentId = nodeId ?? (schema ? `${connectionId}:${database}:${schema}:${table}` : `${connectionId}:${database}:${table}`);
     const node = findNode(treeNodes.value, parentId);
     if (!node) return;
@@ -3093,6 +3447,7 @@ export const useConnectionStore = defineStore("connection", () => {
         connectionId,
         database,
         schema,
+        catalog,
         tableName: table,
         isExpanded: false,
         children: [],
@@ -3110,6 +3465,7 @@ export const useConnectionStore = defineStore("connection", () => {
           connectionId,
           database,
           schema,
+          catalog,
           tableName: table,
           isExpanded: false,
           children: [],
@@ -3125,6 +3481,7 @@ export const useConnectionStore = defineStore("connection", () => {
           connectionId,
           database,
           schema,
+          catalog,
           tableName: table,
           isExpanded: false,
           children: [],
@@ -3138,6 +3495,7 @@ export const useConnectionStore = defineStore("connection", () => {
           connectionId,
           database,
           schema,
+          catalog,
           tableName: table,
           isExpanded: false,
           children: [],
@@ -3149,7 +3507,7 @@ export const useConnectionStore = defineStore("connection", () => {
     node.isExpanded = true;
   }
 
-  async function loadColumns(connectionId: string, database: string, table: string, schema?: string, nodeId?: string) {
+  async function loadColumns(connectionId: string, database: string, table: string, schema?: string, nodeId?: string, catalog?: string) {
     const parentId = nodeId ?? (schema ? `${connectionId}:${database}:${schema}:${table}:__columns` : `${connectionId}:${database}:${table}:__columns`);
     const node = findNode(treeNodes.value, parentId);
     if (!node) return;
@@ -3184,7 +3542,7 @@ export const useConnectionStore = defineStore("connection", () => {
         return;
       }
       const querySchema = metadataQuerySchema(connectionId, database, schema);
-      const columns = await api.getColumns(connectionId, database, querySchema, table);
+      const columns = await api.getColumns(connectionId, database, querySchema, table, catalog);
       setChildren(
         node,
         columns.map((col) => ({
@@ -3207,7 +3565,7 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
-  async function loadIndexes(connectionId: string, database: string, table: string, schema?: string, nodeId?: string) {
+  async function loadIndexes(connectionId: string, database: string, table: string, schema?: string, nodeId?: string, catalog?: string) {
     const parentId = nodeId ?? (schema ? `${connectionId}:${database}:${schema}:${table}:__indexes` : `${connectionId}:${database}:${table}:__indexes`);
     const node = findNode(treeNodes.value, parentId);
     if (!node) return;
@@ -3221,7 +3579,7 @@ export const useConnectionStore = defineStore("connection", () => {
         return;
       }
       const querySchema = metadataQuerySchema(connectionId, database, schema);
-      const indexes = await api.listIndexes(connectionId, database, querySchema, table);
+      const indexes = await api.listIndexes(connectionId, database, querySchema, table, catalog);
       setChildren(
         node,
         indexes.map((idx) => ({
@@ -3244,7 +3602,7 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
-  async function loadForeignKeys(connectionId: string, database: string, table: string, schema?: string, nodeId?: string) {
+  async function loadForeignKeys(connectionId: string, database: string, table: string, schema?: string, nodeId?: string, catalog?: string) {
     const parentId = nodeId ?? (schema ? `${connectionId}:${database}:${schema}:${table}:__fkeys` : `${connectionId}:${database}:${table}:__fkeys`);
     const node = findNode(treeNodes.value, parentId);
     if (!node) return;
@@ -3258,7 +3616,7 @@ export const useConnectionStore = defineStore("connection", () => {
         return;
       }
       const querySchema = metadataQuerySchema(connectionId, database, schema);
-      const fkeys = await api.listForeignKeys(connectionId, database, querySchema, table);
+      const fkeys = await api.listForeignKeys(connectionId, database, querySchema, table, catalog);
       const cacheKey = `${connectionId}:${database}:${schema || ""}:${table}`;
       completionForeignKeysCache.value[cacheKey] = fkeys;
       evictOldestCacheEntries(completionForeignKeysCache.value, COMPLETION_CACHE_MAX);
@@ -3285,7 +3643,7 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
-  async function loadTriggers(connectionId: string, database: string, table: string, schema?: string, nodeId?: string) {
+  async function loadTriggers(connectionId: string, database: string, table: string, schema?: string, nodeId?: string, catalog?: string) {
     const parentId = nodeId ?? (schema ? `${connectionId}:${database}:${schema}:${table}:__triggers` : `${connectionId}:${database}:${table}:__triggers`);
     const node = findNode(treeNodes.value, parentId);
     if (!node) return;
@@ -3299,7 +3657,7 @@ export const useConnectionStore = defineStore("connection", () => {
         return;
       }
       const querySchema = metadataQuerySchema(connectionId, database, schema);
-      const triggers = await api.listTriggers(connectionId, database, querySchema, table);
+      const triggers = await api.listTriggers(connectionId, database, querySchema, table, catalog);
       setChildren(
         node,
         triggers.map((tr) => ({
@@ -3343,7 +3701,9 @@ export const useConnectionStore = defineStore("connection", () => {
         await loadMongoDatabases(node.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await loadElasticsearchIndices(node.connectionId);
-      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
+      } else if (config?.db_type === "milvus") {
+        await loadMilvusDatabases(node.connectionId);
+      } else if (config?.db_type === "qdrant" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
         await loadVectorCollections(node.connectionId);
       } else if (config?.db_type === "mq") {
         await loadMqTenants(node.connectionId, options);
@@ -3354,19 +3714,27 @@ export const useConnectionStore = defineStore("connection", () => {
       }
     } else if (node.type === "mongo-db" && node.connectionId && node.database) {
       await loadMongoCollections(node.connectionId, node.database);
+    } else if (node.type === "vector-database" && node.connectionId && node.database) {
+      await loadVectorCollections(node.connectionId, node.database);
     } else if (node.type === "mongo-collection" && node.connectionId && node.database) {
       await loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id);
     } else if (node.type === "mongo-gridfs") {
       node.isExpanded = true;
+    } else if (node.type === "doris-catalog" && node.connectionId) {
+      await loadDorisCatalogDatabases(node, options);
     } else if (node.type === "database" && node.connectionId && hasTreeNodeDatabaseContext(node)) {
-      const config = getConfig(node.connectionId);
-      const effectiveDbType = effectiveDatabaseTypeForConnection(config);
-      if (config?.db_type === "sqlserver") {
-        await loadSqlServerDatabaseObjects(node.connectionId, node.database, options);
-      } else if (usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config)) {
-        await loadSchemas(node.connectionId, node.database, options);
+      if (node.catalog && node.catalog !== "internal") {
+        await loadDorisCatalogTables(node, options);
       } else {
-        await loadTables(node.connectionId, node.database, undefined, options);
+        const config = getConfig(node.connectionId);
+        const effectiveDbType = effectiveDatabaseTypeForConnection(config);
+        if (config?.db_type === "sqlserver") {
+          await loadSqlServerDatabaseObjects(node.connectionId, node.database, options);
+        } else if (usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config)) {
+          await loadSchemas(node.connectionId, node.database, options);
+        } else {
+          await loadTables(node.connectionId, node.database, undefined, options);
+        }
       }
     } else if (node.type === "schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.schema) {
       await loadTables(node.connectionId, node.database, node.schema, options);
@@ -3379,15 +3747,15 @@ export const useConnectionStore = defineStore("connection", () => {
     } else if (node.type === "linked-server-schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.schema) {
       await loadTables(node.connectionId, node.database, node.schema, options);
     } else if ((node.type === "table" || node.type === "view" || node.type === "materialized_view") && node.connectionId && hasTreeNodeDatabaseContext(node)) {
-      await loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id);
+      await loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id, node.catalog);
     } else if (node.type === "group-columns" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await loadColumns(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await loadColumns(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-indexes" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await loadIndexes(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await loadIndexes(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-fkeys" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await loadForeignKeys(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await loadForeignKeys(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-triggers" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.tableName) {
-      await loadTriggers(node.connectionId, node.database, node.tableName, node.schema, node.id);
+      await loadTriggers(node.connectionId, node.database, node.tableName, node.schema, node.id, node.catalog);
     } else if (node.type === "group-tables" || node.type === "group-views" || node.type === "group-materialized-views" || node.type === "group-procedures" || node.type === "group-functions" || node.type === "group-sequences" || node.type === "group-packages") {
       await loadObjectGroupChildren(node, options);
     } else if (node.type === "group-partitions") {
@@ -3791,6 +4159,7 @@ export const useConnectionStore = defineStore("connection", () => {
           databases.map((database) => database.name),
           config,
         );
+        evictOldestCacheEntries(completionDatabasesCache.value, COMPLETION_CACHE_MAX);
         return completionDatabasesCache.value[connectionId];
       },
       { scope: completionLimiterScope(connectionId), kind: "databases" },
@@ -3805,6 +4174,7 @@ export const useConnectionStore = defineStore("connection", () => {
     return withCompletionInFlight(`${cacheKey}:schemas`, async () => {
       const schemas = await api.listSchemas(connectionId, database);
       schemaListCache.value[cacheKey] = schemas;
+      evictOldestCacheEntries(schemaListCache.value, COMPLETION_CACHE_MAX);
       return schemas;
     });
   }
@@ -3872,9 +4242,14 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   async function listCompletionTables(connectionId: string, database: string, filter = "", limit?: number, schema?: string): Promise<SqlCompletionTable[]> {
-    const normalizedFilter = filter.trim().toLowerCase();
-    const relaxedFilter = relaxedCompletionTableFilter(normalizedFilter);
-    const cacheKey = `${connectionId}:${database}:${normalizedFilter}:${limit ?? ""}:${schema ?? ""}`;
+    const trimmedFilter = filter.trim();
+    const normalizedFilter = trimmedFilter.toLowerCase();
+    // Remote queries (Dameng/Oracle) are case-sensitive, so the cache key must
+    // preserve original casing — otherwise "TEST" and "test" collide and the
+    // second lookup returns the first's stale results. Local lookups below stay
+    // case-insensitive because tableMatchScore normalizes internally.
+    const relaxedFilter = relaxedCompletionTableFilter(trimmedFilter);
+    const cacheKey = `${connectionId}:${database}:${trimmedFilter}:${limit ?? ""}:${schema ?? ""}`;
     if (completionTablesCache.value[cacheKey]) {
       return completionTablesCache.value[cacheKey];
     }
@@ -3888,10 +4263,10 @@ export const useConnectionStore = defineStore("connection", () => {
           if (normalizedFilter || limit) {
             let results: SqlCompletionTable[] = [];
             try {
-              results = await listCompletionAssistantTables(connectionId, database, normalizedFilter, limit, schema);
+              results = await listCompletionAssistantTables(connectionId, database, trimmedFilter, limit, schema);
             } catch {
               if (schema) {
-                const tables = await api.listTables(connectionId, database, schema, normalizedFilter, limit);
+                const tables = await api.listTables(connectionId, database, schema, trimmedFilter, limit);
                 results = tables.map((table) => ({
                   name: table.name,
                   schema,
@@ -3939,7 +4314,7 @@ export const useConnectionStore = defineStore("connection", () => {
           return completionTablesCache.value[cacheKey];
         }
 
-        let tables = await api.listTables(connectionId, database, database, normalizedFilter, limit);
+        let tables = await api.listTables(connectionId, database, database, trimmedFilter, limit);
         if (tables.length === 0 && relaxedFilter) {
           tables = await api.listTables(connectionId, database, database, relaxedFilter, expandedCompletionLimit(limit));
         }
@@ -4629,9 +5004,10 @@ export const useConnectionStore = defineStore("connection", () => {
         const saved = await api.loadConnections();
         connections.value = saved.map(normalizeConnection);
         const savedLayout = await api.loadSidebarLayout();
+        const currentLayout = sidebarLayout.value.groups.length || sidebarLayout.value.order.length ? sidebarLayout.value : null;
         sidebarLayout.value = reconcileLayout(
           connections.value.map((c) => c.id),
-          savedLayout,
+          savedLayout ?? currentLayout,
         );
         rebuildTreeNodes();
       })().finally(() => {
@@ -4689,6 +5065,7 @@ export const useConnectionStore = defineStore("connection", () => {
     isDefaultDatabase,
     setVisibleDatabases,
     clearVisibleDatabases,
+    ensureVisibleDatabase,
     setVisibleSchemas,
     clearVisibleSchemas,
     removeConnection,
@@ -4716,6 +5093,7 @@ export const useConnectionStore = defineStore("connection", () => {
     loadNacosNamespaces,
     updateRedisDbKeyStats,
     loadMongoDatabases,
+    loadMilvusDatabases,
     loadElasticsearchIndices,
     loadVectorCollections,
     loadMongoCollections,
@@ -4724,6 +5102,8 @@ export const useConnectionStore = defineStore("connection", () => {
     loadSqlServerLinkedServers,
     loadSqlServerLinkedServerCatalogs,
     loadSqlServerLinkedServerSchemas,
+    loadDorisCatalogDatabases,
+    loadDorisCatalogTables,
     loadTables,
     loadTableForLocate,
     loadObjectGroupChildren,

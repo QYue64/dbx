@@ -26,7 +26,7 @@ import { buildRedisKeyTree, collectExpandedGroupIds, collectRedisGroupKeyRaws, f
 import { classifyRedisCommandSafety } from "@/lib/redis/redisCommandSafety";
 import { isRedisMutatingCommand } from "@/lib/redis/redisCommandTable";
 import { isRedisClearScreenCommand, nextRedisCommandDb, redisKeyTextToRaw } from "@/lib/redis/redisCommandSession";
-import { formatRedisConsoleValue, formatRedisStringValue } from "@/lib/redis/redisValuePresentation";
+import { formatRedisConsoleValue, redisValuePreview, redisValueSize } from "@/lib/redis/redisValuePresentation";
 import { isCancelSearchShortcut } from "@/lib/editor/keyboardShortcuts";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { useEditorFontFamilyStyle } from "@/composables/useEditorFontFamilyStyle";
@@ -151,6 +151,11 @@ const dangerConfirmLabel = computed(() => {
   if (pendingDanger.value?.kind === "command") return t("dangerDialog.confirm");
   return t("dangerDialog.deleteConfirm");
 });
+const dangerMessage = computed(() => {
+  // Redis write commands such as SET/HSET are mutating but not necessarily delete operations.
+  if (pendingDanger.value?.kind === "command") return t("dangerDialog.redisCommandMessage");
+  return t("dangerDialog.deleteMessage");
+});
 const commandPrompt = computed(() => `db${commandDb.value}>`);
 const createKeyTypeOptions = computed<{ value: RedisCreateKeyType; label: string }[]>(() => [
   { value: "string", label: "String" },
@@ -211,14 +216,37 @@ function mergeTree(newKeys: RedisKeyInfo[]) {
   }
 }
 
-async function fetchScanPage(): Promise<RedisScanResult> {
+async function fetchScanPage(requestId = searchRequestId): Promise<RedisScanResult> {
   const pageSize = redisScanPageSize.value;
-  // Redis SCAN may return an empty page with a non-zero cursor; batch a few
-  // key-search pages so sparse MATCH patterns do not look empty immediately.
-  const keySearchIterations = 8;
-  return isValueSearchMode.value
-    ? await api.redisScanValues(props.connectionId, props.db, scanCursor.value, "*", valueQuery.value, pageSize, searchMode.value === "all")
-    : await api.redisScanKeysBatch(props.connectionId, props.db, scanCursor.value, effectivePattern.value, pageSize, keySearchIterations, false);
+  if (isValueSearchMode.value) {
+    return api.redisScanValues(props.connectionId, props.db, scanCursor.value, "*", valueQuery.value, pageSize, searchMode.value === "all");
+  }
+
+  // Keep each backend call small so a changed search can cancel between calls.
+  // The total COUNT budget bounds Redis work while giving sparse MATCH patterns
+  // substantially more coverage than a fixed number of SCAN calls.
+  const scanCountBudget = 50_000;
+  const iterationsPerCall = 8;
+  const maxIterations = Math.max(1, Math.ceil(scanCountBudget / Math.max(1, pageSize)));
+  let completedIterations = 0;
+  let cursor = scanCursor.value;
+  let totalKeys = 0;
+
+  while (completedIterations < maxIterations) {
+    if (requestId !== searchRequestId) {
+      return { cursor, keys: [], total_keys: totalKeys };
+    }
+    const iterations = Math.min(iterationsPerCall, maxIterations - completedIterations);
+    const result = await api.redisScanKeysBatch(props.connectionId, props.db, cursor, effectivePattern.value, pageSize, iterations, false);
+    if (totalKeys === 0) totalKeys = result.total_keys;
+    if (result.keys.length > 0 || result.cursor === 0) {
+      return { ...result, total_keys: totalKeys };
+    }
+    cursor = result.cursor;
+    completedIterations += iterations;
+  }
+
+  return { cursor, keys: [], total_keys: totalKeys };
 }
 
 /// Batch-scan variant that performs multiple SCAN iterations server-side.
@@ -270,7 +298,7 @@ function appendScanResult(result: RedisScanResult, options: { updateTree?: boole
 }
 
 async function scanNextPage(requestId = searchRequestId): Promise<boolean> {
-  const result = await fetchScanPage();
+  const result = await fetchScanPage(requestId);
   if (requestId !== searchRequestId) return false;
   appendScanResult(result);
   return true;
@@ -388,10 +416,10 @@ function redisValueToKeyInfo(value: RedisValue): RedisKeyInfo {
   return {
     key_display: value.key_display,
     key_raw: value.key_raw,
-    key_type: value.key_type,
+    key_type: value.redis_type,
     ttl: value.ttl,
-    size: typeof value.value === "string" ? value.value.length : (value.total ?? 0),
-    value_preview: createdKeyPreview(value.value),
+    size: redisValueSize(value),
+    value_preview: redisValuePreview(value),
   };
 }
 
@@ -518,12 +546,11 @@ async function runRedisCommand(command: string) {
     // The db this command ran on — capture before nextRedisCommandDb() advances it.
     const executedDb = commandDb.value;
     commandDb.value = nextRedisCommandDb(commandDb.value, command, result.value);
-    if (result.safety === "confirm") {
-      await loadKeys();
-    }
     // Drop the cached key-name completion for this db so the editor's autocomplete
     // reflects keys added/removed/renamed by SET/DEL/RENAME/...
-    if (isRedisMutatingCommand(command)) {
+    const mutatesKeys = isRedisMutatingCommand(command);
+    if (mutatesKeys) {
+      await loadKeys();
       connectionStore.invalidateCompletionCache(props.connectionId, String(executedDb));
       // Refresh the sidebar db key counts (INFO keyspace) so `dbN (count)` stays accurate
       // after the write. Fire-and-forget so the terminal stays responsive.
@@ -642,23 +669,14 @@ function openCreateKeyDialog() {
   showCreateKeyDialog.value = true;
 }
 
-function createdKeyPreview(value: any): string {
-  if (typeof value === "string") {
-    const text = formatRedisStringValue(value).replace(/\s+/g, " ").trim();
-    return text.length > 160 ? `${text.slice(0, 160)}…` : text;
-  }
-  if (Array.isArray(value) && value.length > 0) return String(value.length);
-  return "";
-}
-
-function upsertCreatedKey(value: any) {
+function upsertCreatedKey(value: RedisValue) {
   const keyInfo: RedisKeyInfo = {
     key_display: value.key_display,
     key_raw: value.key_raw,
-    key_type: value.key_type,
+    key_type: value.redis_type,
     ttl: value.ttl,
-    size: typeof value.value === "string" ? value.value.length : (value.total ?? 0),
-    value_preview: createdKeyPreview(value.value),
+    size: redisValueSize(value),
+    value_preview: redisValuePreview(value),
   };
   const existingIndex = flatKeys.value.findIndex((key) => key.key_raw === keyInfo.key_raw);
   if (existingIndex >= 0) {
@@ -1233,7 +1251,7 @@ defineExpose({ focusSearch });
       </Pane>
     </Splitpanes>
 
-    <DangerConfirmDialog v-model:open="showDangerConfirm" :message="t('dangerDialog.deleteMessage')" :details="dangerDetails" :confirm-label="dangerConfirmLabel" @confirm="applyDangerAction" />
+    <DangerConfirmDialog v-model:open="showDangerConfirm" :message="dangerMessage" :details="dangerDetails" :confirm-label="dangerConfirmLabel" @confirm="applyDangerAction" />
 
     <Dialog v-model:open="showCreateKeyDialog">
       <DialogContent class="sm:max-w-md" :style="editorFontFamilyStyle">

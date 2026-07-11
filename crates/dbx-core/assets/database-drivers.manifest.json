@@ -212,6 +212,12 @@
       "skipTcpProbe": false,
       "defaultPort": 1433,
       "supportLevel": "operate",
+      "driverProfiles": [
+        {
+          "profile": "sqlserver-legacy",
+          "agentKey": "sqlserver-legacy"
+        }
+      ],
       "capabilities": {
         "queryExecution": true,
         "metadataBrowse": true,
@@ -286,7 +292,7 @@
         "sqlFileExecution": true,
         "databaseCreate": false,
         "fieldLineage": true,
-        "sqlExplain": false,
+        "sqlExplain": true,
         "userAdmin": false,
         "driverManagement": true
       }
@@ -603,7 +609,7 @@
         "tableDataEdit": true,
         "tableStructureEdit": true,
         "tableImport": true,
-        "dataTransfer": false,
+        "dataTransfer": true,
         "sqlFileExecution": true,
         "databaseCreate": true,
         "fieldLineage": false,
@@ -1067,7 +1073,7 @@
       "singleConnectionPool": true,
       "metadataConnectionScoped": false,
       "skipTcpProbe": true,
-      "defaultPort": 2881,
+      "defaultPort": 2883,
       "supportLevel": "operate",
       "capabilities": {
         "queryExecution": true,
@@ -1819,6 +1825,36 @@
         "sqlExplain": false,
         "userAdmin": false,
         "driverManagement": false
+      }
+    },
+    {
+      "dbType": "spark",
+      "label": "Apache Spark",
+      "runtimeMode": "agent",
+      "mcpMode": "bridge",
+      "agentKey": "spark",
+      "singleConnectionPool": false,
+      "metadataConnectionScoped": false,
+      "skipTcpProbe": true,
+      "defaultPort": 10015,
+      "supportLevel": "operate",
+      "capabilities": {
+        "queryExecution": true,
+        "metadataBrowse": true,
+        "objectBrowser": true,
+        "objectSource": false,
+        "schemaSearch": true,
+        "diagram": false,
+        "tableDataEdit": true,
+        "tableStructureEdit": false,
+        "tableImport": false,
+        "dataTransfer": true,
+        "sqlFileExecution": true,
+        "databaseCreate": false,
+        "fieldLineage": false,
+        "sqlExplain": false,
+        "userAdmin": false,
+        "driverManagement": true
       }
     }
   ]

@@ -10,6 +10,14 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ autoAliasTables: false }).autoAliasTables).toBe(false);
   });
 
+  it("shows the current statement frame by default", () => {
+    expect(normalizeEditorSettings({}).showCurrentStatementFrame).toBe(true);
+  });
+
+  it("preserves disabled current statement frames", () => {
+    expect(normalizeEditorSettings({ showCurrentStatementFrame: false }).showCurrentStatementFrame).toBe(false);
+  });
+
   it("keeps SQL semantic diagnostics in auto mode and disabled by default", () => {
     const settings = normalizeEditorSettings({});
     expect(settings.sqlSemanticDiagnosticsMode).toBe("auto");
@@ -61,6 +69,19 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({}).dataGridSearchMode).toBe("filter");
     expect(normalizeEditorSettings({ dataGridSearchMode: "highlight" }).dataGridSearchMode).toBe("highlight");
     expect(normalizeEditorSettings({ dataGridSearchMode: "invalid" as any }).dataGridSearchMode).toBe("filter");
+  });
+
+  it("normalizes toolbar item settings from older saved settings", () => {
+    const settings = normalizeEditorSettings({
+      toolbarItems: {
+        sqlFileTree: false,
+        history: false,
+      } as any,
+    });
+
+    expect(settings.toolbarItems.sqlFileTree).toBe(false);
+    expect(settings.toolbarItems.history).toBe(false);
+    expect(settings.toolbarItems.sqlLibrary).toBe(true);
   });
 });
 

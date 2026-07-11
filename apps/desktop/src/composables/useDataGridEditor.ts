@@ -39,6 +39,7 @@ type CommitEditResult =
 
 interface CommitEditOptions {
   promoteDraft?: boolean;
+  explicitValue?: string | null;
 }
 
 type GridScrollerRef =
@@ -52,6 +53,7 @@ type GridScrollerRef =
 
 export interface CustomSaveHandler {
   save: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<void>;
+  applySavedChanges?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; columns: string[] }) => void;
   preview?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; deletedRows: Set<number>; columns: string[]; rows: CellValue[][] }) => Promise<string[]>;
   canInsert?: boolean;
   canDelete?: boolean;
@@ -624,7 +626,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     if (item.isDraft) {
       ensureQuickEntryDraftRow();
       const oldVal = quickEntryDraftRow.value[col] ?? null;
-      const newVal = coerceCellValue(editValue.value, oldVal, col);
+      const newVal = options.explicitValue !== undefined ? options.explicitValue : coerceCellValue(editValue.value, oldVal, col);
       const nextDraftRow = [...quickEntryDraftRow.value];
       nextDraftRow[col] = newVal;
       if (newVal !== oldVal) pushUndoSnapshot();
@@ -650,7 +652,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
 
     if (item.isNew && item.newIndex !== undefined) {
       const oldVal = newRows.value[item.newIndex]?.[col];
-      const newVal = coerceCellValue(editValue.value, oldVal, col);
+      const newVal = options.explicitValue !== undefined ? options.explicitValue : coerceCellValue(editValue.value, oldVal, col);
       const changed = newVal !== oldVal;
       if (changed) pushUndoSnapshot();
       if (newRows.value[item.newIndex]) {
@@ -675,7 +677,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
 
     const oldVal = result.value.rows[item.sourceIndex]?.[col];
-    const newVal = coerceCellValue(editValue.value, oldVal, col);
+    const newVal = options.explicitValue !== undefined ? options.explicitValue : coerceCellValue(editValue.value, oldVal, col);
     const changed = newVal !== item.data[col];
     if (newVal !== oldVal) {
       if (changed) pushUndoSnapshot();
@@ -900,27 +902,55 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
   }
 
-  function applyDeleteRow(rowId: number) {
-    const item = getRowItem(rowId);
-    if (!item) return;
-    if (item.isNew && item.newIndex !== undefined) {
-      if (isSavingNewRow(item)) return;
-      pushUndoSnapshot();
-      newRows.value.splice(item.newIndex, 1);
+  function applyDeleteRows(rowIds: number[]) {
+    const items = rowIds.map((rowId) => getRowItem(rowId)).filter((item): item is RowItem => !!item);
+    if (items.length === 0) return;
+
+    const newIndexes = new Set<number>();
+    const sourceIndexes = new Set<number>();
+    const deletedRowIds = new Set<number>();
+
+    for (const item of items) {
+      if (item.isNew && item.newIndex !== undefined) {
+        if (isSavingNewRow(item)) continue;
+        newIndexes.add(item.newIndex);
+        deletedRowIds.add(item.id);
+      } else if (item.sourceIndex !== undefined && canEditExistingRows.value) {
+        sourceIndexes.add(item.sourceIndex);
+        deletedRowIds.add(item.id);
+      }
+    }
+
+    if (newIndexes.size === 0 && sourceIndexes.size === 0) return;
+
+    // Batch row deletion into one reactive update so multi-row deletes do not
+    // rebuild the entire grid and undo history once per selected row.
+    pushUndoSnapshot();
+    if (newIndexes.size > 0) {
+      [...newIndexes]
+        .sort((a, b) => b - a)
+        .forEach((newIndex) => {
+          newRows.value.splice(newIndex, 1);
+        });
       newRows.value = [...newRows.value];
-    } else if (item.sourceIndex !== undefined) {
-      if (!canEditExistingRows.value) return;
-      pushUndoSnapshot();
-      dirtyRows.value.delete(item.sourceIndex);
-      deletedRows.value.add(item.sourceIndex);
+    }
+    if (sourceIndexes.size > 0) {
+      for (const sourceIndex of sourceIndexes) {
+        dirtyRows.value.delete(sourceIndex);
+        deletedRows.value.add(sourceIndex);
+      }
       dirtyRows.value = new Map(dirtyRows.value);
       deletedRows.value = new Set(deletedRows.value);
     }
     touchPendingChanges();
-    if (editingCell.value?.rowId === rowId) editingCell.value = null;
+    if (editingCell.value && deletedRowIds.has(editingCell.value.rowId)) editingCell.value = null;
     if (useTransaction.value && !transactionActive.value) {
       enterTransaction();
     }
+  }
+
+  function applyDeleteRow(rowId: number) {
+    applyDeleteRows([rowId]);
   }
 
   const showDeleteRowConfirm = ref(false);
@@ -939,9 +969,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
 
   function confirmDeleteRow() {
     if (pendingDeleteRowIds.value.length > 0) {
-      for (const rowId of pendingDeleteRowIds.value) {
-        applyDeleteRow(rowId);
-      }
+      applyDeleteRows(pendingDeleteRowIds.value);
       pendingDeleteRowIds.value = [];
       return;
     }
@@ -1157,6 +1185,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         return;
       }
       snapshot.newRowRefs.forEach((row) => savingNewRows.delete(row));
+      customHandler.applySavedChanges?.({ dirtyRows: snapshot.dirtyRows, columns: result.value.columns });
       applyDirtyRowsToResult(snapshot);
       clearSavedPendingChanges(snapshot);
       if (!hasPendingChanges.value) exitTransaction();
@@ -1404,6 +1433,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     addRow,
     cloneRow,
     cloneRows,
+    applyDeleteRows,
     applyDeleteRow,
     showDeleteRowConfirm,
     pendingDeleteRowId,
