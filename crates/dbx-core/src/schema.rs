@@ -74,7 +74,13 @@ pub fn duckdb_query_tables_in_database_with_attached(
             })
         })
         .map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let tables: Vec<db::TableInfo> = rows.filter_map(|r| r.ok()).collect();
+    if tables.is_empty() && duckdb_is_quack_catalog(con, &database) {
+        if let Some(remote) = duckdb_quack_remote_tables(con, &database, schema) {
+            return Ok(remote);
+        }
+    }
+    Ok(tables)
 }
 
 #[cfg(feature = "duckdb-bundled")]
@@ -85,7 +91,7 @@ pub fn duckdb_attach_database(con: &duckdb::Connection, name: &str, path: &str) 
         return Err("DuckDB attached database name and path are required".to_string());
     }
     let sql = format!("ATTACH {} AS {}", duckdb_quote_string(path), duckdb_quote_ident(name));
-    con.execute_batch(&sql).map_err(|e| e.to_string())
+    con.execute_batch(&sql).map_err(|e| format!("Failed to attach database \"{name}\": {e}"))
 }
 
 #[cfg(feature = "duckdb-bundled")]
@@ -127,7 +133,143 @@ pub fn duckdb_list_schemas_with_attached(
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt.query_map([database.as_str()], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let schemas: Vec<String> = rows.filter_map(|r| r.ok()).collect();
+    if schemas.is_empty() && duckdb_is_quack_catalog(con, &database) {
+        if let Some(remote) = duckdb_quack_remote_schemas(con, &database) {
+            return Ok(remote);
+        }
+    }
+    Ok(schemas)
+}
+
+/// Identifies quack catalogs by the storage-extension `type` that
+/// `duckdb_databases()` reports, rather than by the attach aliases parsed from
+/// the init script: `ATTACH 'quack:host:port'` without an `AS` alias gets a
+/// derived catalog name (e.g. `localhost:9494`) that no parser sees.
+#[cfg(feature = "duckdb-bundled")]
+fn duckdb_is_quack_catalog(con: &duckdb::Connection, database: &str) -> bool {
+    con.query_row("SELECT type FROM duckdb_databases() WHERE lower(database_name) = lower(?)", [database], |row| {
+        row.get::<_, String>(0)
+    })
+    .map(|catalog_type| catalog_type.eq_ignore_ascii_case("quack"))
+    .unwrap_or(false)
+}
+
+/// Quack-attached catalogs expose no metadata on the client side (the beta
+/// extension implements name resolution and streaming scans, but not catalog
+/// enumeration: `information_schema`, `duckdb_tables()` and `SHOW ALL TABLES`
+/// all skip the remote catalog). The extension's `quack_query_by_name` table
+/// function runs SQL on the remote server, so when a metadata query for an
+/// attached catalog comes back empty we ask the remote for its own
+/// information_schema. For non-quack catalogs (or when the extension is not
+/// loaded) the function call errors and the fallback quietly yields `None`.
+#[cfg(feature = "duckdb-bundled")]
+fn duckdb_quack_remote_query<T>(
+    con: &duckdb::Connection,
+    alias: &str,
+    remote_sql: &str,
+    map_row: impl Fn(&duckdb::Row<'_>) -> Result<T, duckdb::Error>,
+) -> Option<Vec<T>> {
+    let sql = format!(
+        "SELECT * FROM quack_query_by_name({}, {})",
+        duckdb_quote_string(alias),
+        duckdb_quote_string(remote_sql)
+    );
+    let mut stmt = match con.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            log::debug!("quack metadata fallback unavailable for catalog {alias}: {e}");
+            return None;
+        }
+    };
+    let rows = match stmt.query_map([], |row| map_row(row)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::debug!("quack metadata fallback query failed for catalog {alias}: {e}");
+            return None;
+        }
+    };
+    Some(rows.filter_map(|r| r.ok()).collect())
+}
+
+#[cfg(feature = "duckdb-bundled")]
+fn duckdb_quack_remote_schemas(con: &duckdb::Connection, alias: &str) -> Option<Vec<String>> {
+    duckdb_quack_remote_query(
+        con,
+        alias,
+        "SELECT DISTINCT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY schema_name",
+        |row| row.get::<_, String>(0),
+    )
+}
+
+#[cfg(feature = "duckdb-bundled")]
+fn duckdb_quack_remote_tables(con: &duckdb::Connection, alias: &str, schema: &str) -> Option<Vec<db::TableInfo>> {
+    let remote_sql = format!(
+        "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = {} ORDER BY table_name",
+        duckdb_quote_string(schema)
+    );
+    duckdb_quack_remote_query(con, alias, &remote_sql, |row| {
+        Ok(db::TableInfo {
+            name: row.get::<_, String>(0)?,
+            table_type: row.get::<_, String>(1)?,
+            comment: None,
+            parent_schema: None,
+            parent_name: None,
+        })
+    })
+}
+
+#[cfg(feature = "duckdb-bundled")]
+fn duckdb_quack_remote_columns(
+    con: &duckdb::Connection,
+    alias: &str,
+    schema: &str,
+    table: &str,
+) -> Option<Vec<db::ColumnInfo>> {
+    let pk_sql = format!(
+        "SELECT kcu.column_name
+         FROM information_schema.table_constraints tc
+         JOIN information_schema.key_column_usage kcu
+           ON tc.constraint_name = kcu.constraint_name
+          AND tc.table_schema = kcu.table_schema
+          AND tc.table_name = kcu.table_name
+         WHERE tc.constraint_type = 'PRIMARY KEY'
+           AND tc.table_schema = {schema}
+           AND tc.table_name = {table}
+         ORDER BY kcu.ordinal_position",
+        schema = duckdb_quote_string(schema),
+        table = duckdb_quote_string(table),
+    );
+    let primary_keys: std::collections::HashSet<String> =
+        duckdb_quack_remote_query(con, alias, &pk_sql, |row| row.get::<_, String>(0))
+            .map(|names| names.into_iter().collect())
+            .unwrap_or_default();
+
+    let columns_sql = format!(
+        "SELECT column_name, data_type, is_nullable, column_default
+         FROM information_schema.columns
+         WHERE table_schema = {schema} AND table_name = {table}
+         ORDER BY ordinal_position",
+        schema = duckdb_quote_string(schema),
+        table = duckdb_quote_string(table),
+    );
+    duckdb_quack_remote_query(con, alias, &columns_sql, |row| {
+        let name = row.get::<_, String>(0)?;
+        Ok(db::ColumnInfo {
+            is_primary_key: primary_keys.contains(&name),
+            name,
+            data_type: row.get::<_, String>(1)?,
+            is_nullable: row.get::<_, String>(2).unwrap_or_default() == "YES",
+            column_default: row.get::<_, Option<String>>(3)?,
+            extra: None,
+            comment: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            character_maximum_length: None,
+            enum_values: None,
+            ..Default::default()
+        })
+    })
 }
 
 #[cfg(feature = "duckdb-bundled")]
@@ -243,7 +385,13 @@ pub fn duckdb_query_columns_in_database_with_attached(
             })
         })
         .map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let columns: Vec<db::ColumnInfo> = rows.filter_map(|r| r.ok()).collect();
+    if columns.is_empty() && duckdb_is_quack_catalog(con, &database) {
+        if let Some(remote) = duckdb_quack_remote_columns(con, &database, schema, table) {
+            return Ok(remote);
+        }
+    }
+    Ok(columns)
 }
 
 #[cfg(feature = "duckdb-bundled")]
@@ -454,13 +602,7 @@ fn duckdb_completion_like_pattern(request: &db::CompletionAssistantRequest) -> S
 
 #[cfg(feature = "duckdb-bundled")]
 async fn duckdb_attached_database_names(state: &AppState, connection_id: &str) -> Vec<String> {
-    state
-        .configs
-        .read()
-        .await
-        .get(connection_id)
-        .map(|config| config.attached_databases.iter().map(|database| database.name.clone()).collect())
-        .unwrap_or_default()
+    state.configs.read().await.get(connection_id).map(crate::db::duckdb_sql::config_attached_names).unwrap_or_default()
 }
 
 fn clickhouse_metadata_database<'a>(database: &'a str, schema: &'a str) -> &'a str {
@@ -808,6 +950,7 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
             drop(connections);
             client.list_databases().await
         }
+        PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_databases(client).await,
         _ => Ok(vec![]),
     }
 }
@@ -1908,6 +2051,9 @@ async fn list_tables_once(
             .await
             .map(|infos| collection_names_to_tables(infos.into_iter().map(|i| i.name).collect(), "COLLECTION"))
             .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
+        PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_tables(client, schema)
+            .await
+            .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types)),
         _ => Ok(vec![]),
     }
 }
@@ -2322,6 +2468,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: 5,
@@ -2352,6 +2499,8 @@ mod tests {
             jdbc_driver_paths: Vec::new(),
             one_time: false,
             read_only: false,
+            is_production: false,
+            production_databases: vec![],
         }
     }
 
@@ -4195,6 +4344,9 @@ pub async fn get_columns_core(
             PoolKind::Rqlite(client) => {
                 db::rqlite_driver::get_columns(client, schema, table).await.map(deduplicate_column_infos)
             }
+            PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::get_columns(client, schema, table)
+                .await
+                .map(deduplicate_column_infos),
             _ => Ok(vec![]),
         }
     })
@@ -4291,6 +4443,7 @@ pub async fn list_indexes_core(
             PoolKind::Sqlite(p) => db::sqlite::list_indexes(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_indexes(client, schema, table).await,
             PoolKind::MongoDb(client) => db::mongo_driver::list_indexes(client, database, table).await,
+            PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_indexes(client, schema, table).await,
             _ => Ok(vec![]),
         }
     })
@@ -4337,6 +4490,7 @@ pub async fn list_foreign_keys_core(
             PoolKind::Postgres(p) => db::postgres::list_foreign_keys(p, schema, table).await,
             PoolKind::Sqlite(p) => db::sqlite::list_foreign_keys(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_foreign_keys(client, schema, table).await,
+            PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_foreign_keys(client, schema, table).await,
             _ => Ok(vec![]),
         }
     })
@@ -4381,6 +4535,7 @@ pub async fn list_triggers_core(
             PoolKind::Postgres(p) => db::postgres::list_triggers(p, schema, table).await,
             PoolKind::Sqlite(p) => db::sqlite::list_triggers(p, schema, table).await,
             PoolKind::Rqlite(client) => db::rqlite_driver::list_triggers(client, schema, table).await,
+            PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::list_triggers(client, schema, table).await,
             _ => Ok(vec![]),
         }
     })
@@ -4514,7 +4669,8 @@ pub async fn get_table_ddl_core(
     }
     if matches!(object_type, Some(db::ObjectSourceKind::View)) {
         let source =
-            get_object_source_core(state, connection_id, database, schema, table, db::ObjectSourceKind::View).await?;
+            get_object_source_core(state, connection_id, database, schema, table, db::ObjectSourceKind::View, None)
+                .await?;
         let database_type = connection_config(state, connection_id).await.map(|config| config.db_type);
         return Ok(crate::object_source_sql::build_view_ddl_sql(crate::object_source_sql::BuildViewDdlInput {
             database_type,
@@ -4531,6 +4687,7 @@ pub async fn get_table_ddl_core(
             schema,
             table,
             db::ObjectSourceKind::MaterializedView,
+            None,
         )
         .await?;
         return Ok(source.source);
@@ -4653,6 +4810,7 @@ pub async fn get_table_ddl_core(
         PoolKind::Postgres(p) => pg_ddl(p, schema, table).await,
         PoolKind::Sqlite(p) => sqlite_ddl(p, table).await,
         PoolKind::Rqlite(client) => db::rqlite_driver::table_ddl(client, table).await,
+        PoolKind::CloudflareD1(client) => db::cloudflare_d1_driver::table_ddl(client, table).await,
         _ => Err("DDL not supported for this database type".to_string()),
     }
 }
@@ -4788,12 +4946,22 @@ pub fn sqlserver_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSo
     )
 }
 
-pub fn postgres_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourceKind) -> String {
-    postgres_object_source_sql_inner(schema, name, kind, true)
+pub fn postgres_object_source_sql(
+    schema: &str,
+    name: &str,
+    kind: &db::ObjectSourceKind,
+    signature: Option<&str>,
+) -> String {
+    postgres_object_source_sql_inner(schema, name, kind, signature, true)
 }
 
-fn postgres_object_source_sql_without_relispopulated(schema: &str, name: &str, kind: &db::ObjectSourceKind) -> String {
-    postgres_object_source_sql_inner(schema, name, kind, false)
+fn postgres_object_source_sql_without_relispopulated(
+    schema: &str,
+    name: &str,
+    kind: &db::ObjectSourceKind,
+    signature: Option<&str>,
+) -> String {
+    postgres_object_source_sql_inner(schema, name, kind, signature, false)
 }
 
 fn postgres_function_object_source_sql_without_prokind(schema: &str, name: &str) -> String {
@@ -4812,6 +4980,7 @@ fn postgres_object_source_sql_inner(
     schema: &str,
     name: &str,
     kind: &db::ObjectSourceKind,
+    signature: Option<&str>,
     include_relispopulated: bool,
 ) -> String {
     match kind {
@@ -4843,15 +5012,19 @@ fn postgres_object_source_sql_inner(
         }
         db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function => {
             let prokind = if matches!(kind, db::ObjectSourceKind::Procedure) { "p" } else { "f" };
+            let signature_filter = signature
+                .map(|value| format!(" AND pg_get_function_identity_arguments(p.oid) = {}", sql_string(value)))
+                .unwrap_or_default();
             format!(
                 "SELECT pg_get_functiondef(p.oid) \
                  FROM pg_proc p \
                  JOIN pg_namespace n ON n.oid = p.pronamespace \
-                 WHERE n.nspname = {} AND p.proname = {} AND p.prokind = '{}' \
+                 WHERE n.nspname = {} AND p.proname = {} AND p.prokind = '{}'{} \
                  ORDER BY p.oid LIMIT 1",
                 sql_string(schema),
                 sql_string(name),
-                prokind
+                prokind,
+                signature_filter
             )
         }
         db::ObjectSourceKind::Sequence => {
@@ -4975,9 +5148,10 @@ pub async fn get_object_source_core(
     schema: &str,
     name: &str,
     object_type: db::ObjectSourceKind,
+    signature: Option<&str>,
 ) -> Result<db::ObjectSource, String> {
     retry_metadata_connection(state, connection_id, Some(database), || {
-        get_object_source_once(state, connection_id, database, schema, name, object_type.clone())
+        get_object_source_once(state, connection_id, database, schema, name, object_type.clone(), signature)
     })
     .await
 }
@@ -4989,6 +5163,7 @@ async fn get_object_source_once(
     schema: &str,
     name: &str,
     object_type: db::ObjectSourceKind,
+    signature: Option<&str>,
 ) -> Result<db::ObjectSource, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let db_config = connection_config(state, connection_id).await;
@@ -5056,7 +5231,7 @@ async fn get_object_source_once(
                     // only view
                     db::questdb::questdb_object_source(pool, name).await?
                 }
-                PoolKind::Postgres(pool) => postgres_object_source(pool, schema, name, &object_type).await?,
+                PoolKind::Postgres(pool) => postgres_object_source(pool, schema, name, &object_type, signature).await?,
                 PoolKind::Sqlite(pool) => first_string_cell(
                     db::sqlite::execute_query(pool, &sqlite_object_source_sql(name, &object_type)).await?,
                 )?,
@@ -5071,6 +5246,9 @@ async fn get_object_source_once(
                     )
                     .await?;
                     first_string_cell(result)?
+                }
+                PoolKind::CloudflareD1(client) => {
+                    return db::cloudflare_d1_driver::object_source(client, name, &object_type).await;
                 }
                 _ => return Err("Object source is not supported for this database type".to_string()),
             }
@@ -5383,15 +5561,16 @@ async fn postgres_object_source(
     schema: &str,
     name: &str,
     object_type: &db::ObjectSourceKind,
+    signature: Option<&str>,
 ) -> Result<String, String> {
-    let sql = postgres_object_source_sql(schema, name, object_type);
+    let sql = postgres_object_source_sql(schema, name, object_type, signature);
     match db::postgres::execute_query(pool, &sql).await.and_then(first_string_cell) {
         Ok(source) => Ok(source),
         Err(primary_err)
             if postgres_missing_relispopulated_error(&primary_err)
                 && matches!(object_type, db::ObjectSourceKind::View | db::ObjectSourceKind::MaterializedView) =>
         {
-            let fallback_sql = postgres_object_source_sql_without_relispopulated(schema, name, object_type);
+            let fallback_sql = postgres_object_source_sql_without_relispopulated(schema, name, object_type, signature);
             db::postgres::execute_query(pool, &fallback_sql)
                 .await
                 .and_then(first_string_cell)
@@ -5449,7 +5628,7 @@ mod object_source_tests {
 
     #[test]
     fn builds_postgres_object_source_sql_for_views_and_functions() {
-        let view_sql = postgres_object_source_sql("public", "active_users", &ObjectSourceKind::View);
+        let view_sql = postgres_object_source_sql("public", "active_users", &ObjectSourceKind::View, None);
 
         assert!(view_sql.contains("CREATE MATERIALIZED VIEW"));
         assert!(view_sql.contains("CREATE OR REPLACE VIEW"));
@@ -5458,8 +5637,13 @@ mod object_source_tests {
         assert!(view_sql.contains("c.relname = 'active_users'"));
 
         assert_eq!(
-            postgres_object_source_sql("public", "recalc_score", &ObjectSourceKind::Function),
+            postgres_object_source_sql("public", "recalc_score", &ObjectSourceKind::Function, None),
             "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND p.prokind = 'f' ORDER BY p.oid LIMIT 1"
+        );
+
+        assert_eq!(
+            postgres_object_source_sql("public", "recalc_score", &ObjectSourceKind::Function, Some("integer, integer")),
+            "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND p.prokind = 'f' AND pg_get_function_identity_arguments(p.oid) = 'integer, integer' ORDER BY p.oid LIMIT 1"
         );
     }
 
@@ -5469,6 +5653,7 @@ mod object_source_tests {
             "public",
             "active_users",
             &ObjectSourceKind::MaterializedView,
+            None,
         );
 
         assert!(sql.contains("CREATE MATERIALIZED VIEW"));
@@ -5488,7 +5673,7 @@ mod object_source_tests {
 
     #[test]
     fn keeps_legacy_materialized_viewdef_when_it_already_contains_create_statement() {
-        let sql = postgres_object_source_sql("public", "active_users", &ObjectSourceKind::MaterializedView);
+        let sql = postgres_object_source_sql("public", "active_users", &ObjectSourceKind::MaterializedView, None);
 
         assert!(
             sql.contains(
@@ -5515,7 +5700,7 @@ mod object_source_tests {
 
     #[test]
     fn builds_postgres_view_source_sql_without_regclass_cast() {
-        let sql = postgres_object_source_sql("tenant's schema", "active users", &ObjectSourceKind::View);
+        let sql = postgres_object_source_sql("tenant's schema", "active users", &ObjectSourceKind::View, None);
 
         assert!(!sql.contains("::regclass"));
         assert!(sql.contains("pg_get_viewdef(c.oid, 0)"));
@@ -5652,9 +5837,36 @@ mod ddl_tests {
         display_name.comment = Some("User's display name".to_string());
         let columns = vec![display_name];
 
-        let ddl = render_postgres_table_ddl("public", "users", &columns, &[], &[]);
+        let ddl = render_postgres_table_ddl("public", "users", &columns, &[], &[], None);
 
         assert!(ddl.contains("COMMENT ON COLUMN \"public\".\"users\".\"display_name\" IS 'User''s display name';"));
+    }
+
+    #[test]
+    fn postgres_table_ddl_includes_table_comment() {
+        let columns = vec![column("id", "integer")];
+
+        let ddl = render_postgres_table_ddl("public", "users", &columns, &[], &[], Some("User table"));
+
+        assert!(ddl.contains("COMMENT ON TABLE \"public\".\"users\" IS 'User table';"));
+    }
+
+    #[test]
+    fn postgres_table_ddl_omits_table_comment_when_empty() {
+        let columns = vec![column("id", "integer")];
+
+        let ddl = render_postgres_table_ddl("public", "users", &columns, &[], &[], Some(""));
+
+        assert!(!ddl.contains("COMMENT ON TABLE"));
+    }
+
+    #[test]
+    fn postgres_table_ddl_preserves_table_comment_whitespace() {
+        let columns = vec![column("id", "integer")];
+
+        let ddl = render_postgres_table_ddl("public", "users", &columns, &[], &[], Some("  User table  "));
+
+        assert!(ddl.contains("COMMENT ON TABLE \"public\".\"users\" IS '  User table  ';"));
     }
 
     #[test]
@@ -5664,7 +5876,7 @@ mod ddl_tests {
         id.is_primary_key = true;
         id.extra = Some("generated by default as identity".to_string());
 
-        let ddl = render_postgres_table_ddl("public", "users", &[id], &[], &[]);
+        let ddl = render_postgres_table_ddl("public", "users", &[id], &[], &[], None);
 
         assert!(ddl.contains("\"id\" integer generated by default as identity NOT NULL"), "ddl: {ddl}");
     }
@@ -5702,7 +5914,7 @@ mod ddl_tests {
             },
         ];
 
-        let ddl = render_postgres_table_ddl("public", "aaa_1", &columns, &[], &foreign_keys);
+        let ddl = render_postgres_table_ddl("public", "aaa_1", &columns, &[], &foreign_keys, None);
 
         assert!(ddl.contains(
             "CONSTRAINT \"aaa_1\" FOREIGN KEY (\"a\", \"b\", \"c\") REFERENCES \"aaa_2\"(\"a\", \"b\", \"c\")"
@@ -5716,12 +5928,41 @@ mod ddl_tests {
         display_name.comment = Some("User's display name".to_string());
         let columns = vec![display_name];
 
-        let ddl = render_sqlserver_table_ddl("dbo", "users", &columns, &[], &[]);
+        let ddl = render_sqlserver_table_ddl("dbo", "users", &columns, &[], &[], None);
 
         assert!(ddl.contains("CREATE TABLE [dbo].[users] (\n  [display]]name] nvarchar(100)\n);"));
         assert!(ddl.contains(
             "EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'User''s display name', @level0type=N'SCHEMA', @level0name=N'dbo', @level1type=N'TABLE', @level1name=N'users', @level2type=N'COLUMN', @level2name=N'display]name';"
         ));
+    }
+
+    #[test]
+    fn sqlserver_table_ddl_includes_table_comment() {
+        let columns = vec![column("id", "int")];
+
+        let ddl = render_sqlserver_table_ddl("dbo", "users", &columns, &[], &[], Some("User table"));
+
+        assert!(ddl.contains(
+            "EXEC sys.sp_addextendedproperty @name=N'MS_Description', @value=N'User table', @level0type=N'SCHEMA', @level0name=N'dbo', @level1type=N'TABLE', @level1name=N'users';"
+        ));
+    }
+
+    #[test]
+    fn sqlserver_table_ddl_omits_table_comment_when_empty() {
+        let columns = vec![column("id", "int")];
+
+        let ddl = render_sqlserver_table_ddl("dbo", "users", &columns, &[], &[], Some(""));
+
+        assert!(!ddl.contains("MS_Description"));
+    }
+
+    #[test]
+    fn sqlserver_table_ddl_preserves_table_comment_whitespace() {
+        let columns = vec![column("id", "int")];
+
+        let ddl = render_sqlserver_table_ddl("dbo", "users", &columns, &[], &[], Some("  User table  "));
+
+        assert!(ddl.contains("@value=N'  User table  '"));
     }
 
     #[test]
@@ -5731,7 +5972,7 @@ mod ddl_tests {
         id.is_primary_key = true;
         id.extra = Some("identity(1,1)".to_string());
 
-        let ddl = render_sqlserver_table_ddl("dbo", "ZHLSBS", &[id], &[], &[]);
+        let ddl = render_sqlserver_table_ddl("dbo", "ZHLSBS", &[id], &[], &[], None);
 
         assert!(ddl.contains("[FIDS] int IDENTITY(1,1) NOT NULL"), "ddl: {ddl}");
     }
@@ -5822,13 +6063,14 @@ pub fn opengauss_table_ddl_sql(schema: &str, table: &str) -> String {
 }
 
 pub async fn pg_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -> Result<String, String> {
-    let (columns, indexes, fkeys) = tokio::try_join!(
+    let (columns, indexes, fkeys, table_comment) = tokio::try_join!(
         db::postgres::get_columns(pool, schema, table),
         db::postgres::list_indexes(pool, schema, table),
         db::postgres::list_foreign_keys(pool, schema, table),
+        async { db::postgres::get_table_comment(pool, schema, table).await },
     )?;
 
-    Ok(render_postgres_table_ddl(schema, table, &columns, &indexes, &fkeys))
+    Ok(render_postgres_table_ddl(schema, table, &columns, &indexes, &fkeys, table_comment.as_deref()))
 }
 
 pub fn render_postgres_table_ddl(
@@ -5837,6 +6079,7 @@ pub fn render_postgres_table_ddl(
     columns: &[db::ColumnInfo],
     indexes: &[db::IndexInfo],
     fkeys: &[db::ForeignKeyInfo],
+    table_comment: Option<&str>,
 ) -> String {
     let table_name = format!("{}.{}", pg_ident(schema), pg_ident(table));
     let mut ddl = format!("CREATE TABLE {table_name} (\n");
@@ -5884,6 +6127,10 @@ pub fn render_postgres_table_ddl(
         ));
     }
     ddl.push_str("\n);\n");
+
+    if let Some(comment) = table_comment.filter(|comment| !comment.trim().is_empty()) {
+        ddl.push_str(&format!("\nCOMMENT ON TABLE {table_name} IS {};", sql_string(comment)));
+    }
 
     for col in columns {
         if let Some(comment) = col.comment.as_deref().filter(|comment| !comment.is_empty()) {
@@ -5962,8 +6209,9 @@ pub async fn build_sqlserver_ddl(
     let columns = db::sqlserver::get_columns(client, schema, table).await?;
     let indexes = db::sqlserver::list_indexes(client, schema, table).await?;
     let fkeys = db::sqlserver::list_foreign_keys(client, schema, table).await?;
+    let table_comment = db::sqlserver::get_table_comment(client, schema, table).await?;
 
-    Ok(render_sqlserver_table_ddl(schema, table, &columns, &indexes, &fkeys))
+    Ok(render_sqlserver_table_ddl(schema, table, &columns, &indexes, &fkeys, table_comment.as_deref()))
 }
 
 pub fn render_sqlserver_table_ddl(
@@ -5972,6 +6220,7 @@ pub fn render_sqlserver_table_ddl(
     columns: &[db::ColumnInfo],
     indexes: &[db::IndexInfo],
     fkeys: &[db::ForeignKeyInfo],
+    table_comment: Option<&str>,
 ) -> String {
     let table_name = format!("{}.{}", sqlserver_ident(schema), sqlserver_ident(table));
     let mut ddl = format!("CREATE TABLE {table_name} (\n");
@@ -6010,6 +6259,15 @@ pub fn render_sqlserver_table_ddl(
         ));
     }
     ddl.push_str("\n);\n");
+
+    if let Some(comment) = table_comment.filter(|comment| !comment.trim().is_empty()) {
+        ddl.push_str(&format!(
+            "\nEXEC sys.sp_addextendedproperty @name=N'MS_Description', @value={}, @level0type=N'SCHEMA', @level0name={}, @level1type=N'TABLE', @level1name={};",
+            sqlserver_n_string(comment),
+            sqlserver_n_string(schema),
+            sqlserver_n_string(table)
+        ));
+    }
 
     for column in columns {
         if let Some(comment) = column.comment.as_deref().map(str::trim).filter(|comment| !comment.is_empty()) {

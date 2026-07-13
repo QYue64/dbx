@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   combineDataTypeForDatabase,
+  combineDataTypeForDatabaseWithLengthUnit,
   createColumnDrafts,
   dataTypeLengthInputValue,
+  dataTypeLengthUnitValue,
+  DATA_TYPE_OPTIONS,
+  defaultNewColumnDataType,
+  getDataTypeLengthUnitOptions,
   getDefaultLengthForType,
   hasExistingColumnTypeChange,
   isDataTypeLengthDisabled,
@@ -12,6 +17,7 @@ import {
   isSqlServerIdentityCompatibleDataType,
   mysqlEnumDataType,
   rehydrateColumnDraftsFromMetadata,
+  restoreDamengLengthUnitsAfterSave,
   splitDataType,
 } from "@/lib/table/tableStructureEditorState";
 
@@ -99,6 +105,79 @@ describe("tableStructureEditorState", () => {
     expect(combineDataTypeForDatabase("mysql", "integer", "11")).toBe("integer(11)");
   });
 
+  it("offers BYTE and CHAR units only for supported Dameng character types", () => {
+    expect(getDataTypeLengthUnitOptions("dameng", "varchar2(255 CHAR)")).toEqual(["BYTE", "CHAR"]);
+    expect(getDataTypeLengthUnitOptions("dameng", "varchar(255)")).toEqual(["BYTE", "CHAR"]);
+    expect(getDataTypeLengthUnitOptions("dameng", "char(10 BYTE)")).toEqual(["BYTE", "CHAR"]);
+
+    expect(getDataTypeLengthUnitOptions("dameng", "nchar(10)")).toEqual([]);
+    expect(getDataTypeLengthUnitOptions("dameng", "nvarchar2(10)")).toEqual([]);
+    expect(getDataTypeLengthUnitOptions("dameng", "number(10,0)")).toEqual([]);
+    expect(getDataTypeLengthUnitOptions("oracle", "varchar2(255 CHAR)")).toEqual([]);
+    expect(getDataTypeLengthUnitOptions("mysql", "varchar(255)")).toEqual([]);
+  });
+
+  it("separates and reconstructs Dameng character length units", () => {
+    expect(dataTypeLengthInputValue("dameng", "varchar2(255 char)")).toBe("255");
+    expect(dataTypeLengthUnitValue("dameng", "varchar2(255 char)")).toBe("CHAR");
+    expect(dataTypeLengthInputValue("dameng", "char(10 BYTE)")).toBe("10");
+    expect(dataTypeLengthUnitValue("dameng", "char(10 BYTE)")).toBe("BYTE");
+
+    expect(combineDataTypeForDatabaseWithLengthUnit("dameng", "varchar2", "255", "CHAR")).toBe("varchar2(255 CHAR)");
+    expect(combineDataTypeForDatabaseWithLengthUnit("dameng", "varchar", "64", "byte")).toBe("varchar(64 BYTE)");
+    expect(combineDataTypeForDatabaseWithLengthUnit("dameng", "char", "", "CHAR")).toBe("char");
+    expect(combineDataTypeForDatabaseWithLengthUnit("dameng", "varchar2", "255", "")).toBe("varchar2(255)");
+  });
+
+  it("does not reinterpret unsupported length parameters or dialects", () => {
+    expect(dataTypeLengthInputValue("dameng", "varchar2(255 WORD)")).toBe("255 WORD");
+    expect(dataTypeLengthUnitValue("dameng", "varchar2(255 WORD)")).toBe("");
+    expect(combineDataTypeForDatabaseWithLengthUnit("mysql", "varchar", "255", "CHAR")).toBe("varchar(255)");
+    expect(combineDataTypeForDatabaseWithLengthUnit("dameng", "nvarchar2", "20", "BYTE")).toBe("nvarchar2(20)");
+  });
+
+  it("keeps a saved Dameng length unit when an older agent omits it during post-save refresh", () => {
+    const [legacyAgentDraft] = createColumnDrafts(
+      [
+        {
+          name: "DISPLAY_NAME",
+          data_type: "VARCHAR2(255)",
+          is_nullable: true,
+          column_default: null,
+          is_primary_key: false,
+          extra: null,
+        },
+      ],
+      "dameng",
+    );
+
+    const [restored] = restoreDamengLengthUnitsAfterSave([legacyAgentDraft!], new Map([["display_name", "VARCHAR2(255 CHAR)"]]));
+
+    expect(restored?.dataType).toBe("VARCHAR2(255 CHAR)");
+    expect(restored?.original?.data_type).toBe("VARCHAR2(255 CHAR)");
+  });
+
+  it("prefers live Dameng metadata when the agent returns an explicit length unit", () => {
+    const [liveDraft] = createColumnDrafts(
+      [
+        {
+          name: "DISPLAY_NAME",
+          data_type: "VARCHAR2(255 BYTE)",
+          is_nullable: true,
+          column_default: null,
+          is_primary_key: false,
+          extra: null,
+        },
+      ],
+      "dameng",
+    );
+
+    const [restored] = restoreDamengLengthUnitsAfterSave([liveDraft!], new Map([["display_name", "VARCHAR2(255 CHAR)"]]));
+
+    expect(restored?.dataType).toBe("VARCHAR2(255 BYTE)");
+    expect(restored?.original?.data_type).toBe("VARCHAR2(255 BYTE)");
+  });
+
   it("does not add MySQL display lengths when choosing SQLite-family types", () => {
     for (const databaseType of ["sqlite", "rqlite", "turso"] as const) {
       expect(getDefaultLengthForType(databaseType, "integer")).toBe("");
@@ -107,6 +186,30 @@ describe("tableStructureEditorState", () => {
     }
 
     expect(getDefaultLengthForType("mysql", "integer")).toBe("11");
+  });
+
+  it("uses MySQL 8-safe defaults only when the native MySQL profile is known", () => {
+    const mysql8Defaults = { omitMysqlDeprecatedDefaults: true };
+
+    expect(getDefaultLengthForType("mysql", "int", mysql8Defaults)).toBe("");
+    expect(getDefaultLengthForType("mysql", "bigint unsigned", mysql8Defaults)).toBe("");
+    expect(getDefaultLengthForType("mysql", "float", mysql8Defaults)).toBe("");
+    expect(getDefaultLengthForType("mysql", "double", mysql8Defaults)).toBe("");
+    expect(combineDataTypeForDatabase("mysql", "int", getDefaultLengthForType("mysql", "int", mysql8Defaults))).toBe("int");
+    expect(combineDataTypeForDatabase("mysql", "float", getDefaultLengthForType("mysql", "float", mysql8Defaults))).toBe("float");
+    expect(getDefaultLengthForType("mysql", "decimal", mysql8Defaults)).toBe("10,0");
+
+    // A compatibility profile cannot be version-identified, so its existing behavior is retained.
+    expect(getDefaultLengthForType("mysql", "int")).toBe("11");
+    expect(getDefaultLengthForType("mysql", "float")).toBe("10,2");
+  });
+
+  it("uses TEXT for a new native SQLite column without changing compatible defaults", () => {
+    expect(DATA_TYPE_OPTIONS.sqlite).toContain("text");
+    expect(defaultNewColumnDataType("sqlite")).toBe("text");
+    expect(defaultNewColumnDataType("rqlite")).toBe("varchar(255)");
+    expect(defaultNewColumnDataType("turso")).toBe("varchar(255)");
+    expect(defaultNewColumnDataType("mysql")).toBe("varchar(255)");
   });
 
   it("requires a SQLite rebuild only for a retained existing column type change", () => {

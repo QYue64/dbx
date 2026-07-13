@@ -1,12 +1,62 @@
 import { describe, expect, it } from "vitest";
-import { appendTableTreeLoadMoreNode, buildTableTreeNodes, mergeTableTreePageChildren, tablePartitionGroups, withoutTableTreeLoadMoreNodes } from "@/lib/table/tableTree";
-import type { TableInfo, TreeNode } from "@/types/database";
+import { appendTableTreeLoadMoreNode, buildSimpleObjectTreeNodes, buildTableTreeNodes, mergeTableTreePageChildren, tablePartitionGroups, withoutTableTreeLoadMoreNodes } from "@/lib/table/tableTree";
+import type { ObjectInfo, TableInfo, TreeNode } from "@/types/database";
 
 const context = {
   nodeId: "connection:db",
   connectionId: "connection",
   database: "db",
 };
+
+describe("PostgreSQL overloaded routines", () => {
+  it("keeps routines with the same name distinct by identity arguments", () => {
+    const objects: ObjectInfo[] = [
+      { name: "calc", object_type: "FUNCTION", schema: "public", signature: "integer" },
+      { name: "calc", object_type: "FUNCTION", schema: "public", signature: "integer, integer" },
+      { name: "calc", object_type: "FUNCTION", schema: "public", signature: "numeric" },
+    ];
+
+    const nodes = buildSimpleObjectTreeNodes({ ...context, schema: "public", objects });
+
+    expect(nodes.map((node) => ({ label: node.label, objectName: node.objectName, signature: node.signature }))).toEqual(
+      expect.arrayContaining([
+        { label: "calc(integer)", objectName: "calc", signature: "integer" },
+        { label: "calc(integer, integer)", objectName: "calc", signature: "integer, integer" },
+        { label: "calc(numeric)", objectName: "calc", signature: "numeric" },
+      ]),
+    );
+    expect(new Set(nodes.map((node) => node.id)).size).toBe(3);
+  });
+});
+
+describe("PostgreSQL table hierarchy", () => {
+  it("keeps schema pagination visible at the table-group root when a page ends inside nested partitions", () => {
+    const nodes = buildTableTreeNodes({
+      ...context,
+      schema: "public",
+      tables: [
+        { name: "orders", table_type: "BASE TABLE", comment: null },
+        { name: "orders_2026", table_type: "BASE TABLE", comment: null, parent_schema: "public", parent_name: "orders" },
+        { name: "orders_2026_01", table_type: "BASE TABLE", comment: null, parent_schema: "public", parent_name: "orders_2026" },
+      ],
+    });
+    const loadMore: TreeNode = {
+      id: "load-more:1000",
+      label: "tree.loadMore",
+      type: "load-more",
+      connectionId: context.connectionId,
+      database: context.database,
+      loadMore: { parentId: "connection:db:__tables", offset: 1000, pageSize: 1000 },
+    };
+
+    const withLoadMore = appendTableTreeLoadMoreNode(nodes, loadMore, { schema: "public", name: "orders_2026" });
+
+    expect(withLoadMore.map((node) => node.label)).toEqual(["orders", "tree.loadMore"]);
+    const yearPartition = tablePartitionGroups(withLoadMore[0])[0].children?.[0];
+    expect(yearPartition?.label).toBe("orders_2026");
+    expect(tablePartitionGroups(yearPartition!)[0].children?.map((node) => node.label)).toEqual(["orders_2026_01"]);
+  });
+});
 
 describe("TDengine table hierarchy", () => {
   it("groups child tables under their supertable and keeps ordinary tables flat", () => {

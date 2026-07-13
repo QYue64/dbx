@@ -4,6 +4,7 @@ export type DatabaseType =
   | "sqlite"
   | "rqlite"
   | "turso"
+  | "cloudflare-d1"
   | "redis"
   | "duckdb"
   | "clickhouse"
@@ -127,6 +128,7 @@ export interface ConnectionConfig {
   visible_databases?: string[];
   visible_schemas?: Record<string, string[]>;
   attached_databases?: AttachedDatabaseConfig[];
+  init_script?: string;
   color?: string;
   transport_layers?: TransportLayerConfig[];
   connect_timeout_secs?: number;
@@ -157,9 +159,21 @@ export interface ConnectionConfig {
   external_config?: unknown;
   one_time?: boolean;
   read_only?: boolean;
+  /** Explicit production marker for every database reachable through this connection. */
+  is_production?: boolean;
+  /** Database-level production markers for multi-database connections. */
+  production_databases?: string[];
 }
 
 export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig) | ({ type: "http_tunnel" } & HttpTunnelConfig);
+
+/**
+ * A shared tunnel configuration managed in Settings > Tunnels. Structurally a
+ * `TransportLayerConfig`; its `id` is what connection layers reference via
+ * `profile_id`. Edits to a profile apply to every referencing connection the
+ * next time it connects.
+ */
+export type TunnelProfile = TransportLayerConfig;
 
 export interface SshTunnelConfig {
   id: string;
@@ -186,6 +200,12 @@ export interface SshTunnelConfig {
    * for connections that already have `use_ssh_agent` configured.
    */
   auth_method?: "password" | "key" | "agent" | "none";
+  /**
+   * When set, this layer references a shared tunnel profile; the profile's
+   * configuration replaces this layer's fields at connect time (only `id`
+   * and `enabled` are kept).
+   */
+  profile_id?: string;
 }
 
 export interface SshConfigHostEntry {
@@ -205,6 +225,8 @@ export interface ProxyTunnelConfig {
   port: number;
   username?: string;
   password?: string;
+  /** See {@link SshTunnelConfig.profile_id}. */
+  profile_id?: string;
 }
 
 export interface HttpTunnelConfig {
@@ -214,6 +236,8 @@ export interface HttpTunnelConfig {
   url: string;
   token?: string;
   connect_timeout_secs?: number;
+  /** See {@link SshTunnelConfig.profile_id}. */
+  profile_id?: string;
 }
 
 export interface AttachedDatabaseConfig {
@@ -445,6 +469,8 @@ export interface OwnerInfo {
 
 export interface QueryResult {
   columns: string[];
+  /** Set for synthesized query execution failures. */
+  execution_error?: true;
   /** Internal row identifiers appended to editable query results. */
   hidden_column_indexes?: number[];
   /**
@@ -471,6 +497,9 @@ export interface QueryResult {
   has_more?: boolean;
   sourceLabel?: string;
   sourceStatement?: string;
+  /** Absolute offsets in the editor document at execution time. */
+  sourceFrom?: number;
+  sourceTo?: number;
 }
 
 export interface QueryResultRun {
@@ -634,6 +663,8 @@ export interface TreeNode {
   nacosNamespaceName?: string;
   schema?: string;
   tableName?: string;
+  objectName?: string;
+  signature?: string;
   tableType?: string;
   comment?: string | null;
   objectCount?: number;
@@ -661,6 +692,7 @@ export interface TableStructureEditorTarget {
 }
 
 export interface TableStructureEditorDraft {
+  dirty?: boolean;
   activeTab: TableInfoTab;
   newTableName: string;
   tableComment: string;
@@ -696,6 +728,9 @@ export interface QueryTab {
   connectionId: string;
   database: string;
   schema?: string;
+  /** Doris / StarRocks multi-catalog: the external catalog this tab's
+   * database belongs to (undefined for internal/default catalog). */
+  catalog?: string;
   sql: string;
   savedSqlId?: string;
   externalSqlPath?: string;
@@ -751,7 +786,7 @@ export interface QueryTab {
   explainExecutionId?: string;
   /** Per-run connection session for sequential MySQL explain formats. */
   explainClientSessionId?: string;
-  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users" | "dameng-jobs";
+  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users" | "dameng-jobs" | "processlist" | "mysql-dashboard";
   mqTenant?: string;
   mqInitialTab?: "topics";
   nacosNamespace?: string;
@@ -777,6 +812,7 @@ export interface QueryTab {
     tableName: string;
     tableType?: string;
     catalog?: string;
+    database?: string;
     columns: ColumnInfo[];
     primaryKeys: string[];
   };

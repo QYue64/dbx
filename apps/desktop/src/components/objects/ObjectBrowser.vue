@@ -77,9 +77,9 @@ import { useExportTracker, type ExportTask } from "@/composables/useExportTracke
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useQueryStore } from "@/stores/queryStore";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
-import DdlViewDialog from "./DdlViewDialog.vue";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { isCancelSearchShortcut } from "@/lib/editor/keyboardShortcuts";
+import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { batchTableEmptyFeedback, buildBatchTableEmptyPlan, runBatchTableEmpty, type BatchTableEmptyPlanItem } from "@/lib/sidebar/batchTableEmpty";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -195,8 +195,6 @@ const duplicateTarget = ref<ObjectBrowserRow | null>(null);
 const duplicateTableName = ref("");
 const showProcedureExecutionConfirm = ref(false);
 const procedureExecutionTarget = ref<ObjectBrowserRow | null>(null);
-const ddlDialogTarget = ref<ObjectBrowserRow | null>(null);
-const showDdlDialog = ref(false);
 const selectedTableIds = ref<Set<string>>(new Set());
 const expandedPartitionParentIds = ref<Set<string>>(new Set());
 const showBatchDropConfirm = ref(false);
@@ -740,7 +738,7 @@ function onRowClick(row: ObjectBrowserRow, event: MouseEvent) {
   }
   // Single click: defer when the row has a distinct double-click action so a
   // following second click can cancel it (e.g. TABLE single→table-info, double→open-table).
-  if (shouldDeferSingleClick(row, action, activation)) {
+  if (shouldDeferSingleClick(row, action)) {
     if (singleClickTimer) clearTimeout(singleClickTimer);
     singleClickTimer = setTimeout(() => {
       singleClickTimer = null;
@@ -814,9 +812,9 @@ const filteredTableDdlContent = computed(() => {
   });
 });
 
-async function openTableInfo(row: ObjectBrowserRow) {
+async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
   // Toggle off if clicking the same table
-  if (sidePanelRow.value?.id === row.id && sidePanelMode.value === "table-info") {
+  if (sidePanelRow.value?.id === row.id && sidePanelMode.value === "table-info" && !initialTab) {
     closeSidePanel();
     return;
   }
@@ -830,8 +828,8 @@ async function openTableInfo(row: ObjectBrowserRow) {
   tableForeignKeys.value = [];
   tableTriggers.value = [];
   tableInfoSearchQuery.value = "";
-  // Determine first available tab
-  const firstTab = tableInfoTabs.value[0]?.id ?? "ddl";
+  // Determine initial tab: explicit request > first available > ddl
+  const firstTab = initialTab ?? tableInfoTabs.value[0]?.id ?? "ddl";
   await selectTableInfoTab(firstTab);
 }
 
@@ -854,7 +852,7 @@ async function fetchTableDdl() {
   tableDdlLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const ddl = await api.getTableDdl(props.connection.id, props.database || "", schema, row.name);
+    const ddl = await api.getTableDdl(props.connection.id, props.database || "", schema, row.name, tableDdlObjectType(row.type), props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableDdlContent.value = ddl;
   } catch (e: any) {
@@ -872,7 +870,7 @@ async function fetchTableColumns() {
   tableColumnsLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const columns = await api.getColumns(props.connection.id, props.database || "", schema, row.name);
+    const columns = await api.getColumns(props.connection.id, props.database || "", schema, row.name, props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableColumns.value = columns;
   } catch {
@@ -890,7 +888,7 @@ async function fetchTableIndexes() {
   tableIndexesLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const indexes = await api.listIndexes(props.connection.id, props.database || "", schema, row.name);
+    const indexes = await api.listIndexes(props.connection.id, props.database || "", schema, row.name, props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableIndexes.value = indexes;
   } catch {
@@ -908,7 +906,7 @@ async function fetchTableForeignKeys() {
   tableForeignKeysLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const fks = await api.listForeignKeys(props.connection.id, props.database || "", schema, row.name);
+    const fks = await api.listForeignKeys(props.connection.id, props.database || "", schema, row.name, props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableForeignKeys.value = fks;
   } catch {
@@ -926,7 +924,7 @@ async function fetchTableTriggers() {
   tableTriggersLoading.value = true;
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const triggers = await api.listTriggers(props.connection.id, props.database || "", schema, row.name);
+    const triggers = await api.listTriggers(props.connection.id, props.database || "", schema, row.name, props.catalog);
     if (sidePanelGuard.isStale(epoch)) return;
     tableTriggers.value = triggers;
   } catch {
@@ -989,7 +987,7 @@ const canOpenTableStructureEditor = computed(() => sidePanelRow.value?.type === 
 function openTableStructureEditor() {
   const row = sidePanelRow.value;
   if (!row || row.type !== "TABLE" || !canOpenTableStructureEditor.value) return;
-  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name, tableInfoTab.value);
+  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name, tableInfoTab.value, undefined, props.catalog);
 }
 
 async function openSource(row: ObjectBrowserRow) {
@@ -1050,6 +1048,7 @@ async function openNewQuery(row: ObjectBrowserRow) {
     tabId,
     await buildTableSelectSql({
       databaseType: effectiveDatabaseType.value,
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connection.id),
       schema: row.schema || selectedSchema.value,
       tableName: row.name,
       limit: 100,
@@ -1145,9 +1144,13 @@ async function confirmRename() {
         newName,
         source: source.source,
       });
-      for (const sql of statements) {
-        await api.executeQuery(props.connection.id, props.database, sql, schema);
-      }
+      const executed = await executeObjectBrowserSqlWithProductionGuard(statements.join(";\n"), async () => {
+        for (const sql of statements) {
+          await api.executeQuery(props.connection.id, props.database, sql, schema);
+        }
+        return true;
+      });
+      if (!executed) return;
     } else {
       const sql = await buildRenameObjectSql({
         databaseType: effectiveDatabaseType.value,
@@ -1156,7 +1159,8 @@ async function confirmRename() {
         oldName: row.name,
         newName,
       });
-      await api.executeQuery(props.connection.id, props.database, sql, schema);
+      const executed = await executeObjectBrowserSqlWithProductionGuard(sql, () => api.executeQuery(props.connection.id, props.database, sql, schema));
+      if (!executed) return;
     }
     toast(t("contextMenu.renameObjectSuccess", { oldName: row.name, newName }));
     showRenameDialog.value = false;
@@ -1173,7 +1177,8 @@ async function confirmDrop() {
   const row = dropTarget.value;
   try {
     const sql = dropPreviewSql.value || (await buildDropSqlForRow(row, { cascade: canDropTargetCascade.value && dropTableCascade.value }));
-    await api.executeQuery(props.connection.id, props.database, sql);
+    const executed = await executeObjectBrowserSqlWithProductionGuard(sql, () => api.executeQuery(props.connection.id, props.database, sql));
+    if (!executed) return;
     const successKey = row.type === "VIEW" ? "contextMenu.dropViewSuccess" : row.type === "PROCEDURE" ? "contextMenu.dropProcedureSuccess" : row.type === "FUNCTION" ? "contextMenu.dropFunctionSuccess" : "contextMenu.dropTableSuccess";
     toast(t(successKey, { name: row.name }));
     closeDroppedTableObjectTabsForRow(row);
@@ -1269,7 +1274,7 @@ function openViewData(row: ObjectBrowserRow) {
 
 function openStructureEditor(row: ObjectBrowserRow) {
   if (row.type !== "TABLE") return;
-  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name);
+  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name, undefined, undefined, props.catalog);
 }
 
 function droppedTableObjectTypeForRow(row: ObjectBrowserRow): "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | null {
@@ -1372,7 +1377,7 @@ async function fetchSortedTableRowsForDrop(): Promise<ObjectBrowserRow[]> {
   const rows = [...selectedTableRows.value];
   if (rows.length <= 1) return rows;
 
-  const fkResults = await Promise.all(rows.map((row) => api.listForeignKeys(props.connection.id, props.database, row.schema || selectedSchema.value || "", row.name).catch(() => [] as ForeignKeyInfo[])));
+  const fkResults = await Promise.all(rows.map((row) => api.listForeignKeys(props.connection.id, props.database, row.schema || selectedSchema.value || "", row.name, props.catalog).catch(() => [] as ForeignKeyInfo[])));
 
   const tablesWithFk: TableWithFk[] = rows.map((row, i) => ({
     name: row.name,
@@ -1409,11 +1414,20 @@ async function confirmBatchDropTables() {
   if (targets.length === 0) return;
   try {
     const useCascade = canBatchDropCascade.value && batchDropCascade.value;
-    for (const row of targets) {
-      const sql = await buildDropTableSql(tableAdminSqlOptions(row, { cascade: useCascade }));
-      await api.executeQuery(props.connection.id, props.database, sql);
-      closeDroppedTableObjectTabsForRow(row);
-    }
+    const statements = await Promise.all(
+      targets.map(async (row) => ({
+        row,
+        sql: await buildDropTableSql(tableAdminSqlOptions(row, { cascade: useCascade })),
+      })),
+    );
+    const executed = await executeObjectBrowserSqlWithProductionGuard(statements.map(({ sql }) => sql).join(";\n"), async () => {
+      for (const { row, sql } of statements) {
+        await api.executeQuery(props.connection.id, props.database, sql);
+        closeDroppedTableObjectTabsForRow(row);
+      }
+      return true;
+    });
+    if (!executed) return;
     toast(t("objects.batchDropSuccess", { count: targets.length }));
     clearTableSelection();
     await reload();
@@ -1468,14 +1482,23 @@ async function confirmBatchTruncateTables() {
   if (targets.length === 0) return;
   try {
     const useCascade = canBatchTruncateCascade.value && batchTruncateCascade.value;
-    await runBatchTableTruncate(
-      targets,
-      async (row) => {
-        const sql = await buildTruncateTableSql(tableAdminSqlOptions(row, { cascade: useCascade }));
-        await api.executeQuery(props.connection.id, props.database, sql);
-      },
-      refreshMutatedTableDataTabsForRows,
+    const statements = await Promise.all(
+      targets.map(async (row) => ({
+        row,
+        sql: await buildTruncateTableSql(tableAdminSqlOptions(row, { cascade: useCascade })),
+      })),
     );
+    const executed = await executeObjectBrowserSqlWithProductionGuard(statements.map(({ sql }) => sql).join(";\n"), async () => {
+      await runBatchTableTruncate(
+        statements,
+        async ({ sql }) => {
+          await api.executeQuery(props.connection.id, props.database, sql);
+        },
+        async (succeeded) => refreshMutatedTableDataTabsForRows(succeeded.map(({ row }) => row)),
+      );
+      return true;
+    });
+    if (!executed) return;
     toast(t("objects.batchTruncateSuccess", { count: targets.length }));
     clearTableSelection();
     showBatchTruncateConfirm.value = false;
@@ -1512,9 +1535,13 @@ async function confirmBatchEmptyTables() {
   const plan = batchEmptyPlan.value.slice();
   if (plan.length === 0) return;
   const asynchronousMutation = effectiveDatabaseType.value === "clickhouse";
-  const result = await runBatchTableEmpty(plan, async ({ sql }) => {
-    await api.executeQuery(props.connection.id, props.database, sql);
+  const reviewSql = plan.map(({ sql }) => sql).join(";\n");
+  const result = await executeObjectBrowserSqlWithProductionGuard(reviewSql, () => {
+    return runBatchTableEmpty(plan, async ({ sql }) => {
+      await api.executeQuery(props.connection.id, props.database, sql);
+    });
   });
+  if (!result) return;
   for (const failure of result.failed) {
     console.error(`Failed to empty table "${failure.target.target.name}":`, failure.error);
   }
@@ -1540,7 +1567,7 @@ async function confirmBatchEmptyTables() {
 async function exportStructure(row: ObjectBrowserRow) {
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const ddl = await api.getTableDdl(props.connection.id, props.database, schema, row.name, tableDdlObjectType(row.type));
+    const ddl = await api.getTableDdl(props.connection.id, props.database, schema, row.name, tableDdlObjectType(row.type), props.catalog);
     await saveFileContent(buildSingleDdlExportFileContent(ddl), `${row.name}.sql`, "SQL", "sql");
   } catch (e: any) {
     console.error("Export structure failed:", e);
@@ -1555,10 +1582,11 @@ function tableDdlObjectType(type: ObjectBrowserRow["type"]): ObjectSourceKind | 
 async function exportDataLegacy(row: ObjectBrowserRow, format: "json" | "sql") {
   try {
     const schema = row.schema || selectedSchema.value;
-    const tableColumns = format === "sql" ? await api.getColumns(props.connection.id, props.database, schema || props.database, row.name) : undefined;
-    const queryColumns = props.connection.db_type === "neo4j" ? (tableColumns ?? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name))).map((column) => column.name) : undefined;
+    const tableColumns = format === "sql" ? await api.getColumns(props.connection.id, props.database, schema || props.database, row.name, props.catalog) : undefined;
+    const queryColumns = props.connection.db_type === "neo4j" ? (tableColumns ?? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name, props.catalog))).map((column) => column.name) : undefined;
     const result = await fetchTableDataForExport({
       databaseType: effectiveDatabaseType.value,
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connection.id),
       schema,
       tableName: row.name,
       columns: queryColumns,
@@ -1641,7 +1669,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx") {
 
   let task: ExportTask | null = null;
   try {
-    const queryColumns = props.connection.db_type === "neo4j" ? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name)).map((column) => column.name) : undefined;
+    const queryColumns = props.connection.db_type === "neo4j" ? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name, props.catalog)).map((column) => column.name) : undefined;
 
     task = addExportTask(row.name, format, filePath);
     const currentTask = task;
@@ -1696,7 +1724,8 @@ async function confirmDuplicateStructure() {
       sourceName: row.name,
       targetName: newName,
     });
-    await api.executeQuery(props.connection.id, props.database, sql, schema);
+    const executed = await executeObjectBrowserSqlWithProductionGuard(sql, () => api.executeQuery(props.connection.id, props.database, sql, schema));
+    if (!executed) return;
     toast(t("contextMenu.duplicateStructureSuccess", { name: newName }));
     await reload();
     await connectionStore.refreshObjectListTreeNode(props.connection.id, props.database, schema);
@@ -1799,10 +1828,11 @@ async function confirmPasteTable() {
           sourceName: entry.sourceName,
           targetName,
         });
-        await api.executeQuery(props.connection.id, props.database, structureSql, schema);
+        const executed = await executeObjectBrowserSqlWithProductionGuard(structureSql, () => api.executeQuery(props.connection.id, props.database, structureSql, schema));
+        if (!executed) return;
       }
       if (copyData) {
-        const sourceColumns = await api.getColumns(props.connection.id, props.database, schema || "", entry.sourceName);
+        const sourceColumns = await api.getColumns(props.connection.id, props.database, schema || "", entry.sourceName, props.catalog);
         const dataCopyColumnOptions = tableDataCopyColumnOptions(effectiveDatabaseType.value, sourceColumns);
         if (dataCopyColumnOptions.columns.length === 0) {
           throw new Error("No writable columns available for table data copy.");
@@ -1814,7 +1844,8 @@ async function confirmPasteTable() {
           targetName,
           ...dataCopyColumnOptions,
         });
-        await api.executeQuery(props.connection.id, props.database, dataSql, schema);
+        const executed = await executeObjectBrowserSqlWithProductionGuard(dataSql, () => api.executeQuery(props.connection.id, props.database, dataSql, schema));
+        if (!executed) return;
       }
       successCount++;
     } catch (e: any) {
@@ -1841,6 +1872,21 @@ function tableAdminSqlOptions(row: ObjectBrowserRow, options?: { cascade?: boole
   return result;
 }
 
+/**
+ * Routes Object Browser writes through the shared production gate. The SQL is
+ * assessed before the callback runs so generated DDL cannot bypass protection
+ * via executable comments, EXPLAIN ANALYZE, or qualified production targets.
+ */
+async function executeObjectBrowserSqlWithProductionGuard<T>(sql: string, execute: () => Promise<T>): Promise<T | undefined> {
+  return executeWithProductionSqlGuard({
+    connection: props.connection,
+    database: props.database,
+    sql,
+    source: t("production.sourceObjectBrowser"),
+    execute,
+  });
+}
+
 async function refreshTruncatePreviewSql(row: ObjectBrowserRow) {
   truncatePreviewSql.value = "";
   truncatePreviewSql.value = await buildTruncateTableSql(tableAdminSqlOptions(row, { cascade: canTruncateTargetCascade.value && truncateTableCascade.value })).catch(() => "");
@@ -1858,7 +1904,8 @@ async function confirmTruncateTable() {
   if (!row) return;
   try {
     const sql = truncatePreviewSql.value || (await buildTruncateTableSql(tableAdminSqlOptions(row, { cascade: canTruncateTargetCascade.value && truncateTableCascade.value })));
-    await api.executeQuery(props.connection.id, props.database, sql);
+    const executed = await executeObjectBrowserSqlWithProductionGuard(sql, () => api.executeQuery(props.connection.id, props.database, sql));
+    if (!executed) return;
     toast(t("contextMenu.truncateTableSuccess", { name: row.name }));
     await refreshMutatedTableDataTabsForRows([row]);
   } catch (e: any) {
@@ -1883,7 +1930,8 @@ async function confirmEmptyTable() {
   if (!row) return;
   try {
     const sql = emptyPreviewSql.value || (await buildEmptyTableSql(tableAdminSqlOptions(row)));
-    await api.executeQuery(props.connection.id, props.database, sql);
+    const executed = await executeObjectBrowserSqlWithProductionGuard(sql, () => api.executeQuery(props.connection.id, props.database, sql));
+    if (!executed) return;
     toast(t("contextMenu.emptyTableSuccess", { name: row.name }));
     await refreshMutatedTableDataTabsForRows([row]);
   } catch (e: any) {
@@ -1949,8 +1997,23 @@ async function saveSource() {
       name: row.name,
       source: sourceDraft.value,
     });
-    await executeObjectSourceSave(connectionId, database, effectiveDatabaseType.value, statements, schema);
-    if (sidePanelGuard.isStale(epoch)) return;
+    const executableSql = statements.filter((sql) => sql.trim()).join(";\n");
+    if (executableSql.trim()) {
+      const saved = await executeWithProductionSqlGuard({
+        connection: props.connection,
+        database,
+        sql: executableSql,
+        source: t("production.sourceObjectSource"),
+        execute: async () => {
+          await executeObjectSourceSave(connectionId, database, effectiveDatabaseType.value, statements, schema);
+          return true;
+        },
+      });
+      if (!saved || sidePanelGuard.isStale(epoch)) return;
+    } else {
+      await executeObjectSourceSave(connectionId, database, effectiveDatabaseType.value, statements, schema);
+      if (sidePanelGuard.isStale(epoch)) return;
+    }
     toast(t("objects.sourceSaved"));
     sourceEditing.value = false;
     sourceDraft.value = "";
@@ -2173,10 +2236,7 @@ function getTableMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     { label: t("contextMenu.viewData"), action: () => openViewData(item), icon: Table2 },
     {
       label: t("contextMenu.viewDdl"),
-      action: () => {
-        ddlDialogTarget.value = item;
-        showDdlDialog.value = true;
-      },
+      action: () => openTableInfo(item, "ddl"),
       icon: FileCode,
     },
     ...(canOpenStructureEditor.value ? [{ label: t("contextMenu.editStructure"), action: () => openStructureEditor(item), icon: PencilRuler }] : []),
@@ -2227,10 +2287,7 @@ function getViewMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
     {
       label: t("contextMenu.viewDdl"),
-      action: () => {
-        ddlDialogTarget.value = item;
-        showDdlDialog.value = true;
-      },
+      action: () => openTableInfo(item, "ddl"),
       icon: ScrollText,
     },
     ...(canRename(item) ? [{ label: t("contextMenu.renameObject"), action: () => requestRename(item), icon: Pencil }] : []),
@@ -2983,18 +3040,6 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       </DialogFooter>
     </DialogContent>
   </Dialog>
-
-  <DdlViewDialog
-    v-if="ddlDialogTarget"
-    :connection-id="props.connection.id"
-    :database="props.database"
-    :schema="ddlDialogTarget.schema || selectedSchema"
-    :table-name="ddlDialogTarget.name"
-    :object-type="tableDdlObjectType(ddlDialogTarget.type)"
-    :dialect="sourceDialect"
-    :format-dialect="sourceFormatDialect"
-    v-model:open="showDdlDialog"
-  />
 </template>
 
 <style scoped>

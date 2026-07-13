@@ -30,6 +30,7 @@ const SECRET_KEYS: &[&str] = &[
     "proxy_password",
     "redis_sentinel_password",
     "connection_string",
+    "init_script",
     MQ_AUTH_TOKEN_KEY,
     MQ_AUTH_PASSWORD_KEY,
     MQ_AUTH_API_KEY_VALUE_KEY,
@@ -91,6 +92,10 @@ pub struct SyncSnapshot {
     pub exported_at: String,
     pub app_version: String,
     pub connections: Vec<ConnectionConfig>,
+    /// Shared tunnel profiles (secrets scrubbed). `None` means the snapshot
+    /// predates tunnel profiles — applying it leaves local profiles alone.
+    #[serde(default)]
+    pub tunnel_profiles: Option<Vec<TransportLayerConfig>>,
     pub sidebar_layout: Option<serde_json::Value>,
     pub pinned_tree_node_ids: Vec<String>,
     pub saved_sql: SavedSqlLibrary,
@@ -115,6 +120,9 @@ pub struct EncryptedSecretsBlob {
 pub struct SensitiveSyncPayload {
     pub connection_secrets: Vec<ConnectionSecretSnapshot>,
     pub ai_config: Option<AiConfig>,
+    /// Full tunnel profiles including their secrets.
+    #[serde(default)]
+    pub tunnel_profiles: Option<Vec<TransportLayerConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,14 +171,19 @@ pub async fn build_sync_snapshot(
     secrets_passphrase: Option<&str>,
 ) -> Result<SyncSnapshot, String> {
     let mut connections = storage.load_connections().await?;
+    let mut tunnel_profiles = storage.load_tunnel_profiles().await?;
     let encrypted_secrets = match normalized_passphrase(secrets_passphrase) {
-        Some(passphrase) => {
-            Some(encrypt_sensitive_payload(&build_sensitive_payload(storage, &connections).await?, passphrase)?)
-        }
+        Some(passphrase) => Some(encrypt_sensitive_payload(
+            &build_sensitive_payload(storage, &connections, &tunnel_profiles).await?,
+            passphrase,
+        )?),
         None => None,
     };
     for config in &mut connections {
         scrub_connection_secrets(config);
+    }
+    for profile in &mut tunnel_profiles {
+        profile.scrub_secrets();
     }
 
     Ok(SyncSnapshot {
@@ -178,6 +191,7 @@ pub async fn build_sync_snapshot(
         exported_at: Utc::now().to_rfc3339(),
         app_version: app_version.into(),
         connections,
+        tunnel_profiles: Some(tunnel_profiles),
         sidebar_layout: storage.load_sidebar_layout().await?,
         pinned_tree_node_ids: storage.load_pinned_tree_node_ids().await?,
         saved_sql: storage.load_saved_sql_library().await?,
@@ -223,6 +237,9 @@ pub async fn apply_sync_snapshot(
     }
 
     storage.save_connection_metadata_preserving_secrets(&connections).await?;
+    if let Some(profiles) = &snapshot.tunnel_profiles {
+        storage.save_tunnel_profiles_preserving_secrets(profiles).await?;
+    }
     if let Some(layout) = &snapshot.sidebar_layout {
         storage.save_sidebar_layout(layout).await?;
     }
@@ -483,15 +500,9 @@ impl SnippetSyncClient {
                 self.request(method, &url)?.json(&payload).send().await
             }
             SnippetProvider::Gitee => {
-                let files = serde_json::json!({ DEFAULT_SNIPPET_FILE_NAME: { "content": content } }).to_string();
-                self.request(method, &url)?
-                    .form(&[
-                        ("files", files),
-                        ("description", "DBX configuration sync".to_string()),
-                        ("public", "false".to_string()),
-                    ])
-                    .send()
-                    .await
+                let payload = gitee_snippet_payload(content);
+                // Gitee validates `files` as a nested object; form encoding turns it into a string and is rejected.
+                self.request(method, &url)?.json(&payload).send().await
             }
         }
         .map_err(|e| e.to_string())?;
@@ -587,6 +598,7 @@ fn scrub_connection_secrets(config: &mut ConnectionConfig) {
     }
     config.redis_sentinel_password.clear();
     config.connection_string = None;
+    config.init_script = None;
     scrub_mq_external_config_secrets(config);
     scrub_nacos_auth_secrets(config);
 }
@@ -602,10 +614,12 @@ fn webdav_password_account(config: &WebDavConfig) -> String {
 async fn build_sensitive_payload(
     storage: &Storage,
     connections: &[ConnectionConfig],
+    tunnel_profiles: &[TransportLayerConfig],
 ) -> Result<SensitiveSyncPayload, String> {
     let mut connection_secrets = Vec::new();
     for config in connections {
         push_secret(&mut connection_secrets, &config.id, "password", &config.password);
+        push_secret(&mut connection_secrets, &config.id, "init_script", config.init_script.as_deref().unwrap_or(""));
         for (index, layer) in config.transport_layers.iter().enumerate() {
             match layer {
                 TransportLayerConfig::Ssh(ssh) => {
@@ -648,7 +662,11 @@ async fn build_sensitive_payload(
         push_nacos_external_config_secrets(&mut connection_secrets, config);
     }
 
-    Ok(SensitiveSyncPayload { connection_secrets, ai_config: storage.load_ai_config().await? })
+    Ok(SensitiveSyncPayload {
+        connection_secrets,
+        ai_config: storage.load_ai_config().await?,
+        tunnel_profiles: Some(tunnel_profiles.to_vec()),
+    })
 }
 
 fn push_mq_external_config_secrets(secrets: &mut Vec<ConnectionSecretSnapshot>, config: &ConnectionConfig) {
@@ -768,6 +786,9 @@ async fn apply_sensitive_payload(storage: &Storage, payload: &SensitiveSyncPaylo
     }
     if let Some(ai_config) = &payload.ai_config {
         storage.save_ai_config(ai_config).await?;
+    }
+    if let Some(profiles) = &payload.tunnel_profiles {
+        storage.save_tunnel_profiles(profiles).await?;
     }
     Ok(())
 }
@@ -935,6 +956,14 @@ fn snippet_response_id(value: &serde_json::Value) -> Option<String> {
     value.as_array()?.first()?.get("id")?.as_str().map(str::to_string)
 }
 
+fn gitee_snippet_payload(content: String) -> serde_json::Value {
+    serde_json::json!({
+        "description": "DBX configuration sync",
+        "public": false,
+        "files": { DEFAULT_SNIPPET_FILE_NAME: { "content": content } }
+    })
+}
+
 fn snippet_file_content(
     value: &serde_json::Value,
     file_name: &str,
@@ -995,20 +1024,29 @@ fn parent_collection_paths(remote_path: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sync_snapshot_with_saved_secrets, decrypt_sensitive_payload, encrypt_sensitive_payload,
-        forget_webdav_sync_secrets_passphrase, normalized_remote_path, parent_collection_paths,
-        resolve_webdav_sync_secrets_passphrase, save_webdav_sync_secrets_preference, scrub_connection_secrets,
-        snippet_file_content, snippet_response_id, webdav_sync_secrets_status, ConnectionSecretSnapshot,
-        SensitiveSyncPayload,
+        apply_sync_snapshot, build_sync_snapshot, build_sync_snapshot_with_saved_secrets, decrypt_sensitive_payload,
+        encrypt_sensitive_payload, forget_webdav_sync_secrets_passphrase, gitee_snippet_payload,
+        normalized_remote_path, parent_collection_paths, resolve_webdav_sync_secrets_passphrase,
+        save_webdav_sync_secrets_preference, scrub_connection_secrets, snippet_file_content, snippet_response_id,
+        webdav_sync_secrets_status, ApplySnapshotOptions, ConnectionSecretSnapshot, SensitiveSyncPayload,
     };
     use crate::connection_secrets::NACOS_AUTH_PASSWORD_KEY;
     use crate::models::connection::{
-        default_redis_key_separator, ConnectionConfig, DatabaseType, TransportLayerConfig,
+        default_redis_key_separator, ConnectionConfig, DatabaseType, SshTunnelConfig, TransportLayerConfig,
     };
     use crate::storage::Storage;
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("dbx-cloud-sync-{name}-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn gitee_snippet_payload_keeps_files_as_nested_object() {
+        let payload = gitee_snippet_payload("snapshot".to_string());
+
+        assert_eq!(payload["files"]["dbx-sync.json"]["content"], "snapshot");
+        assert!(payload["files"].is_object());
+        assert_eq!(payload["public"], false);
     }
 
     fn postgres_connection(id: &str, password: &str) -> ConnectionConfig {
@@ -1028,6 +1066,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: 5,
@@ -1058,6 +1097,8 @@ mod tests {
             jdbc_driver_paths: Vec::new(),
             one_time: false,
             read_only: false,
+            is_production: false,
+            production_databases: vec![],
         }
     }
 
@@ -1078,6 +1119,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: 5,
@@ -1116,6 +1158,8 @@ mod tests {
             jdbc_driver_paths: Vec::new(),
             one_time: false,
             read_only: false,
+            is_production: false,
+            production_databases: vec![],
         }
     }
 
@@ -1165,9 +1209,11 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: Some("CREATE SECRET (TYPE quack, TOKEN 'token-value');".to_string()),
             color: None,
             transport_layers: vec![
                 TransportLayerConfig::Ssh(crate::models::connection::SshTunnelConfig {
+                    profile_id: String::new(),
                     id: "hop-1".to_string(),
                     name: String::new(),
                     enabled: true,
@@ -1184,6 +1230,7 @@ mod tests {
                     auth_method: "password".to_string(),
                 }),
                 TransportLayerConfig::HttpTunnel(crate::models::connection::HttpTunnelConfig {
+                    profile_id: String::new(),
                     id: "http".to_string(),
                     name: String::new(),
                     enabled: true,
@@ -1220,6 +1267,8 @@ mod tests {
             jdbc_driver_paths: Vec::new(),
             one_time: false,
             read_only: false,
+            is_production: false,
+            production_databases: vec![],
         };
         scrub_connection_secrets(&mut config);
         assert!(config.password.is_empty());
@@ -1236,11 +1285,16 @@ mod tests {
         }
         assert!(config.redis_sentinel_password.is_empty());
         assert!(config.connection_string.is_none());
+        assert!(config.init_script.is_none());
+        let public_json = serde_json::to_string(&config).unwrap();
+        assert!(!public_json.contains("token-value"));
+        assert!(super::SECRET_KEYS.contains(&"init_script"));
     }
 
     #[test]
     fn encrypted_sensitive_payload_round_trips() {
         let payload = SensitiveSyncPayload {
+            tunnel_profiles: None,
             connection_secrets: vec![
                 ConnectionSecretSnapshot {
                     connection_id: "c1".to_string(),
@@ -1265,6 +1319,7 @@ mod tests {
     #[test]
     fn encrypted_sensitive_payload_rejects_wrong_passphrase() {
         let payload = SensitiveSyncPayload {
+            tunnel_profiles: None,
             connection_secrets: vec![ConnectionSecretSnapshot {
                 connection_id: "c1".to_string(),
                 key: "password".to_string(),
@@ -1382,5 +1437,42 @@ mod tests {
         assert!(decrypted.connection_secrets.iter().any(|secret| {
             secret.connection_id == "nacos" && secret.key == NACOS_AUTH_PASSWORD_KEY && secret.secret == "nacos-secret"
         }));
+    }
+
+    #[tokio::test]
+    async fn sync_snapshot_round_trips_tunnel_profiles() {
+        let storage = Storage::open(&temp_db_path("tunnel-profiles-src")).await.unwrap();
+        let profile = TransportLayerConfig::Ssh(SshTunnelConfig {
+            id: "profile-1".to_string(),
+            name: "Bastion".to_string(),
+            enabled: true,
+            host: "bastion.example.com".to_string(),
+            port: 22,
+            user: "deploy".to_string(),
+            password: "tunnel-secret".to_string(),
+            key_path: String::new(),
+            key_passphrase: String::new(),
+            connect_timeout_secs: 5,
+            expose_lan: false,
+            use_ssh_agent: false,
+            ssh_agent_sock_path: String::new(),
+            auth_method: "password".to_string(),
+            profile_id: String::new(),
+        });
+        storage.save_tunnel_profiles(std::slice::from_ref(&profile)).await.unwrap();
+
+        let snapshot = build_sync_snapshot(&storage, "test-version", None, Some("sync-pass")).await.unwrap();
+
+        // The plain snapshot carries the profiles with secrets scrubbed.
+        let public_profiles = snapshot.tunnel_profiles.as_ref().expect("tunnel profiles in snapshot");
+        let public_json = serde_json::to_string(public_profiles).unwrap();
+        assert!(!public_json.contains("tunnel-secret"));
+
+        // Applying with the passphrase restores the full profile on the target.
+        let target = Storage::open(&temp_db_path("tunnel-profiles-dst")).await.unwrap();
+        apply_sync_snapshot(&target, &snapshot, ApplySnapshotOptions { secrets_passphrase: Some("sync-pass") })
+            .await
+            .unwrap();
+        assert_eq!(target.load_tunnel_profiles().await.unwrap(), vec![profile]);
     }
 }

@@ -10,6 +10,7 @@ import {
   extractCteDefinitions,
   getSqlCompletionContext,
   recordCompletionSelection,
+  shouldChainSqlCompletionAfterAccept,
   type SqlCompletionColumn,
   type SqlCompletionForeignKey,
   type SqlCompletionObject,
@@ -141,6 +142,86 @@ test("suggests PostgreSQL-specific data types and functions", () => {
     postgresDateItems.some((item) => item.type === "function" && item.label === "DATE_FORMAT"),
     false,
   );
+});
+
+test("suggests Oracle SQL, PL/SQL, and data type keywords", () => {
+  const keywordCases = [
+    ["tru", "TRUNCATE"],
+    ["mer", "MERGE"],
+    ["dec", "DECLARE"],
+    ["els", "ELSIF"],
+    ["pac", "PACKAGE"],
+    ["seq", "SEQUENCE"],
+    ["flash", "FLASHBACK"],
+    ["mat", "MATERIALIZED VIEW"],
+  ] as const;
+
+  for (const [prefix, expected] of keywordCases) {
+    const items = buildSqlCompletionItems(prefix, prefix.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "oracle",
+    });
+    assert.ok(
+      items.some((item) => item.type === "keyword" && item.label === expected),
+      `${expected} should be suggested for ${prefix}`,
+    );
+  }
+
+  const typeSql = "CREATE TABLE events (payload varc";
+  const typeItems = buildSqlCompletionItems(typeSql, typeSql.length, {
+    tables: [],
+    columnsByTable: new Map(),
+    databaseType: "oracle",
+  });
+  assert.ok(typeItems.some((item) => item.type === "keyword" && item.label === "VARCHAR2"));
+});
+
+test("does not suggest cross-dialect words for Oracle", () => {
+  const unsupportedWords = ["LIMIT", "LOCALTIME", "USE", "ELSEIF", "SERIAL", "BIGSERIAL", "TEXT", "BOOLEAN", "STRING", "TIME"];
+
+  for (const unsupportedWord of unsupportedWords) {
+    const prefix = unsupportedWord.toLowerCase();
+    const items = buildSqlCompletionItems(prefix, prefix.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "oracle",
+    });
+    assert.equal(
+      items.some((item) => item.type === "keyword" && item.label === unsupportedWord),
+      false,
+      `${unsupportedWord} should not be suggested for Oracle`,
+    );
+  }
+
+  for (const supportedWord of ["LOCALTIMESTAMP", "NUMBER", "VARCHAR2", "XMLTYPE"]) {
+    const prefix = supportedWord.toLowerCase();
+    const items = buildSqlCompletionItems(prefix, prefix.length, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType: "oracle",
+    });
+    assert.ok(
+      items.some((item) => item.type === "keyword" && item.label === supportedWord),
+      `${supportedWord} should be suggested for Oracle`,
+    );
+  }
+});
+
+test("keeps TRUNCATE as a statement keyword for Oracle-compatible databases", () => {
+  for (const databaseType of ["oracle", "oceanbase-oracle"] as const) {
+    const items = buildSqlCompletionItems("tru", 3, {
+      tables: [],
+      columnsByTable: new Map(),
+      databaseType,
+    });
+
+    assert.ok(items.some((item) => item.type === "keyword" && item.label === "TRUNCATE"));
+    assert.equal(
+      items.some((item) => item.type === "function" && item.label === "TRUNCATE"),
+      false,
+    );
+  }
 });
 
 test("suggests Manticore Search SQL functions and command snippets", () => {
@@ -623,6 +704,16 @@ test("keeps schema-qualified FROM object input in table suggestion mode", () => 
   );
 });
 
+test("keeps an accepted schema with trailing dot in table suggestion mode", () => {
+  const sql = "SELECT *\nFROM DBX_TEST.";
+  const context = getSqlCompletionContext(sql, sql.length);
+
+  assert.equal(context.qualifier, "DBX_TEST");
+  assert.equal(context.prefix, "");
+  assert.equal(context.suggestTables, true);
+  assert.equal(context.exclusiveTableSuggestions, true);
+});
+
 test("keeps database-qualified FROM input in table suggestion mode", () => {
   const sql = "select * from other_db.or";
   const context = getSqlCompletionContext(sql, sql.length);
@@ -760,6 +851,28 @@ test("suggests SQL Server IIF and CHOOSE scalar functions", () => {
     chooseItems.some((item) => item.label === "CHOOSE"),
     "CHOOSE should appear in completion",
   );
+});
+
+test("only suggests Cloudflare D1 supported common functions", () => {
+  const supported = buildSqlCompletionItems("SELECT SQ", "SELECT SQ".length, {
+    tables,
+    columnsByTable,
+    databaseType: "cloudflare-d1",
+  });
+  const unsupportedNow = buildSqlCompletionItems("SELECT NO", "SELECT NO".length, {
+    tables,
+    columnsByTable,
+    databaseType: "cloudflare-d1",
+  });
+  const unsupportedPower = buildSqlCompletionItems("SELECT PO", "SELECT PO".length, {
+    tables,
+    columnsByTable,
+    databaseType: "cloudflare-d1",
+  });
+
+  assert.ok(supported.some((item) => item.label === "SQRT"));
+  assert.ok(!unsupportedNow.some((item) => item.label === "NOW"));
+  assert.ok(!unsupportedPower.some((item) => item.label === "POWER"));
 });
 
 test("suggests SQL Server IDENTITY_INSERT after SET", () => {
@@ -1805,6 +1918,8 @@ test("schema items include apply value with trailing dot", () => {
   const schemaItems = items.filter((item) => item.type === "schema");
   assert.equal(schemaItems.length, 1);
   assert.equal(schemaItems[0]?.apply, "public.");
+  assert.equal(shouldChainSqlCompletionAfterAccept(schemaItems[0]!), true);
+  assert.equal(shouldChainSqlCompletionAfterAccept({ type: "table", apply: "users" }), false);
 });
 
 // --- Quoted identifier fix ---
@@ -2007,6 +2122,59 @@ test("automatic table aliases avoid reserved words", () => {
   assert.ok(tableItem);
   assert.notEqual(tableItem!.apply, "orders AS or");
   assert.equal(tableItem!.apply, "orders AS ord");
+});
+
+test("automatic table aliases respect text after the cursor", () => {
+  const cases: Array<[string, number, string]> = [
+    ["select * from ord AS o", "select * from ord".length, "orders"],
+    ["select * from ord o", "select * from ord".length, "orders"],
+    ["select * from ord where id = 1", "select * from ord".length, "orders AS ord"],
+    ["select * from ord", "select * from ord".length, "orders AS ord"],
+    ["select * from ord, users", "select * from ord".length, "orders AS ord"],
+    ["select * from orders AS o", "select * from or".length, "orders"],
+    ["select * from ord单 AS o", "select * from ord".length, "orders"],
+    ["select * from orde\u0301 AS o", "select * from ord".length, "orders"],
+    ["select * from ord𐐀 AS o", "select * from ord".length, "orders"],
+    ['select * from ord AS "o"', "select * from ord".length, "orders"],
+    ["select * from ord `o`", "select * from ord".length, "orders"],
+    ["select * from ord AS ", "select * from ord".length, "orders"],
+    ["select * from ord /* comment */ AS o", "select * from ord".length, "orders"],
+    ["select * from ord -- comment\n  o", "select * from ord".length, "orders"],
+    ["select * from ord\n  o", "select * from ord".length, "orders"],
+    ["select * from ord /* ; */ AS o", "select * from ord".length, "orders"],
+    ["select * from ord /* comment */ where id = 1", "select * from ord".length, "orders AS ord"],
+  ];
+
+  for (const [sql, cursor, expectedApply] of cases) {
+    const items = buildSqlCompletionItems(sql, cursor, {
+      tables,
+      columnsByTable,
+      autoAliasTables: true,
+    });
+
+    const tableItem = items.find((item) => item.type === "table" && item.label === "orders");
+    assert.ok(tableItem, `should suggest orders for ${sql}`);
+    assert.equal(tableItem!.apply, expectedApply, sql);
+  }
+});
+
+test("table alias suggestions respect text after the cursor", () => {
+  const aliasedCases: Array<[string, number]> = [
+    ["select * from orders AS o", "select * from orders ".length],
+    ['select * from orders AS "o"', "select * from orders ".length],
+    ["select * from orders AS ", "select * from orders ".length],
+    ["select * from orders /* c */ AS o", "select * from orders ".length],
+  ];
+
+  for (const [sql, cursor] of aliasedCases) {
+    const items = buildSqlCompletionItems(sql, cursor, { tables, columnsByTable });
+    const aliasItem = items.find((item) => item.type === "snippet" && item.detail === "alias for orders");
+    assert.equal(aliasItem, undefined, sql);
+  }
+
+  const items = buildSqlCompletionItems("select * from orders ", "select * from orders ".length, { tables, columnsByTable });
+  const aliasItem = items.find((item) => item.type === "snippet" && item.detail === "alias for orders");
+  assert.ok(aliasItem, "alias snippet should remain available when no alias follows");
 });
 
 test("table alias suggestions avoid SQL keywords", () => {

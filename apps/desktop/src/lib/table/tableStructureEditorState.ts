@@ -842,6 +842,66 @@ export function splitDataType(raw: string): { baseType: string; params: string }
   return { baseType, params };
 }
 
+export type DataTypeLengthUnit = "BYTE" | "CHAR";
+
+const DAMENG_LENGTH_UNIT_TYPES = new Set(["char", "varchar", "varchar2"]);
+const DAMENG_LENGTH_UNITS: readonly DataTypeLengthUnit[] = ["BYTE", "CHAR"];
+
+function normalizedDataTypeName(rawDataType: string): string {
+  return splitDataType(rawDataType).baseType.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+export function getDataTypeLengthUnitOptions(dbType: DatabaseType | undefined, rawDataType: string): readonly DataTypeLengthUnit[] {
+  if (dbType !== "dameng") return [];
+  return DAMENG_LENGTH_UNIT_TYPES.has(normalizedDataTypeName(rawDataType)) ? DAMENG_LENGTH_UNITS : [];
+}
+
+function splitDataTypeLengthParams(dbType: DatabaseType | undefined, rawDataType: string): { length: string; unit: DataTypeLengthUnit | "" } {
+  const { params } = splitDataType(rawDataType);
+  if (!params || getDataTypeLengthUnitOptions(dbType, rawDataType).length === 0) {
+    return { length: params, unit: "" };
+  }
+
+  const match = params.match(/^(.*\S)\s+(BYTE|CHAR)$/i);
+  if (!match) return { length: params, unit: "" };
+  return {
+    length: match[1]!.trim(),
+    unit: match[2]!.toUpperCase() as DataTypeLengthUnit,
+  };
+}
+
+export function dataTypeLengthUnitValue(dbType: DatabaseType | undefined, rawDataType: string): DataTypeLengthUnit | "" {
+  return splitDataTypeLengthParams(dbType, rawDataType).unit;
+}
+
+export function combineDataTypeForDatabaseWithLengthUnit(dbType: DatabaseType | undefined, baseType: string, length: string, unit: string | undefined): string {
+  const normalizedLength = length.trim();
+  if (!normalizedLength) return combineDataTypeForDatabase(dbType, baseType, "");
+
+  const normalizedUnit = unit?.trim().toUpperCase();
+  const validUnit = normalizedUnit === "BYTE" || normalizedUnit === "CHAR" ? normalizedUnit : "";
+  const allowedUnits = getDataTypeLengthUnitOptions(dbType, baseType);
+  const params = validUnit && allowedUnits.includes(validUnit) ? `${normalizedLength} ${validUnit}` : normalizedLength;
+  return combineDataTypeForDatabase(dbType, baseType, params);
+}
+
+export function restoreDamengLengthUnitsAfterSave(columns: EditableStructureColumn[], savedDataTypesByColumn: ReadonlyMap<string, string>): EditableStructureColumn[] {
+  if (savedDataTypesByColumn.size === 0) return columns;
+
+  return columns.map((column) => {
+    if (dataTypeLengthUnitValue("dameng", column.dataType)) return column;
+    const savedDataType = savedDataTypesByColumn.get(column.name.trim().toLowerCase());
+    if (!savedDataType || !dataTypeLengthUnitValue("dameng", savedDataType)) return column;
+    if (normalizedDataTypeName(savedDataType) !== normalizedDataTypeName(column.dataType)) return column;
+
+    return {
+      ...column,
+      dataType: savedDataType,
+      original: column.original ? { ...column.original, data_type: savedDataType } : column.original,
+    };
+  });
+}
+
 /** MySQL character/text types that accept `CHARACTER SET` and `COLLATE`. */
 const MYSQL_CHARACTER_DATA_TYPES = new Set(["char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set"]);
 
@@ -898,7 +958,7 @@ export function combineDataTypeForDatabase(dbType: DatabaseType | undefined, bas
 
 export function dataTypeLengthInputValue(dbType: DatabaseType | undefined, rawDataType: string): string {
   const parsed = splitDataType(rawDataType);
-  return isDataTypeLengthDisabled(dbType, parsed.baseType) ? "" : parsed.params;
+  return isDataTypeLengthDisabled(dbType, parsed.baseType) ? "" : splitDataTypeLengthParams(dbType, rawDataType).length;
 }
 
 export function normalizeDataTypeParams(dbType: DatabaseType | undefined, baseType: string, params: string): string {
@@ -965,8 +1025,17 @@ function isValidTemporalPrecision(dbType: DatabaseType | undefined, params: stri
   return Number.isInteger(value) && value >= 0 && value <= max && String(value) === params;
 }
 
-export function getDefaultLengthForType(_dbType: DatabaseType | undefined, baseType: string): string {
+export interface DataTypeDefaultOptions {
+  /**
+   * Native MySQL profiles use MySQL 8-safe defaults. Compatibility profiles
+   * retain their existing DDL defaults because their server/version is unknown.
+   */
+  omitMysqlDeprecatedDefaults?: boolean;
+}
+
+export function getDefaultLengthForType(_dbType: DatabaseType | undefined, baseType: string, options: DataTypeDefaultOptions = {}): string {
   const key = baseType.trim().toLowerCase();
+  if (_dbType === "mysql" && options.omitMysqlDeprecatedDefaults && isMysqlDeprecatedDefaultParameterType(key)) return "";
   if (_dbType === "sqlite" || _dbType === "rqlite" || _dbType === "turso") {
     return "";
   } else if (_dbType === "questdb") {
@@ -976,6 +1045,20 @@ export function getDefaultLengthForType(_dbType: DatabaseType | undefined, baseT
   } else {
     return DEFAULT_TYPE_LENGTHS[key] ?? "";
   }
+}
+
+/** Default data type for a newly added structure-editor column. */
+export function defaultNewColumnDataType(dbType: DatabaseType | undefined, dataTypeOptions: readonly string[] = []): string {
+  if (dbType === "manticoresearch") {
+    const baseType = dataTypeOptions[0] ?? "text";
+    return combineDataTypeForDatabase(dbType, baseType, getDefaultLengthForType(dbType, baseType));
+  }
+  return dbType === "sqlite" ? "text" : "varchar(255)";
+}
+
+function isMysqlDeprecatedDefaultParameterType(baseType: string): boolean {
+  const typeName = baseType.split(/\s+/)[0];
+  return ["tinyint", "smallint", "mediumint", "int", "integer", "bigint", "float", "double", "real"].includes(typeName ?? "");
 }
 
 export function isDataTypeLengthDisabled(_dbType: DatabaseType | undefined, baseType: string): boolean {

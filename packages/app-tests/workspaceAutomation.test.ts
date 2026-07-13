@@ -493,7 +493,7 @@ test("audits generated data sync SQL on successful execution", async () => {
     assert.equal(records.length, 1);
     assert.equal(records[0].status, "success");
     assert.equal(records[0].connectionId, "target");
-    assert.equal(records[0].sqlPreview, "update users set name = 'A' where id = 1;");
+    assert.equal(records[0].sqlPreview, "update users set name =   where id = 1;");
   });
 });
 
@@ -646,7 +646,7 @@ test("runs CSV query export jobs with the streaming query export API", async () 
     pageSize: 5000,
     rowLimit: 10000,
     totalRows: null,
-    timeoutSecs: 30,
+    timeoutSecs: 60,
     keysetOptimizationEnabled: false,
     clientSessionId: "automation:job-1:export",
     executionId: "automation-query-export-job-1-20260628100000000-execution",
@@ -948,7 +948,7 @@ test("audits generated data sync SQL when policy blocks execution", async () => 
     assert.equal(records[0].status, "error");
     assert.equal(records[0].connectionId, "target");
     assert.equal(records[0].error, "production_write_automation");
-    assert.equal(records[0].sqlPreview, "update users set name = 'A' where id = 1;");
+    assert.equal(records[0].sqlPreview, "update users set name =   where id = 1;");
   });
 });
 

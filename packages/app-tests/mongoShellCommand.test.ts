@@ -143,6 +143,27 @@ test("parseMongoWriteCommand accepts unquoted insert and update commands", () =>
   });
 });
 
+test("parseMongoWriteCommand accepts updateMany arrayFilters options", () => {
+  assert.deepEqual(
+    parseMongoWriteCommand(`db.issue_3231.updateMany(
+      { msgType: 3, "order.orderId": { $in: [12345] } },
+      { $set: { "order.$[orderElem].bcorderproducts.$[prodElem].pankouType": "双双2" } },
+      { arrayFilters: [
+        { "orderElem.orderId": { $in: [12345] } },
+        { "prodElem.id": 322678 }
+      ] }
+    )`),
+    {
+      kind: "update",
+      collection: "issue_3231",
+      filter: '{ "msgType": 3, "order.orderId": { "$in": [12345] } }',
+      update: '{ "$set": { "order.$[orderElem].bcorderproducts.$[prodElem].pankouType": "双双2" } }',
+      options: '{ "arrayFilters": [\n        { "orderElem.orderId": { "$in": [12345] } },\n        { "prodElem.id": 322678 }\n      ] }',
+      many: true,
+    },
+  );
+});
+
 test("parseMongoWriteCommand parses createIndex with optional options", () => {
   assert.deepEqual(parseMongoWriteCommand("db.users.createIndex({email: 1}, {unique: true, name: 'users_email_unique'})"), {
     kind: "createIndex",
@@ -231,6 +252,7 @@ test("parseMongoCountDocumentsCommand parses db collection countDocuments", () =
   assert.deepEqual(parseMongoCountDocumentsCommand("db.products.countDocuments({})"), {
     collection: "products",
     filter: "{}",
+    mode: "accurate",
   });
 });
 
@@ -238,20 +260,24 @@ test("parseMongoCountDocumentsCommand parses legacy count helpers", () => {
   assert.deepEqual(parseMongoCountDocumentsCommand("db.products.count({ active: true })"), {
     collection: "products",
     filter: '{ "active": true }',
+    mode: "legacy",
   });
   assert.deepEqual(parseMongoCountDocumentsCommand('db.getCollection("audit.logs").count()'), {
     collection: "audit.logs",
     filter: "{}",
+    mode: "legacy",
   });
   assert.deepEqual(parseMongoCountDocumentsCommand("db.products.find({ active: true }).count()"), {
     collection: "products",
     filter: '{ "active": true }',
+    mode: "legacy",
   });
   assert.equal(parseMongoFindCommand("db.products.find({ active: true }).count()"), null);
   assert.deepEqual(parseMongoCommand("db.products.find({ active: true }).count()")?.command, {
     kind: "countDocuments",
     collection: "products",
     filter: '{ "active": true }',
+    mode: "legacy",
   });
 });
 

@@ -80,7 +80,7 @@ jobs:
             8
             21
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew shadowJar
+      - run: ./gradlew shadowJar --parallel
         working-directory: agents
       - run: python3 scripts/validate_agent_jars.py
         working-directory: agents
@@ -567,7 +567,10 @@ jobs:
         env:
           TAG_NAME: ${{ matrix.tag }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_USERNAME: ${{ github.repository_owner }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CNB_REPOSITORY: dbxio.com/dbx
+          CNB_USERNAME: cnb
           CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
         run: |
           set -euo pipefail

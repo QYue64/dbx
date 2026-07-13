@@ -353,7 +353,10 @@ function findTableTreeNode(nodes: readonly TreeNode[], parent: TableTreeLoadMore
 
 export function appendTableTreeLoadMoreNode(children: TreeNode[], loadMoreNode: TreeNode, parent?: TableTreeLoadMoreParent): TreeNode[] {
   const parentNode = parent ? findTableTreeNode(children, parent) : undefined;
-  const childGroup = parentNode ? tablePartitionGroups(parentNode)[0] : undefined;
+  // Only TDengine pages are scoped to a STABLE's child-table group. PostgreSQL
+  // paginates the whole schema, so nesting its global cursor under whichever
+  // partition happens to end the page can hide all remaining schema objects.
+  const childGroup = parentNode && isSuperTable(parentNode) ? tablePartitionGroups(parentNode)[0] : undefined;
   if (!childGroup) return [...children, loadMoreNode];
 
   childGroup.children = [...(childGroup.children ?? []), loadMoreNode];
@@ -503,7 +506,8 @@ export function buildSimpleObjectTreeNodes({ nodeId, connectionId, database, sch
     if (!name) continue;
 
     const childSchema = obj.schema ? normalizeDatabaseObjectName(obj.schema) : schema;
-    const dedupeKey = `${objectType}\0${(childSchema || "").toLowerCase()}\0${name.toLowerCase()}`;
+    const signature = obj.signature?.trim() || "";
+    const dedupeKey = `${objectType}\0${(childSchema || "").toLowerCase()}\0${name.toLowerCase()}\0${signature.toLowerCase()}`;
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
@@ -524,9 +528,11 @@ export function buildSimpleObjectTreeNodes({ nodeId, connectionId, database, sch
     } else {
       const simpleNodeType = simpleObjectNodeType(objectType);
       objectNodes.push({
-        id: objectType === "VIEW" || objectType === "MATERIALIZED_VIEW" ? entry.node.id : `${nodeId}:${childSchema ? `${childSchema}:` : ""}${name}:${objectType}`,
-        label: name,
+        id: objectType === "VIEW" || objectType === "MATERIALIZED_VIEW" ? entry.node.id : `${nodeId}:${childSchema ? `${childSchema}:` : ""}${name}:${signature}:${objectType}`,
+        label: signature && (objectType === "FUNCTION" || objectType === "PROCEDURE") ? `${name}(${signature})` : name,
         type: simpleNodeType,
+        objectName: name,
+        signature: signature || undefined,
         comment: obj.comment,
         connectionId,
         database,

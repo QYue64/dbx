@@ -744,7 +744,7 @@ async function exportAutomationResult(job: AutomationJob, runtime: AutomationRun
   const outputPath = payloadString(job.payload, "outputPath");
   const format = payloadString(job.payload, "format") || "csv";
   if (format === "xlsx") {
-    await (runtime.exportQueryResultXlsx ?? api.exportQueryResultXlsx)(outputPath, "DBX", result.columns, result.rows);
+    await (runtime.exportQueryResultXlsx ?? api.exportQueryResultXlsx)(outputPath, "DBX", result.columns, result.column_types ?? [], result.rows);
   } else if (format === "json") {
     await (runtime.exportQueryResultJson ?? api.exportQueryResultJson)(outputPath, result.columns, result.rows);
   } else if (format === "markdown") {
