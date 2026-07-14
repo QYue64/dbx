@@ -39,6 +39,7 @@ import { connectionRedactedNameLabel } from "@/lib/connection/connectionPresenta
 import { quickConnectionOpenTarget } from "@/lib/connection/connectionOpenTarget";
 import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { findTreeNodeById, resolveNewQueryTarget, resolveNewQueryInitialSql } from "@/lib/sql/newQueryContext";
+import { sqlObjectNavigationTableType, type SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { buildExecutableObjectSourceStatements, executeObjectSourceSave } from "@/lib/table/objectSourceEditor";
 import { resolveExecutableSql, resolveExecutableSqlWithBackend, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
 import { uuid } from "@/lib/common/utils";
@@ -157,7 +158,7 @@ const cursorPos = ref(0);
 const formatSqlRequest = ref<{ id: number; tabId: string } | null>(null);
 const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
 const newQueryContextSource = ref<"tab" | "sidebar">("tab");
-const queryEditorDdlTarget = ref<{ connectionId: string; database: string; schema?: string; tableName: string } | null>(null);
+const queryEditorDdlTarget = ref<{ connectionId: string; database: string; schema?: string; tableName: string; objectType?: ObjectSourceKind } | null>(null);
 const showSaveSqlDialog = ref(false);
 const saveSqlName = ref("");
 const saveSqlFolderId = ref("");
@@ -1187,12 +1188,13 @@ async function openSavedSqlFromWelcome(fileId: string) {
   toast(t("welcome.fileOpened", { name: file.name }), 2000);
 }
 
-function tableTargetFromActiveTab(tableName: string) {
+function tableTargetFromActiveTab(table: string | SqlObjectNavigationTarget) {
   const tab = activeTab.value;
   if (!tab) return null;
   const connectionId = tab.connectionId;
   let database = tab.database;
-  let schema = tab.schema;
+  let schema = typeof table === "string" ? tab.schema : table.schema || tab.schema;
+  const tableName = typeof table === "string" ? table : table.name;
 
   const parts = tableName.split(".").filter(Boolean);
   const rawTableName = parts[parts.length - 1] || tableName;
@@ -1209,12 +1211,18 @@ function tableTargetFromActiveTab(tableName: string) {
     }
   }
 
-  return { connectionId, database, schema, tableName: rawTableName };
+  return { connectionId, database, schema, tableName: rawTableName, tableType: typeof table === "string" ? undefined : sqlObjectNavigationTableType(table) };
 }
 
-async function onClickTable(tableName: string) {
-  const target = tableTargetFromActiveTab(tableName);
+async function onClickTable(table: SqlObjectNavigationTarget) {
+  const target = tableTargetFromActiveTab(table);
   if (!target) return;
+  if (table.type === "view") {
+    // Definition navigation for views must not run the view query, which may be expensive or have side effects upstream.
+    queryEditorDdlTarget.value = { ...target, objectType: "VIEW" };
+    showQueryEditorDdlDialog.value = true;
+    return;
+  }
   try {
     await openTableTarget(target, { tableInfoTab: "ddl" });
   } catch (e: any) {
@@ -2187,6 +2195,7 @@ onUnmounted(() => {
         :database="queryEditorDdlTarget.database"
         :schema="queryEditorDdlTarget.schema"
         :table-name="queryEditorDdlTarget.tableName"
+        :object-type="queryEditorDdlTarget.objectType"
         :database-type="queryEditorDdlDatabaseType"
         :dialect="queryEditorDdlDialect"
       />
