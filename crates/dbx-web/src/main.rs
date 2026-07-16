@@ -218,7 +218,10 @@ async fn main() {
         .route("/auth/logout", post(auth::logout))
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
+        .route("/connection/test-info", post(routes::connection::test_connection_with_info))
         .route("/connection/connect", post(routes::connection::connect_db))
+        .route("/connection/database-info", post(routes::connection::connected_database_info))
+        .route("/connection/database-info/save", post(routes::connection::save_connection_database_info))
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
@@ -311,6 +314,9 @@ async fn main() {
                 .get(routes::tab_runtime_cache::load_tab_runtime_cache)
                 .delete(routes::tab_runtime_cache::delete_tab_runtime_cache),
         )
+        .route("/tab-runtime-cache/metadata", get(routes::tab_runtime_cache::list_tab_runtime_cache_metadata))
+        .route("/tab-runtime-cache/prune", post(routes::tab_runtime_cache::prune_tab_runtime_cache))
+        .route("/tab-runtime-cache/owner", delete(routes::tab_runtime_cache::delete_tab_runtime_cache_owner))
         // Query
         .route("/query/execute", post(routes::query::execute_query))
         .route("/query/execute-multi", post(routes::query::execute_multi))
@@ -476,10 +482,12 @@ async fn main() {
         .route("/document-store/update-document", post(routes::document_store::update_document))
         .route("/document-store/delete-document", post(routes::document_store::delete_document))
         .route("/mongo/find-documents", post(routes::mongo::find_documents))
+        .route("/mongo/find-one", post(routes::mongo::find_one))
         .route("/mongo/count-documents", post(routes::mongo::count_documents))
         .route("/mongo/server-version", post(routes::mongo::server_version))
         .route("/mongo/collection-stats", post(routes::mongo::collection_stats))
         .route("/mongo/aggregate-documents", post(routes::mongo::aggregate_documents))
+        .route("/mongo/distinct", post(routes::mongo::distinct))
         .route("/mongo/create-index", post(routes::mongo::create_index))
         .route("/mongo/drop-indexes", post(routes::mongo::drop_indexes))
         .route("/mongo/insert-document", post(routes::mongo::insert_document))
@@ -488,6 +496,9 @@ async fn main() {
         .route("/mongo/update-documents", post(routes::mongo::update_documents))
         .route("/mongo/delete-document", post(routes::mongo::delete_document))
         .route("/mongo/delete-documents", post(routes::mongo::delete_documents))
+        .route("/mongo/find-one-and-update", post(routes::mongo::find_one_and_update))
+        .route("/mongo/find-one-and-replace", post(routes::mongo::find_one_and_replace))
+        .route("/mongo/find-one-and-delete", post(routes::mongo::find_one_and_delete))
         // History
         .route("/history", get(routes::history::load_history).delete(routes::history::clear_history))
         .route("/history/save", post(routes::history::save_history))
@@ -507,6 +518,10 @@ async fn main() {
         .route("/ai/config", post(routes::ai::save_ai_config).get(routes::ai::load_ai_config))
         .route("/ai/provider-config", post(routes::ai::save_ai_provider_config))
         .route("/ai/provider-configs", get(routes::ai::load_ai_provider_configs))
+        .route("/ai/configs", post(routes::ai::save_ai_configs).get(routes::ai::load_ai_configs))
+        .route("/ai/default-config", post(routes::ai::set_default_ai_config))
+        .route("/ai/config-item", post(routes::ai::save_ai_config_item))
+        .route("/ai/config/{config_id}", delete(routes::ai::delete_ai_config))
         .route("/ai/conversation", post(routes::ai::save_ai_conversation))
         .route("/ai/conversations", get(routes::ai::load_ai_conversations))
         .route("/ai/conversation/{id}", delete(routes::ai::delete_ai_conversation))
@@ -556,6 +571,7 @@ async fn main() {
         // Update
         .route("/version", get(routes::update::get_version))
         .route("/update/check", get(routes::update::check_for_updates))
+        .route("/changelog", get(routes::update::fetch_changelog))
         // Layout
         .route("/layout/sidebar", post(routes::layout::save_sidebar_layout).get(routes::layout::load_sidebar_layout))
         // App settings
@@ -624,5 +640,14 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(addr).await.expect("Failed to bind address");
-    axum::serve(listener, app).await.expect("Server error");
+    let shutdown_state = web_state.app.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::warn!("Failed to listen for shutdown signal: {error}");
+            }
+        })
+        .await
+        .expect("Server error");
+    shutdown_state.shutdown_background_tasks(std::time::Duration::from_secs(3)).await;
 }

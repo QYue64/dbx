@@ -296,6 +296,15 @@ The installer will be in `src-tauri/target/release/bundle/`.
 
 This fork's source, releases, issues, and auto-update channel are centralized at [QYue64/dbx](https://github.com/QYue64/dbx).
 
+## Support DBX
+
+DBX is free and open source, but ongoing maintenance, database compatibility testing, infrastructure, and release work require sustained time and resources.
+
+- [Support DBX](https://my.feishu.cn/wiki/WMTkwdATDiiu4rk14JMcoyhTnoh) — voluntary donations via WeChat or Alipay
+- [Sponsors & Partners](https://my.feishu.cn/wiki/CgOWwwTzzify79k9Oq8cXpUNn6e) — sponsorship, infrastructure, tools, and community collaboration
+
+Support does not affect access to DBX or guarantee feature prioritization. With mutual confirmation, sponsors and partners may be listed on the sponsors page.
+
 ## FAQ
 
 <details>

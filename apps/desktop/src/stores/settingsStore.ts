@@ -1,7 +1,8 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { ref, computed } from "vue";
 import * as api from "@/lib/backend/api";
-import { normalizeColumnFormatter, normalizeCustomColumnFormatter, type ColumnFormatterConfig, type CustomColumnFormatterConfig } from "@/lib/dataGrid/columnFormatter";
+import { generateId, getConfigKey, aiConfigToItem } from "@/lib/ai/aiConfigList";
+import { normalizeColumnFormatter, normalizeCustomColumnFormatter, normalizeGlobalDateTimePattern, type ColumnFormatterConfig, type CustomColumnFormatterConfig } from "@/lib/dataGrid/columnFormatter";
 import { normalizeShortcutSettings, type ShortcutSettings } from "@/lib/editor/shortcutRegistry";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableNameDisplay";
@@ -15,35 +16,9 @@ import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS, normalizeTableColumnTemplateField
 import { DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/backend/safeStorage";
 import { normalizeGovernancePolicy, type GovernancePolicySettings } from "@/lib/workspaceGovernance";
+import type { AiProvider, AiApiStyle, AiAuthMethod, AiReasoningLevel, AiConfig, AiTestConnectionResult, AiConfigItem } from "@/types/ai";
 
-export type AiProvider = "claude" | "openai" | "gemini" | "deepseek" | "qwen" | "ollama" | "openai-compatible" | "codex-cli" | "custom";
-export type AiApiStyle = "completions" | "responses" | "anthropic-messages";
-export type AiAuthMethod = "api-key" | "bearer";
-export type AiReasoningLevel = "default" | "minimal" | "low" | "medium" | "high";
-
-export interface AiConfig {
-  provider: AiProvider;
-  apiKey: string;
-  authMethod: AiAuthMethod;
-  endpoint: string;
-  model: string;
-  apiStyle: AiApiStyle;
-  proxyEnabled?: boolean;
-  proxyUrl?: string;
-  enableThinking?: boolean;
-  reasoningLevel?: AiReasoningLevel;
-  contextWindow?: number;
-  codexCliPath?: string | null;
-  codexCliEnv?: Record<string, string>;
-}
-
-export interface AiTestConnectionResult {
-  success: boolean;
-  message: string;
-  latencyMs?: number;
-  modelUsed: string;
-  errorCategory?: string;
-}
+export type { AiProvider, AiApiStyle, AiAuthMethod, AiReasoningLevel, AiConfig, AiTestConnectionResult, AiConfigItem };
 
 export interface DesktopSettings {
   show_tray_icon: boolean;
@@ -425,6 +400,9 @@ export interface EditorSettings {
   sidebarAllowHorizontalScroll: boolean;
   columnFormatters: Record<string, ColumnFormatterConfig>;
   customColumnFormatters: Record<string, CustomColumnFormatterConfig>;
+  globalDateTimeDisplayFormat: string;
+  globalDateTimeExportFormat: string;
+  globalDateTimeImportFormat: string;
   snippets: SqlSnippet[];
   tableColumnTemplateFields: string[];
   exportBatchSize: number;
@@ -436,6 +414,7 @@ export interface EditorSettings {
   objectBrowserShowCheckbox: boolean;
   objectBrowserViewMode: "list" | "grid";
   sqlVariableSyntaxOverrides: SqlVariableSyntaxOverrides;
+  continueOnErrorOnBatch: boolean;
 }
 
 export interface ToolbarItems {
@@ -564,6 +543,9 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   sidebarAllowHorizontalScroll: false,
   columnFormatters: {},
   customColumnFormatters: {},
+  globalDateTimeDisplayFormat: "",
+  globalDateTimeExportFormat: "",
+  globalDateTimeImportFormat: "",
   snippets: DEFAULT_SQL_SNIPPETS,
   tableColumnTemplateFields: [...DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS],
   exportBatchSize: 2000,
@@ -575,6 +557,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   objectBrowserShowCheckbox: false,
   objectBrowserViewMode: "list",
   sqlVariableSyntaxOverrides: {},
+  continueOnErrorOnBatch: false,
 };
 
 export const STORAGE_KEY = "dbx-editor-settings";
@@ -802,6 +785,9 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     sidebarAllowHorizontalScroll: settings.sidebarAllowHorizontalScroll ?? DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll,
     columnFormatters: normalizeColumnFormatters(settings.columnFormatters),
     customColumnFormatters: normalizeCustomColumnFormatters(settings.customColumnFormatters),
+    globalDateTimeDisplayFormat: normalizeGlobalDateTimePattern(settings.globalDateTimeDisplayFormat),
+    globalDateTimeExportFormat: normalizeGlobalDateTimePattern(settings.globalDateTimeExportFormat),
+    globalDateTimeImportFormat: normalizeGlobalDateTimePattern(settings.globalDateTimeImportFormat),
     snippets: normalizeSqlSnippets(settings.snippets, existing?.snippets),
     tableColumnTemplateFields: normalizeTableColumnTemplateFields(settings.tableColumnTemplateFields),
     exportBatchSize: typeof settings.exportBatchSize === "number" && settings.exportBatchSize >= 100 && settings.exportBatchSize <= 100000 ? Math.round(settings.exportBatchSize) : DEFAULT_EDITOR_SETTINGS.exportBatchSize,
@@ -813,6 +799,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     objectBrowserShowCheckbox: typeof settings.objectBrowserShowCheckbox === "boolean" ? settings.objectBrowserShowCheckbox : DEFAULT_EDITOR_SETTINGS.objectBrowserShowCheckbox,
     objectBrowserViewMode: settings.objectBrowserViewMode === "grid" ? "grid" : DEFAULT_EDITOR_SETTINGS.objectBrowserViewMode,
     sqlVariableSyntaxOverrides: normalizeSqlVariableSyntaxOverrides(settings.sqlVariableSyntaxOverrides),
+    continueOnErrorOnBatch: settings.continueOnErrorOnBatch === true,
   };
 }
 
@@ -846,16 +833,35 @@ function saveEditorSettings(settings: EditorSettings) {
   void api.saveEditorSettings(settings).catch(() => {});
 }
 
+export interface SettingsNavigationRequest {
+  id: number;
+  tab: string;
+  section?: string;
+}
+
 export const useSettingsStore = defineStore("settings", () => {
   const settingsPageActive = ref(false);
-  const aiConfig = ref<AiConfig>(normalizeAiConfig({ provider: "claude" }));
+  const settingsNavigationRequest = ref<SettingsNavigationRequest | null>(null);
+  const activeModel = ref<{ configId: string; modelId: string } | null>(null);
   const isAiConfigLoaded = ref(false);
-  const aiProviderConfigs = ref<Partial<Record<AiProvider, AiConfig>>>({});
+  const aiConfigs = ref<AiConfigItem[]>([]);
   const desktopSettings = ref<DesktopSettings>({ ...DEFAULT_DESKTOP_SETTINGS });
   const isDesktopSettingsLoaded = ref(false);
   const isEditorSettingsLoaded = ref(false);
 
   const editorSettings = ref<EditorSettings>(normalizeEditorSettings({}));
+
+  function requestSettingsNavigation(tab: string, section?: string) {
+    settingsNavigationRequest.value = {
+      id: Date.now(),
+      tab,
+      section,
+    };
+  }
+
+  function clearSettingsNavigationRequest(id: number) {
+    if (settingsNavigationRequest.value?.id === id) settingsNavigationRequest.value = null;
+  }
 
   async function initEditorSettings() {
     if (isEditorSettingsLoaded.value) return;
@@ -905,71 +911,118 @@ export const useSettingsStore = defineStore("settings", () => {
     }
   }
 
-  async function initAiConfig() {
+  async function initAiConfigs(): Promise<void> {
     if (isAiConfigLoaded.value) return;
-    const legacy = localStorage.getItem("dbx-ai-config");
-    const [savedActive, savedProviderConfigs] = await Promise.all([api.loadAiConfig().catch(() => null), api.loadAiProviderConfigs().catch(() => null) as Promise<Partial<Record<AiProvider, AiConfig>> | null>]);
 
-    if (savedActive) {
-      aiConfig.value = normalizeAiConfig(savedActive);
-    } else if (legacy) {
-      aiConfig.value = normalizeAiConfig(JSON.parse(legacy));
-      await api.saveAiConfig(aiConfig.value).catch(() => {});
-      localStorage.removeItem("dbx-ai-config");
+    // 尝试加载新格式
+    const newConfigs = await api.loadAiConfigs();
+
+    if (newConfigs.length > 0) {
+      aiConfigs.value = newConfigs;
+    } else {
+      // 迁移旧格式
+      await migrateToMultiConfig();
     }
 
-    if (savedProviderConfigs) {
-      aiProviderConfigs.value = savedProviderConfigs;
+    // 同步活跃状态到默认配置
+    const defaultConfig = aiConfigs.value.find((c) => c.isDefault) || aiConfigs.value[0];
+    if (defaultConfig) {
+      activeModel.value = { configId: defaultConfig.id, modelId: defaultConfig.model };
     }
-
-    // Ensure active config is reflected in provider map (overwrite if exists, to guarantee consistency)
-    const activeProvider = aiConfig.value.provider;
-    aiProviderConfigs.value[activeProvider] = { ...aiConfig.value };
 
     isAiConfigLoaded.value = true;
   }
 
-  function updateAiConfig(config: Partial<AiConfig>) {
-    const previousProvider = aiConfig.value.provider;
-    const targetProvider = config.provider;
-    const switchingProvider = !!targetProvider && targetProvider !== previousProvider;
-
-    if (switchingProvider) {
-      // Save current provider's config before switching
-      aiProviderConfigs.value[previousProvider] = { ...aiConfig.value };
-      api.saveAiProviderConfig(previousProvider, aiConfig.value).catch(() => {});
-
-      // Restore saved config for target provider, or use preset defaults
-      const savedConfig = aiProviderConfigs.value[targetProvider];
-      if (savedConfig) {
-        aiConfig.value = normalizeAiConfig({ ...savedConfig, provider: targetProvider });
+  async function reloadAiConfigs(): Promise<void> {
+    isAiConfigLoaded.value = false;
+    await initAiConfigs();
+    // If the active config was deleted, fall back to the default
+    if (activeModel.value && !aiConfigs.value.find((c) => c.id === activeModel.value!.configId)) {
+      if (aiConfigs.value.length > 0) {
+        activeModel.value = { configId: aiConfigs.value[0].id, modelId: aiConfigs.value[0].model };
       } else {
-        aiConfig.value = normalizeAiConfig({ provider: targetProvider });
+        activeModel.value = null;
       }
-      // Don't merge caller fields when switching — caller passes only { provider }
-    } else {
-      // Not switching provider — apply partial update
-      Object.assign(aiConfig.value, config);
+    }
+  }
+
+  async function migrateToMultiConfig(): Promise<void> {
+    const oldActiveConfig = await api.loadAiConfig().catch(() => null);
+    const oldProviderConfigs = await api.loadAiProviderConfigs().catch(() => null);
+
+    if (!oldActiveConfig && (!oldProviderConfigs || Object.keys(oldProviderConfigs).length === 0)) {
+      return;
     }
 
-    aiProviderConfigs.value[aiConfig.value.provider] = { ...aiConfig.value };
-    api.saveAiConfig(aiConfig.value).catch(() => {});
-    api.saveAiProviderConfig(aiConfig.value.provider, aiConfig.value).catch(() => {});
+    const newConfigs: AiConfigItem[] = [];
+    const seenKeys = new Set<string>();
+
+    if (oldActiveConfig) {
+      const item = aiConfigToItem(normalizeAiConfig(oldActiveConfig), generateId(), oldActiveConfig.provider);
+      item.isDefault = true;
+      newConfigs.push(item);
+      seenKeys.add(getConfigKey(oldActiveConfig));
+    }
+
+    if (oldProviderConfigs) {
+      for (const [provider, config] of Object.entries(oldProviderConfigs)) {
+        const key = getConfigKey(config);
+        if (!seenKeys.has(key)) {
+          const item = aiConfigToItem(normalizeAiConfig(config), generateId(), provider);
+          item.isDefault = false;
+          newConfigs.push(item);
+          seenKeys.add(key);
+        }
+      }
+    }
+
+    if (newConfigs.length > 0) {
+      await api.saveAiConfigs(newConfigs);
+      aiConfigs.value = newConfigs;
+    }
   }
 
-  function isConfigured(): boolean {
-    const preset = AI_PROVIDER_PRESETS[aiConfig.value.provider];
-    if (aiConfig.value.provider === "codex-cli") return true;
-    return !!aiConfig.value.endpoint && !!aiConfig.value.model && (!preset.requiresApiKey || !!aiConfig.value.apiKey);
+  async function createAiConfig(config: AiConfigItem): Promise<void> {
+    await api.saveAiConfigItem(config);
+    aiConfigs.value.push(config);
+    if (aiConfigs.value.length === 1) {
+      activeModel.value = { configId: config.id, modelId: config.model };
+    }
   }
 
-  function isAiProviderConfigured(provider: AiProvider): boolean {
-    const config = aiProviderConfigs.value[provider];
+  async function updateAiConfigItem(id: string, config: Partial<AiConfigItem>): Promise<void> {
+    const index = aiConfigs.value.findIndex((c) => c.id === id);
+    if (index !== -1) {
+      const updated = { ...aiConfigs.value[index], ...config };
+      await api.saveAiConfigItem(updated);
+      aiConfigs.value[index] = updated;
+    }
+  }
+
+  async function deleteAiConfig(id: string): Promise<void> {
+    await api.deleteAiConfig(id);
+    aiConfigs.value = aiConfigs.value.filter((c) => c.id !== id);
+  }
+
+  async function setDefaultAiConfig(id: string): Promise<void> {
+    await api.setDefaultAiConfig(id);
+    aiConfigs.value.forEach((c) => {
+      c.isDefault = c.id === id;
+    });
+  }
+
+  function updateActiveModel(model: { configId: string; modelId: string }) {
+    activeModel.value = model;
+  }
+
+  const isConfigured = computed((): boolean => {
+    if (!activeModel.value) return false;
+    const config = aiConfigs.value.find((c) => c.id === activeModel.value!.configId);
     if (!config) return false;
-    if (provider === "codex-cli") return true;
-    const preset = AI_PROVIDER_PRESETS[provider];
-    return !!config.endpoint?.trim() && !!config.model?.trim() && (!preset.requiresApiKey || !!config.apiKey?.trim());
-  }
+    const preset = AI_PROVIDER_PRESETS[config.provider];
+    if (config.provider === "codex-cli") return true;
+    return !!config.endpoint && !!activeModel.value!.modelId && (!preset.requiresApiKey || !!config.apiKey);
+  });
 
   function updateEditorSettings(partial: Partial<EditorSettings>) {
     if (partial.fontFamily !== undefined) editorSettings.value.fontFamily = normalizeFontFamily(partial.fontFamily, DEFAULT_EDITOR_SETTINGS.fontFamily);
@@ -1051,6 +1104,9 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.sidebarAllowHorizontalScroll !== undefined) editorSettings.value.sidebarAllowHorizontalScroll = partial.sidebarAllowHorizontalScroll;
     if (partial.columnFormatters !== undefined) editorSettings.value.columnFormatters = partial.columnFormatters;
     if (partial.customColumnFormatters !== undefined) editorSettings.value.customColumnFormatters = partial.customColumnFormatters;
+    if (partial.globalDateTimeDisplayFormat !== undefined) editorSettings.value.globalDateTimeDisplayFormat = normalizeGlobalDateTimePattern(partial.globalDateTimeDisplayFormat);
+    if (partial.globalDateTimeExportFormat !== undefined) editorSettings.value.globalDateTimeExportFormat = normalizeGlobalDateTimePattern(partial.globalDateTimeExportFormat);
+    if (partial.globalDateTimeImportFormat !== undefined) editorSettings.value.globalDateTimeImportFormat = normalizeGlobalDateTimePattern(partial.globalDateTimeImportFormat);
     if (partial.snippets !== undefined) editorSettings.value.snippets = normalizeSqlSnippets(partial.snippets);
     if (partial.tableColumnTemplateFields !== undefined) editorSettings.value.tableColumnTemplateFields = normalizeTableColumnTemplateFields(partial.tableColumnTemplateFields);
     if (partial.exportBatchSize !== undefined) editorSettings.value.exportBatchSize = Math.min(100000, Math.max(100, Math.round(partial.exportBatchSize)));
@@ -1062,6 +1118,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.objectBrowserShowCheckbox !== undefined) editorSettings.value.objectBrowserShowCheckbox = partial.objectBrowserShowCheckbox === true;
     if (partial.objectBrowserViewMode !== undefined) editorSettings.value.objectBrowserViewMode = partial.objectBrowserViewMode === "grid" ? "grid" : "list";
     if (partial.sqlVariableSyntaxOverrides !== undefined) editorSettings.value.sqlVariableSyntaxOverrides = normalizeSqlVariableSyntaxOverrides(partial.sqlVariableSyntaxOverrides);
+    if (partial.continueOnErrorOnBatch !== undefined) editorSettings.value.continueOnErrorOnBatch = partial.continueOnErrorOnBatch === true;
     saveEditorSettings(editorSettings.value);
   }
 
@@ -1101,13 +1158,21 @@ export const useSettingsStore = defineStore("settings", () => {
 
   return {
     settingsPageActive,
-    aiConfig,
+    settingsNavigationRequest,
+    requestSettingsNavigation,
+    clearSettingsNavigationRequest,
+    activeModel,
     isAiConfigLoaded,
-    aiProviderConfigs,
-    initAiConfig,
-    updateAiConfig,
+    aiConfigs,
+    initAiConfigs,
+    reloadAiConfigs,
+    migrateToMultiConfig,
+    createAiConfig,
+    updateAiConfigItem,
+    deleteAiConfig,
+    setDefaultAiConfig,
+    updateActiveModel,
     isConfigured,
-    isAiProviderConfigured,
     isEditorSettingsLoaded,
     editorSettings,
     desktopSettings,

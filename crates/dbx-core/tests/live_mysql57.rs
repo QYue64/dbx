@@ -157,6 +157,7 @@ async fn live_mysql_query_result_export_xlsx_streams_single_query_without_duplic
         use_agent_cursor: false,
         file_path: file_path.to_string_lossy().to_string(),
         format: "xlsx".to_string(),
+        include_sql_sheet: false,
         page_size: 50,
         row_limit: None,
         total_rows: Some(250),
@@ -164,6 +165,7 @@ async fn live_mysql_query_result_export_xlsx_streams_single_query_without_duplic
         keyset_optimization_enabled: false,
         client_session_id: None,
         execution_id: Some(format!("live-mysql-query-export-{suffix}")),
+        date_time_format: None,
     };
     let done_seen = AtomicBool::new(false);
     let result = export_query_result_core(&state, &request, None, |progress| {

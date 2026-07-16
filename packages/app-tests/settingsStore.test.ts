@@ -342,6 +342,19 @@ test("defaults column formatters to an empty record", () => {
   assert.deepEqual(normalizeEditorSettings({}).columnFormatters, {});
 });
 
+test("normalizes global datetime display and transfer formats", () => {
+  assert.equal(DEFAULT_EDITOR_SETTINGS.globalDateTimeDisplayFormat, "");
+  const settings = normalizeEditorSettings({
+    globalDateTimeDisplayFormat: " YYYY/MM/DD HH:mm:ss ",
+    globalDateTimeExportFormat: "YYYY-M-D H:m:s",
+    globalDateTimeImportFormat: 123,
+  } as any);
+
+  assert.equal(settings.globalDateTimeDisplayFormat, "YYYY/MM/DD HH:mm:ss");
+  assert.equal(settings.globalDateTimeExportFormat, "YYYY-M-D H:m:s");
+  assert.equal(settings.globalDateTimeImportFormat, "");
+});
+
 test("keeps only valid saved column formatter configs", () => {
   const settings = normalizeEditorSettings({
     columnFormatters: {
@@ -360,7 +373,7 @@ test("keeps only valid saved column formatter configs", () => {
   } as any);
 
   assert.deepEqual(settings.columnFormatters, {
-    "conn::db::public::users::created_at": { kind: "datetime", unit: "auto", pattern: "YYYY-MM-DD HH:mm:ss" },
+    "conn::db::public::users::created_at": { kind: "datetime", unit: "auto", pattern: "YYYY-MM-DD HH:mm:ss", timezone: undefined },
     "conn::db::public::users::name": { kind: "mask", prefix: 2, suffix: 2 },
     "conn::db::public::users::payload": { kind: "json-path", path: "$.user.name" },
     "conn::db::public::users::status": { kind: "custom-ref", formatterId: "fmt_1" },

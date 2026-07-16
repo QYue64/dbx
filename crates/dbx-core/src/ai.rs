@@ -8,6 +8,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Notify, RwLock};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Stream cancel registry
@@ -63,6 +64,22 @@ pub enum AiProvider {
     Custom,
 }
 
+impl AiProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AiProvider::Claude => "claude",
+            AiProvider::Openai => "openai",
+            AiProvider::Gemini => "gemini",
+            AiProvider::Deepseek => "deepseek",
+            AiProvider::Qwen => "qwen",
+            AiProvider::Ollama => "ollama",
+            AiProvider::OpenaiCompatible => "openai-compatible",
+            AiProvider::CodexCli => "codex-cli",
+            AiProvider::Custom => "custom",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AiApiStyle {
@@ -106,6 +123,31 @@ impl AiReasoningLevel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AiConfigItem {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(flatten)]
+    pub config: AiConfig,
+}
+
+impl AiConfigItem {
+    pub fn new_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelListItem {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AiConfig {
     pub provider: AiProvider,
     #[serde(default)]
@@ -116,6 +158,8 @@ pub struct AiConfig {
     pub endpoint: String,
     #[serde(default)]
     pub model: String,
+    #[serde(default)]
+    pub models: Vec<AiModelListItem>,
     #[serde(default)]
     pub api_style: AiApiStyle,
     #[serde(default)]
@@ -527,6 +571,12 @@ fn is_kimi_model(model: &str) -> bool {
 
 fn apply_chat_completion_thinking_toggle(body: &mut serde_json::Value, config: &AiConfig) {
     if config.enable_thinking {
+        return;
+    }
+
+    if is_openai_api_config(config) {
+        // `extra_body.chat_template_kwargs` is a third-party compatibility extension,
+        // not an OpenAI API parameter. OpenAI models use their native defaults here.
         return;
     }
 
@@ -2567,6 +2617,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
             model: "gpt-4o".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: true,
             proxy_url: "not a proxy url".to_string(),
@@ -2590,6 +2641,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
             model: "gpt-4o".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: true,
             proxy_url: "127.0.0.1:7890".to_string(),
@@ -2611,6 +2663,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "http://127.0.0.1:3456/v1".to_string(),
             model: "gpt-4o".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: true,
             proxy_url: "not a proxy url".to_string(),
@@ -2632,6 +2685,7 @@ mod tests {
             auth_method: AiAuthMethod::ApiKey,
             endpoint: "https://generativelanguage.googleapis.com".to_string(),
             model: "gemini-1.5-pro".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -2657,6 +2711,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "http://localhost:11434/v1".to_string(),
             model: "llama3.1".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -2679,6 +2734,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
             model: String::new(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -2696,6 +2752,7 @@ mod tests {
             auth_method: AiAuthMethod::ApiKey,
             endpoint: "https://api.anthropic.com/v1/messages".to_string(),
             model: String::new(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -2716,6 +2773,7 @@ mod tests {
             auth_method: AiAuthMethod::ApiKey,
             endpoint: "https://gateway.example.com/anthropic/v1".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::AnthropicMessages,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -2760,6 +2818,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "https://api.example.com".to_string(),
             model: "test-model".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -2816,6 +2875,7 @@ mod tests {
             auth_method: AiAuthMethod::ApiKey,
             endpoint: "https://api.anthropic.com/v1/messages".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -3104,6 +3164,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
             model: "gpt-5.5".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -3169,6 +3230,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "https://api.moonshot.cn/v1".to_string(),
             model: "kimi-k2.5".to_string(),
+            models: Vec::new(),
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -3192,6 +3254,43 @@ mod tests {
     }
 
     #[test]
+    fn omits_thinking_toggle_for_openai_requests() {
+        let mut config = AiConfig {
+            provider: AiProvider::Openai,
+            api_key: "key".to_string(),
+            auth_method: AiAuthMethod::Bearer,
+            endpoint: "https://api.openai.com/v1/chat/completions".to_string(),
+            model: "gpt-5".to_string(),
+            models: vec![],
+            api_style: AiApiStyle::Completions,
+            proxy_enabled: false,
+            proxy_url: String::new(),
+            enable_thinking: false,
+            reasoning_level: AiReasoningLevel::Default,
+            context_window: None,
+            codex_cli_path: None,
+            codex_cli_env: Default::default(),
+        };
+        let mut body = serde_json::json!({ "model": &config.model });
+
+        apply_chat_completion_thinking_toggle(&mut body, &config);
+
+        assert!(body.get("extra_body").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+
+        // Provider identity preserves OpenAI semantics when requests use a custom gateway.
+        config.endpoint = "https://gateway.example.com/v1/chat/completions".to_string();
+        apply_chat_completion_thinking_toggle(&mut body, &config);
+        assert!(body.get("extra_body").is_none());
+
+        // The official endpoint must also stay strict if a legacy config has a compatible provider value.
+        config.provider = AiProvider::OpenaiCompatible;
+        config.endpoint = "https://api.openai.com/v1/chat/completions".to_string();
+        apply_chat_completion_thinking_toggle(&mut body, &config);
+        assert!(body.get("extra_body").is_none());
+    }
+
+    #[test]
     fn keeps_extra_body_thinking_toggle_for_other_compatible_providers() {
         let config = AiConfig {
             provider: AiProvider::OpenaiCompatible,
@@ -3199,6 +3298,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "https://example.com/v1".to_string(),
             model: "qwen3".to_string(),
+            models: vec![],
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),
@@ -3229,6 +3329,7 @@ mod tests {
             auth_method: AiAuthMethod::Bearer,
             endpoint: "http://localhost:11434/v1".to_string(),
             model: "deepseek-r1:14b".to_string(),
+            models: vec![],
             api_style: AiApiStyle::Completions,
             proxy_enabled: false,
             proxy_url: String::new(),

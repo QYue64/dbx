@@ -64,6 +64,7 @@ fn live_postgres_config(
         read_only: false,
         is_production: false,
         production_databases: vec![],
+        database_info: None,
     }
 }
 
@@ -121,6 +122,7 @@ async fn live_postgres_query_result_export_uses_single_streamed_query() {
         use_agent_cursor: false,
         file_path: file_path.to_string_lossy().to_string(),
         format: "csv".to_string(),
+        include_sql_sheet: false,
         page_size: 100,
         row_limit: None,
         total_rows: None,
@@ -128,6 +130,7 @@ async fn live_postgres_query_result_export_uses_single_streamed_query() {
         keyset_optimization_enabled: true,
         client_session_id: None,
         execution_id: Some(format!("live-postgres-query-export-{suffix}")),
+        date_time_format: None,
     };
     let done_seen = AtomicBool::new(false);
     let result = export_query_result_core(&state, &request, None, |progress| {
