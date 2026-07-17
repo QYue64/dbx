@@ -1560,11 +1560,6 @@ function onSearchKeydown(e: KeyboardEvent) {
   }
 }
 
-function clearWhereFilterInput() {
-  whereFilterInput.value = "";
-  void applyWhereFilter();
-}
-
 watch(whereFilterInput, () => {
   emit("update:whereInput", currentWhereInput() ?? "");
   persistStructuredFilterState();
@@ -7446,7 +7441,6 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   :mode-options="filterModeOptions"
                   :column-search="filterBuilderColumnSearch"
                   :apply-where="applyWhereFilter"
-                  :clear-where="clearWhereFilterInput"
                   :apply-order-by="applyOrderBySearch"
                   :clear-order-by="clearOrderByInput"
                   @update:column-search="filterBuilderColumnSearch = $event"
