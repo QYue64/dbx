@@ -228,6 +228,8 @@ const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const tableFontSize = computed(() => settingsStore.editorSettings.tableFontSize);
+const multiRowTranspose = computed(() => settingsStore.editorSettings.dataGridMultiRowTranspose);
+const hideNullColumns = computed(() => settingsStore.editorSettings.dataGridHideNullColumns);
 const { isDark, themePalette } = useTheme();
 const { toast } = useToast();
 const { highlight } = useSqlHighlighter();
@@ -343,7 +345,6 @@ if (isDebugLoggingEnabled()) {
 
 const transposeRowIndex = ref<number | null>(null);
 const showTranspose = ref(false);
-const multiRowTranspose = ref(false);
 const preserveTransposeOnNextResult = ref(false);
 
 watch(
@@ -1676,6 +1677,8 @@ const {
   columnOrderKeys,
   layoutScopeKey: columnLayoutScopeKey,
   tableScopeKey: tableColumnOrderScopeKey,
+  hideNullColumns,
+  onHideNullColumnsChange: (value) => settingsStore.updateEditorSettings({ dataGridHideNullColumns: value }),
   onRefreshMetrics: refreshGridScrollerMetrics,
 });
 const goToColumnItems = computed(() =>
@@ -6116,7 +6119,8 @@ function scrollTransposeRecordIntoView(rowIndex: number) {
 }
 
 function setMultiRowTranspose(value: boolean) {
-  multiRowTranspose.value = value;
+  if (multiRowTranspose.value === value) return;
+  settingsStore.updateEditorSettings({ dataGridMultiRowTranspose: value });
   if (!showTranspose.value) return;
   nextTick(updateTransposeViewport);
   if (value && transposeRowIndex.value !== null) {
