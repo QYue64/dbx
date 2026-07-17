@@ -16,9 +16,9 @@ import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS, normalizeTableColumnTemplateField
 import { DEFAULT_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/backend/safeStorage";
 import { normalizeGovernancePolicy, type GovernancePolicySettings } from "@/lib/workspaceGovernance";
-import type { AiProvider, AiApiStyle, AiAuthMethod, AiReasoningLevel, AiConfig, AiTestConnectionResult, AiConfigItem } from "@/types/ai";
+import type { AiProvider, AiApiStyle, AiAuthMethod, AiEffortLevel, AiReasoningLevel, AiConfiguredModel, AiConfig, AiTestConnectionResult, AiConfigItem } from "@/types/ai";
 
-export type { AiProvider, AiApiStyle, AiAuthMethod, AiReasoningLevel, AiConfig, AiTestConnectionResult, AiConfigItem };
+export type { AiProvider, AiApiStyle, AiAuthMethod, AiEffortLevel, AiReasoningLevel, AiConfiguredModel, AiConfig, AiTestConnectionResult, AiConfigItem };
 
 export interface DesktopSettings {
   show_tray_icon: boolean;
@@ -166,7 +166,17 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     model: "",
     apiStyle: "completions",
     authMethod: "bearer",
-    requiresApiKey: true,
+    requiresApiKey: false,
+  },
+  "claude-code-cli": {
+    label: "Claude Code CLI",
+    iconSlug: "claudecode",
+    provider: "claude-code-cli",
+    endpoint: "",
+    model: "default",
+    apiStyle: "completions",
+    authMethod: "bearer",
+    requiresApiKey: false,
   },
   "codex-cli": {
     label: "Codex CLI",
@@ -185,7 +195,7 @@ export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
     model: "",
     apiStyle: "completions",
     authMethod: "bearer",
-    requiresApiKey: true,
+    requiresApiKey: false,
   },
 };
 
@@ -196,7 +206,7 @@ const defaultConfigs: Record<AiProvider, Omit<AiConfig, "apiKey">> = Object.from
   }),
 ) as Record<AiProvider, Omit<AiConfig, "apiKey">>;
 
-const AI_REASONING_LEVELS: AiReasoningLevel[] = ["default", "minimal", "low", "medium", "high"];
+const AI_REASONING_LEVELS: AiReasoningLevel[] = ["default", "minimal", "low", "medium", "high", "xhigh", "max"];
 const AI_ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function normalizeAiReasoningLevel(value: unknown): AiReasoningLevel {
@@ -230,6 +240,8 @@ export function normalizeAiConfig(config: Partial<AiConfig> | null | undefined):
     contextWindow: config?.contextWindow ?? undefined,
     codexCliPath: config?.codexCliPath?.trim() || undefined,
     codexCliEnv: normalizeAiEnv(config?.codexCliEnv),
+    claudeCodeCliPath: config?.claudeCodeCliPath?.trim() || undefined,
+    claudeCodeCliEnv: normalizeAiEnv(config?.claudeCodeCliEnv),
   };
 }
 
@@ -272,6 +284,8 @@ const COLUMN_WIDTH_DENSITIES = ["compact", "standard", "comfortable"] as const;
 export type ColumnWidthDensity = (typeof COLUMN_WIDTH_DENSITIES)[number];
 const CELL_DETAIL_PANEL_LAYOUTS = ["bottom", "right"] as const;
 export type CellDetailPanelLayout = (typeof CELL_DETAIL_PANEL_LAYOUTS)[number];
+const TAB_LAYOUT_MODES = ["scroll", "wrap"] as const;
+export type TabLayoutMode = (typeof TAB_LAYOUT_MODES)[number];
 const DATA_GRID_RENDER_MODES = ["dom", "canvas"] as const;
 export type DataGridRenderMode = (typeof DATA_GRID_RENDER_MODES)[number];
 const DATA_GRID_SEARCH_MODES = ["filter", "highlight"] as const;
@@ -364,6 +378,7 @@ export interface EditorSettings {
   confirmDangerousSqlExecution: boolean;
   confirmUnsavedSqlClose: boolean;
   compactTabTitle: boolean;
+  tabLayout: TabLayoutMode;
   appLayout: "separated" | "classic";
   pageSize: number;
   infiniteScroll: boolean;
@@ -377,6 +392,8 @@ export interface EditorSettings {
   dataGridQuickEntry: boolean;
   dataGridRenderMode: DataGridRenderMode;
   dataGridSearchMode: DataGridSearchMode;
+  dataGridMultiRowTranspose: boolean;
+  dataGridHideNullColumns: boolean;
   tableFontSize: number;
   structureEditorDensity: StructureEditorDensity;
   tableInfoDrawerWidth: number;
@@ -507,6 +524,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   confirmDangerousSqlExecution: true,
   confirmUnsavedSqlClose: true,
   compactTabTitle: false,
+  tabLayout: "scroll",
   appLayout: "classic",
   pageSize: 100,
   infiniteScroll: false,
@@ -520,6 +538,8 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   dataGridQuickEntry: false,
   dataGridRenderMode: "canvas",
   dataGridSearchMode: "filter",
+  dataGridMultiRowTranspose: false,
+  dataGridHideNullColumns: false,
   tableFontSize: TABLE_FONT_SIZE_DEFAULT,
   structureEditorDensity: "compact",
   tableInfoDrawerWidth: 320,
@@ -588,6 +608,10 @@ function normalizeStructureEditorDensity(value: unknown): StructureEditorDensity
 }
 function normalizeColumnWidthDensity(value: unknown): ColumnWidthDensity {
   return COLUMN_WIDTH_DENSITIES.includes(value as ColumnWidthDensity) ? (value as ColumnWidthDensity) : DEFAULT_EDITOR_SETTINGS.columnWidthDensity;
+}
+
+function normalizeTabLayout(value: unknown): TabLayoutMode {
+  return TAB_LAYOUT_MODES.includes(value as TabLayoutMode) ? (value as TabLayoutMode) : DEFAULT_EDITOR_SETTINGS.tabLayout;
 }
 
 function normalizeCellDetailPanelLayout(value: unknown): CellDetailPanelLayout {
@@ -749,6 +773,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     confirmDangerousSqlExecution: settings.confirmDangerousSqlExecution ?? DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution,
     confirmUnsavedSqlClose: settings.confirmUnsavedSqlClose ?? DEFAULT_EDITOR_SETTINGS.confirmUnsavedSqlClose,
     compactTabTitle: settings.compactTabTitle ?? DEFAULT_EDITOR_SETTINGS.compactTabTitle,
+    tabLayout: normalizeTabLayout(settings.tabLayout),
     appLayout: settings.appLayout ?? DEFAULT_EDITOR_SETTINGS.appLayout,
     pageSize: normalizeResultPageSize(settings.pageSize),
     infiniteScroll: settings.infiniteScroll ?? DEFAULT_EDITOR_SETTINGS.infiniteScroll,
@@ -762,6 +787,8 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     dataGridQuickEntry: settings.dataGridQuickEntry ?? DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry,
     dataGridRenderMode: normalizeDataGridRenderMode(settings.dataGridRenderMode),
     dataGridSearchMode: normalizeDataGridSearchMode(settings.dataGridSearchMode),
+    dataGridMultiRowTranspose: settings.dataGridMultiRowTranspose === true,
+    dataGridHideNullColumns: settings.dataGridHideNullColumns === true,
     tableFontSize: normalizeTableFontSize(settings.tableFontSize),
     structureEditorDensity: normalizeStructureEditorDensity(settings.structureEditorDensity),
     tableInfoDrawerWidth: normalizeDrawerWidth(settings.tableInfoDrawerWidth, 240, DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth),
@@ -924,7 +951,8 @@ export const useSettingsStore = defineStore("settings", () => {
       await migrateToMultiConfig();
     }
 
-    // 同步活跃状态到默认配置
+    // 重置 activeModel 到默认配置是有意行为——activeModel 是本次运行 (run-scoped) 的末次使用选择，
+    // 应用启动和配置同步下载 (reloadAiConfigs) 两条路径均需丢弃会话内手动切换的模型、回到默认。
     const defaultConfig = aiConfigs.value.find((c) => c.isDefault) || aiConfigs.value[0];
     if (defaultConfig) {
       activeModel.value = { configId: defaultConfig.id, modelId: defaultConfig.model };
@@ -936,14 +964,7 @@ export const useSettingsStore = defineStore("settings", () => {
   async function reloadAiConfigs(): Promise<void> {
     isAiConfigLoaded.value = false;
     await initAiConfigs();
-    // If the active config was deleted, fall back to the default
-    if (activeModel.value && !aiConfigs.value.find((c) => c.id === activeModel.value!.configId)) {
-      if (aiConfigs.value.length > 0) {
-        activeModel.value = { configId: aiConfigs.value[0].id, modelId: aiConfigs.value[0].model };
-      } else {
-        activeModel.value = null;
-      }
-    }
+    if (aiConfigs.value.length === 0) activeModel.value = null;
   }
 
   async function migrateToMultiConfig(): Promise<void> {
@@ -1009,6 +1030,11 @@ export const useSettingsStore = defineStore("settings", () => {
     aiConfigs.value.forEach((c) => {
       c.isDefault = c.id === id;
     });
+    const config = aiConfigs.value.find((c) => c.id === id);
+    if (config) {
+      // 修改默认配置时丢弃用户手动选择的模型，回到新默认——放在 await 之后确保后端持久化成功才执行
+      activeModel.value = { configId: config.id, modelId: config.model };
+    }
   }
 
   function updateActiveModel(model: { configId: string; modelId: string }) {
@@ -1020,7 +1046,7 @@ export const useSettingsStore = defineStore("settings", () => {
     const config = aiConfigs.value.find((c) => c.id === activeModel.value!.configId);
     if (!config) return false;
     const preset = AI_PROVIDER_PRESETS[config.provider];
-    if (config.provider === "codex-cli") return true;
+    if (config.provider === "codex-cli" || config.provider === "claude-code-cli") return true;
     return !!config.endpoint && !!activeModel.value!.modelId && (!preset.requiresApiKey || !!config.apiKey);
   });
 
@@ -1067,6 +1093,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.confirmDangerousSqlExecution !== undefined) editorSettings.value.confirmDangerousSqlExecution = partial.confirmDangerousSqlExecution;
     if (partial.confirmUnsavedSqlClose !== undefined) editorSettings.value.confirmUnsavedSqlClose = partial.confirmUnsavedSqlClose;
     if (partial.compactTabTitle !== undefined) editorSettings.value.compactTabTitle = partial.compactTabTitle;
+    if (partial.tabLayout !== undefined) editorSettings.value.tabLayout = normalizeTabLayout(partial.tabLayout);
     if (partial.appLayout !== undefined) editorSettings.value.appLayout = partial.appLayout;
     if (partial.pageSize !== undefined) editorSettings.value.pageSize = normalizeResultPageSize(partial.pageSize);
     if (partial.infiniteScroll !== undefined) editorSettings.value.infiniteScroll = partial.infiniteScroll;
@@ -1081,6 +1108,8 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.dataGridQuickEntry !== undefined) editorSettings.value.dataGridQuickEntry = partial.dataGridQuickEntry;
     if (partial.dataGridRenderMode !== undefined) editorSettings.value.dataGridRenderMode = normalizeDataGridRenderMode(partial.dataGridRenderMode);
     if (partial.dataGridSearchMode !== undefined) editorSettings.value.dataGridSearchMode = normalizeDataGridSearchMode(partial.dataGridSearchMode);
+    if (partial.dataGridMultiRowTranspose !== undefined) editorSettings.value.dataGridMultiRowTranspose = partial.dataGridMultiRowTranspose === true;
+    if (partial.dataGridHideNullColumns !== undefined) editorSettings.value.dataGridHideNullColumns = partial.dataGridHideNullColumns === true;
     if (partial.tableFontSize !== undefined) editorSettings.value.tableFontSize = normalizeTableFontSize(partial.tableFontSize);
     if (partial.structureEditorDensity !== undefined) editorSettings.value.structureEditorDensity = normalizeStructureEditorDensity(partial.structureEditorDensity);
     if (partial.tableInfoDrawerWidth !== undefined) editorSettings.value.tableInfoDrawerWidth = normalizeDrawerWidth(partial.tableInfoDrawerWidth, 240, DEFAULT_EDITOR_SETTINGS.tableInfoDrawerWidth);
